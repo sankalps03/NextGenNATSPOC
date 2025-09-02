@@ -1,0 +1,179 @@
+services:
+  # NATS Cluster Node 1
+  nats-motadata-1:
+    image: nats:2.10-alpine
+    container_name: nats-motadata-1
+    hostname: nats-motadata-1
+    ports:
+      - "4222:4222"    # Client connections
+      - "8222:8222"    # HTTP monitoring
+      - "6222:6222"    # Cluster routes
+      - "11222:11222"  # Profiling
+    volumes:
+      - ./nats-cluster/config/nats-server-1.conf:/etc/nats/nats-server.conf:ro
+      - nats1_data:/data/jetstream
+      - nats1_logs:/logs
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nats", "server", "ping", "--server=nats://localhost:4222"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # NATS Cluster Node 2
+  nats-motadata-2:
+    image: nats:2.10-alpine
+    container_name: nats-motadata-2
+    hostname: nats-motadata-2
+    ports:
+      - "4223:4222"    # Client connections
+      - "8223:8222"    # HTTP monitoring
+      - "6223:6222"    # Cluster routes
+      - "11223:11222"  # Profiling
+    volumes:
+      - ./nats-cluster/config/nats-server-2.conf:/etc/nats/nats-server.conf:ro
+      - nats2_data:/data/jetstream
+      - nats2_logs:/logs
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    depends_on:
+      - nats-motadata-1
+    healthcheck:
+      test: ["CMD", "nats", "server", "ping", "--server=nats://localhost:4222"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # NATS Cluster Node 3
+  nats-motadata-3:
+    image: nats:2.10-alpine
+    container_name: nats-motadata-3
+    hostname: nats-motadata-3
+    ports:
+      - "4224:4222"    # Client connections
+      - "8224:8222"    # HTTP monitoring
+      - "6224:6222"    # Cluster routes
+      - "11224:11222"  # Profiling
+    volumes:
+      - ./nats-cluster/config/nats-server-3.conf:/etc/nats/nats-server.conf:ro
+      - nats3_data:/data/jetstream
+      - nats3_logs:/logs
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    depends_on:
+      - nats-motadata-1
+      - nats-motadata-2
+    healthcheck:
+      test: ["CMD", "nats", "server", "ping", "--server=nats://localhost:4222"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # NATS Box for cluster management and testing
+  nats-box:
+    image: natsio/nats-box:0.14.3
+    container_name: nats-box
+    hostname: nats-box
+    networks:
+      - nats-cluster
+    depends_on:
+      - nats-motadata-1
+      - nats-motadata-2
+      - nats-motadata-3
+    command: ["tail", "-f", "/dev/null"]
+    volumes:
+      - ./scripts:/scripts:ro
+
+  # Ticket Service
+  ticket-svc:
+    build:
+      context: ../src/ticket-svc
+      dockerfile: Dockerfile
+    container_name: ticket-svc
+    hostname: ticket-svc
+    ports:
+      - "8080:8080"
+    environment:
+      - NATS_URL=nats://nats-motadata-1:4222,nats://nats-motadata-2:4222,nats://nats-motadata-3:4222
+      - PORT=8080
+      - SERVICE_NAME=ticket-svc
+      - LOG_LEVEL=info
+      - X_TENANT_HEADER=X-Tenant-ID
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+
+  # Notification Service
+  notification-svc:
+    build:
+      context: ../src/notification-svc
+      dockerfile: Dockerfile
+    container_name: notification-svc
+    hostname: notification-svc
+    ports:
+      - "8081:8081"
+    environment:
+      - NATS_URL=nats://nats-motadata-1:4222,nats://nats-motadata-2:4222,nats://nats-motadata-3:4222
+      - PORT=8081
+      - SERVICE_NAME=notification-svc
+      - LOG_LEVEL=info
+      - LOG_FILE_PATH=/app/logs
+      - X_TENANT_HEADER=X-Tenant-ID
+      - NOTIFICATION_RETENTION_DAYS=30
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    volumes:
+      - notification_logs:/app/logs
+
+  # NATS Stream Manager (creates required streams)
+  stream-manager:
+    image: natsio/nats-box:0.14.3
+    container_name: stream-manager
+    networks:
+      - nats-cluster
+    depends_on:
+      nats-motadata-1:
+        condition: service_healthy
+      nats-motadata-2:
+        condition: service_healthy
+      nats-motadata-3:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    command: ["/scripts/setup-streams.sh"]
+
+# Named volumes for persistent storage
+volumes:
+  nats1_data:
+    driver: local
+  nats1_logs:
+    driver: local
+  nats2_data:
+    driver: local
+  nats2_logs:
+    driver: local
+  nats3_data:
+    driver: local
+  nats3_logs:
+    driver: local
+  notification_logs:
+    driver: local
+
+# Network for NATS cluster communication
+networks:
+  nats-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
