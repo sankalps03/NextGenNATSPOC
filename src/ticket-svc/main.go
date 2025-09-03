@@ -139,6 +139,30 @@ func convertMapToFields(data map[string]interface{}) (map[string]*ticketpb.Field
 	return fields, nil
 }
 
+// convertFieldValueToInterface converts a protobuf FieldValue back to Go interface{}
+func convertFieldValueToInterface(fieldValue *ticketpb.FieldValue) interface{} {
+	if fieldValue == nil {
+		return nil
+	}
+
+	switch v := fieldValue.Value.(type) {
+	case *ticketpb.FieldValue_StringValue:
+		return v.StringValue
+	case *ticketpb.FieldValue_IntValue:
+		return v.IntValue
+	case *ticketpb.FieldValue_DoubleValue:
+		return v.DoubleValue
+	case *ticketpb.FieldValue_BoolValue:
+		return v.BoolValue
+	case *ticketpb.FieldValue_BytesValue:
+		return v.BytesValue
+	case *ticketpb.FieldValue_StringArray:
+		return v.StringArray.Values
+	default:
+		return nil
+	}
+}
+
 // checkForSeverityInFields checks if any field contains severity keywords
 func (ts *TicketService) checkForSeverityInFields(fields map[string]*ticketpb.FieldValue) bool {
 	for _, fieldValue := range fields {
@@ -222,6 +246,8 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 		response, err = ts.handleUpdateTicket(req)
 	case "delete":
 		response, err = ts.handleDeleteTicket(req)
+	case "search":
+		response, err = ts.handleSearchTickets(req)
 	default:
 		response = ErrorResponse{Error: "unknown_action", Message: "Unknown action: " + req.Action}
 	}
@@ -423,6 +449,59 @@ func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, er
 	}, nil
 }
 
+func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, error) {
+	// Parse search conditions from request data
+	var searchRequest struct {
+		Conditions []storage2.SearchCondition `json:"conditions"`
+	}
+
+	// Convert req.Data to search request
+	dataBytes, err := json.Marshal(req.Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request data: %w", err)
+	}
+
+	if err := json.Unmarshal(dataBytes, &searchRequest); err != nil {
+		return nil, fmt.Errorf("failed to parse search conditions: %w", err)
+	}
+
+	// Measure database latency
+	dbStart := time.Now()
+	tickets, err := ts.storage.SearchTickets(req.Tenant, searchRequest.Conditions)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to search tickets: %w", err)
+	}
+
+	// Convert protobuf tickets to response format
+	var responseTickets []map[string]interface{}
+	for _, ticket := range tickets {
+		ticketMap := make(map[string]interface{})
+		ticketMap["id"] = ticket.Id
+		ticketMap["tenant"] = ticket.Tenant
+		ticketMap["created_at"] = ticket.CreatedAt
+		ticketMap["updated_at"] = ticket.UpdatedAt
+
+		// Add dynamic fields
+		for fieldName, fieldValue := range ticket.Fields {
+			ticketMap[fieldName] = convertFieldValueToInterface(fieldValue)
+		}
+
+		responseTickets = append(responseTickets, ticketMap)
+	}
+
+	// Publish search event for auditing
+	if err := ts.publishTicketSearched(context.Background(), req.Tenant, len(tickets), searchRequest.Conditions); err != nil {
+		log.Printf("ERROR: Failed to publish ticket searched event for tenant=%s: %v", req.Tenant, err)
+	}
+
+	return ResponseWithLatency{
+		Data:            responseTickets,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
+}
+
 func connectNATS(urls string) (*NATSManager, error) {
 	serverList := strings.Split(urls, ",")
 	for i, url := range serverList {
@@ -601,6 +680,47 @@ func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenan
 	headers := map[string]string{
 		"tenant":       tenant,
 		"schema":       "notification.event@v1",
+		"Nats-Msg-Id":  uuid.New().String(),
+		"Content-Type": "application/json",
+	}
+
+	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
+}
+
+func (ts *TicketService) publishTicketSearched(ctx context.Context, tenant string, resultCount int, conditions []storage2.SearchCondition) error {
+
+	event := &TicketEvent{
+		Meta: &Meta{
+			EventId:    uuid.New().String(),
+			Tenant:     tenant,
+			OccurredAt: time.Now().Format(time.RFC3339),
+			Schema:     "ticket.event.searched@v1",
+		},
+		Data: &ticketpb.TicketData{
+			Id:        "search-" + uuid.New().String(),
+			Tenant:    tenant,
+			CreatedAt: time.Now().Format(time.RFC3339),
+			UpdatedAt: time.Now().Format(time.RFC3339),
+			Fields: map[string]*ticketpb.FieldValue{
+				"search_result_count": {
+					Value: &ticketpb.FieldValue_IntValue{IntValue: int64(resultCount)},
+				},
+				"search_conditions": {
+					Value: &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%+v", conditions)},
+				},
+			},
+		},
+	}
+
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ticket searched event: %w", err)
+	}
+
+	subject := fmt.Sprintf("%s.ticket.ticket.event.searched", tenant)
+	headers := map[string]string{
+		"tenant":       tenant,
+		"schema":       "ticket.event.searched@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
 	}

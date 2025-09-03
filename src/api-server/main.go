@@ -292,6 +292,42 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
+	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	// Parse search conditions from request body
+	var searchRequest struct {
+		Conditions []map[string]interface{} `json:"conditions"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&searchRequest); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_json", Message: err.Error()})
+		return
+	}
+
+	requestData := map[string]interface{}{
+		"action": "search",
+		"tenant": tenant,
+		"data": map[string]interface{}{
+			"conditions": searchRequest.Conditions,
+		},
+	}
+
+	response, err := h.sendNATSRequest("ticket.service", requestData, 10*time.Second)
+	if err != nil {
+		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(response)
+}
+
 func (h *APIHandler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 
@@ -450,6 +486,7 @@ func setupRouter(handler *APIHandler) *mux.Router {
 
 	api.HandleFunc("/tickets", handler.CreateTicket).Methods("POST")
 	api.HandleFunc("/tickets", handler.ListTickets).Methods("GET")
+	api.HandleFunc("/tickets/search", handler.SearchTickets).Methods("POST")
 	api.HandleFunc("/tickets/{id}", handler.GetTicket).Methods("GET")
 	api.HandleFunc("/tickets/{id}", handler.UpdateTicket).Methods("PUT")
 	api.HandleFunc("/tickets/{id}", handler.DeleteTicket).Methods("DELETE")

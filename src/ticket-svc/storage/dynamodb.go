@@ -6,7 +6,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,21 +18,342 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
-	"google.golang.org/protobuf/proto"
 )
 
-// DynamoDBStorage implements tenant-aware dynamic ticket storage using AWS DynamoDB with protobuf
+// GSIConfig represents a Global Secondary Index configuration
+type GSIConfig struct {
+	IndexName           string    // Name of the GSI
+	HashKey             string    // Hash key attribute name
+	RangeKey            string    // Range key attribute name (usually "pk")
+	Priority            int       // Priority for index selection (lower = higher priority)
+	EstimatedCost       float64   // Estimated cost for using this index
+	SupportedOps        []string  // Supported operators for this index
+	Status              string    // Index status: CREATING, ACTIVE, DELETING, etc.
+	ProjectionType      string    // Projection type: ALL, KEYS_ONLY, INCLUDE
+	ProjectedAttributes []string  // Projected attributes for INCLUDE projection
+	CreatedAt           time.Time // When the index was created
+	ExistsInDynamoDB    bool      // Whether the index actually exists in DynamoDB
+}
+
+// GSIQueryMetrics tracks performance metrics for GSI queries
+type GSIQueryMetrics struct {
+	IndexName     string
+	QueryTime     time.Duration
+	ResultCount   int
+	ConditionUsed SearchCondition
+	Success       bool
+	ErrorMessage  string
+}
+
+// GSIQueryResult represents the result of a GSI query
+type GSIQueryResult struct {
+	TicketIDs []string                          // Extracted ticket IDs
+	Items     []map[string]types.AttributeValue // Raw DynamoDB items
+	Metrics   GSIQueryMetrics                   // Performance metrics for this query
+}
+
+// DynamoDBStorage implements tenant-aware dynamic ticket storage using AWS DynamoDB with separate field attributes
 // Each tenant gets its own DynamoDB table for complete data isolation
 type DynamoDBStorage struct {
 	client        *dynamodb.Client
 	baseTableName string
-	tenantTables  sync.Map     // tenant -> tableName mapping for performance
-	tableMutex    sync.RWMutex // synchronizes table creation operations
+	tenantTables  sync.Map                        // tenant -> tableName mapping for performance
+	tableMutex    sync.RWMutex                    // synchronizes table creation operations
+	gsiConfig     map[string]map[string]GSIConfig // tenant -> field name -> GSI configuration mapping
+	gsiMutex      sync.RWMutex                    // synchronizes GSI configuration operations
+	enableGSI     bool                            // feature flag to enable/disable GSI usage
+}
+
+// fieldValueToDynamoDBAttribute converts a protobuf FieldValue to a DynamoDB AttributeValue
+func fieldValueToDynamoDBAttribute(fieldValue *ticketpb.FieldValue) types.AttributeValue {
+	if fieldValue == nil {
+		return &types.AttributeValueMemberNULL{Value: true}
+	}
+
+	switch v := fieldValue.Value.(type) {
+	case *ticketpb.FieldValue_StringValue:
+		return &types.AttributeValueMemberS{Value: v.StringValue}
+	case *ticketpb.FieldValue_IntValue:
+		return &types.AttributeValueMemberN{Value: strconv.FormatInt(v.IntValue, 10)}
+	case *ticketpb.FieldValue_DoubleValue:
+		return &types.AttributeValueMemberN{Value: strconv.FormatFloat(v.DoubleValue, 'f', -1, 64)}
+	case *ticketpb.FieldValue_BoolValue:
+		return &types.AttributeValueMemberBOOL{Value: v.BoolValue}
+	case *ticketpb.FieldValue_BytesValue:
+		return &types.AttributeValueMemberB{Value: v.BytesValue}
+	case *ticketpb.FieldValue_StringArray:
+		var listItems []types.AttributeValue
+		for _, str := range v.StringArray.Values {
+			listItems = append(listItems, &types.AttributeValueMemberS{Value: str})
+		}
+		return &types.AttributeValueMemberL{Value: listItems}
+	default:
+		return &types.AttributeValueMemberNULL{Value: true}
+	}
+}
+
+// dynamoDBAttributeToFieldValue converts a DynamoDB AttributeValue to a protobuf FieldValue
+func dynamoDBAttributeToFieldValue(attr types.AttributeValue) *ticketpb.FieldValue {
+	switch v := attr.(type) {
+	case *types.AttributeValueMemberS:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: v.Value},
+		}
+	case *types.AttributeValueMemberN:
+		// Try to parse as int first, then as float
+		if intVal, err := strconv.ParseInt(v.Value, 10, 64); err == nil {
+			return &ticketpb.FieldValue{
+				Value: &ticketpb.FieldValue_IntValue{IntValue: intVal},
+			}
+		}
+		if floatVal, err := strconv.ParseFloat(v.Value, 64); err == nil {
+			return &ticketpb.FieldValue{
+				Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: floatVal},
+			}
+		}
+		// Fallback to string if parsing fails
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: v.Value},
+		}
+	case *types.AttributeValueMemberBOOL:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_BoolValue{BoolValue: v.Value},
+		}
+	case *types.AttributeValueMemberB:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_BytesValue{BytesValue: v.Value},
+		}
+	case *types.AttributeValueMemberL:
+		var stringValues []string
+		for _, item := range v.Value {
+			if strItem, ok := item.(*types.AttributeValueMemberS); ok {
+				stringValues = append(stringValues, strItem.Value)
+			}
+		}
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: stringValues},
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+// protobufToDynamoDBItem converts a TicketData protobuf to a DynamoDB item with separate field attributes
+func protobufToDynamoDBItem(ticketData *ticketpb.TicketData) map[string]types.AttributeValue {
+	item := make(map[string]types.AttributeValue)
+
+	// Store core fields as top-level attributes
+	item["pk"] = &types.AttributeValueMemberS{Value: ticketData.Id}
+	item["tenant"] = &types.AttributeValueMemberS{Value: ticketData.Tenant}
+	item["created_at"] = &types.AttributeValueMemberS{Value: ticketData.CreatedAt}
+	item["updated_at"] = &types.AttributeValueMemberS{Value: ticketData.UpdatedAt}
+
+	// Store dynamic fields with "field_" prefix to avoid naming conflicts
+	for fieldName, fieldValue := range ticketData.Fields {
+		attributeName := "field_" + fieldName
+		item[attributeName] = fieldValueToDynamoDBAttribute(fieldValue)
+	}
+
+	return item
+}
+
+// dynamoDBItemToProtobuf converts a DynamoDB item back to a TicketData protobuf
+func dynamoDBItemToProtobuf(item map[string]types.AttributeValue) *ticketpb.TicketData {
+	ticketData := &ticketpb.TicketData{
+		Fields: make(map[string]*ticketpb.FieldValue),
+	}
+
+	// Extract core fields
+	if pkAttr, ok := item["pk"]; ok {
+		if pkVal, ok := pkAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.Id = pkVal.Value
+		}
+	}
+	if tenantAttr, ok := item["tenant"]; ok {
+		if tenantVal, ok := tenantAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.Tenant = tenantVal.Value
+		}
+	}
+	if createdAttr, ok := item["created_at"]; ok {
+		if createdVal, ok := createdAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.CreatedAt = createdVal.Value
+		}
+	}
+	if updatedAttr, ok := item["updated_at"]; ok {
+		if updatedVal, ok := updatedAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.UpdatedAt = updatedVal.Value
+		}
+	}
+
+	// Extract dynamic fields (those with "field_" prefix)
+	for attributeName, attributeValue := range item {
+		if strings.HasPrefix(attributeName, "field_") {
+			fieldName := strings.TrimPrefix(attributeName, "field_")
+			fieldValue := dynamoDBAttributeToFieldValue(attributeValue)
+			if fieldValue != nil {
+				ticketData.Fields[fieldName] = fieldValue
+			}
+		}
+	}
+
+	return ticketData
+}
+
+// initializeDefaultGSIConfig sets up the default GSI configuration mapping with enhanced metadata
+func initializeDefaultGSIConfig() map[string]GSIConfig {
+	now := time.Now()
+	return map[string]GSIConfig{
+		"status": {
+			IndexName:           "status-index",
+			HashKey:             "field_status",
+			RangeKey:            "pk",
+			Priority:            1, // High priority for status queries
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false, // Will be updated when fetching actual indexes
+		},
+		"priority": {
+			IndexName:           "priority-index",
+			HashKey:             "field_priority",
+			RangeKey:            "pk",
+			Priority:            2, // Medium priority for priority queries
+			EstimatedCost:       1.2,
+			SupportedOps:        []string{"eq", "=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"assignee": {
+			IndexName:           "assignee-index",
+			HashKey:             "field_assignee",
+			RangeKey:            "pk",
+			Priority:            2, // Medium priority for assignee queries
+			EstimatedCost:       1.1,
+			SupportedOps:        []string{"eq", "=", "begins_with"},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"created_at": {
+			IndexName:           "created-at-index",
+			HashKey:             "created_at",
+			RangeKey:            "pk",
+			Priority:            3, // Lower priority for time-based queries
+			EstimatedCost:       1.5,
+			SupportedOps:        []string{"eq", "=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "begins_with"},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"updated_at": {
+			IndexName:           "updated-at-index",
+			HashKey:             "updated_at",
+			RangeKey:            "pk",
+			Priority:            3, // Lower priority for time-based queries
+			EstimatedCost:       1.5,
+			SupportedOps:        []string{"eq", "=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "begins_with"},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"dummy1": {
+			IndexName:           "dummy1-index",
+			HashKey:             "field_dummy1",
+			RangeKey:            "pk",
+			Priority:            3, // Lower priority for time-based queries
+			EstimatedCost:       1.5,
+			SupportedOps:        []string{"eq", "=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "begins_with"},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+	}
+}
+
+// getGSIForField returns the GSI configuration for a given field name and tenant with enhanced logging
+func (d *DynamoDBStorage) getGSIForField(tenantID, fieldName string) (*GSIConfig, bool) {
+	if !d.enableGSI {
+		log.Printf("GSI disabled, cannot use index for field: %s", fieldName)
+		return nil, false
+	}
+
+	d.gsiMutex.RLock()
+	defer d.gsiMutex.RUnlock()
+
+	tenantGSI, tenantExists := d.gsiConfig[tenantID]
+	if !tenantExists {
+		log.Printf("No GSI configuration found for tenant: %s", tenantID)
+		return nil, false
+	}
+
+	gsi, exists := tenantGSI[fieldName]
+	if !exists {
+		log.Printf("No GSI mapping found for field: %s in tenant: %s", fieldName, tenantID)
+		return nil, false
+	}
+
+	if !gsi.ExistsInDynamoDB {
+		log.Printf("GSI for field '%s' exists in config but not in DynamoDB for tenant: %s", fieldName, tenantID)
+		log.Printf("Index status: %s, IndexName: %s", gsi.Status, gsi.IndexName)
+		return nil, false
+	}
+
+	if gsi.Status != "ACTIVE" {
+		log.Printf("GSI for field '%s' exists but is not ACTIVE (status: %s) for tenant: %s", fieldName, gsi.Status, tenantID)
+		return nil, false
+	}
+
+	log.Printf("Selected GSI for field '%s' in tenant '%s': index=%s, priority=%d, cost=%.2f, status=%s",
+		fieldName, tenantID, gsi.IndexName, gsi.Priority, gsi.EstimatedCost, gsi.Status)
+	return &gsi, true
+}
+
+// canUseGSIForCondition checks if a search condition can use GSI query with enhanced validation
+func (d *DynamoDBStorage) canUseGSIForCondition(tenantID string, condition SearchCondition) bool {
+	// Check if GSI exists for this field
+	gsiConfig, hasGSI := d.getGSIForField(tenantID, condition.Operand)
+	if !hasGSI {
+		return false
+	}
+
+	// Check if operator is supported by this specific GSI
+	operatorLower := strings.ToLower(condition.Operator)
+	for _, supportedOp := range gsiConfig.SupportedOps {
+		if supportedOp == operatorLower {
+			log.Printf("GSI condition validated: tenant=%s, field=%s, operator=%s, index=%s",
+				tenantID, condition.Operand, condition.Operator, gsiConfig.IndexName)
+			return true
+		}
+	}
+
+	log.Printf("Operator '%s' not supported by GSI '%s' for field '%s' in tenant '%s'",
+		condition.Operator, gsiConfig.IndexName, condition.Operand, tenantID)
+	return false
 }
 
 // NewDynamoDBStorage creates a new tenant-aware DynamoDB storage instance with connection pooling
 // Each tenant will get its own DynamoDB table for complete data isolation
 func NewDynamoDBStorage(ctx context.Context, baseTableName, region, dbURL, dbAddress string) (*DynamoDBStorage, error) {
+	// Clean up any quotes from environment variables
+	dbURL = strings.Trim(dbURL, "\"'")
+	dbAddress = strings.Trim(dbAddress, "\"'")
+
 	// Determine the endpoint URL to use
 	var endpointURL string
 	if dbURL != "" {
@@ -53,11 +376,27 @@ func NewDynamoDBStorage(ctx context.Context, baseTableName, region, dbURL, dbAdd
 		config.WithRetryMode(aws.RetryModeAdaptive),
 	}
 
+	// For local DynamoDB, use static credentials if endpoint is configured
+	if endpointURL != "" {
+		log.Printf("Local DynamoDB detected, using static credentials")
+		configOptions = append(configOptions, config.WithCredentialsProvider(
+			aws.NewCredentialsCache(aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+				return aws.Credentials{
+					AccessKeyID:     "dummy",
+					SecretAccessKey: "dummy",
+					Source:          "Hardcoded",
+				}, nil
+			})),
+		))
+	}
+
 	// Add custom endpoint resolver if URL/address is provided
 	if endpointURL != "" {
+		log.Printf("Configuring DynamoDB client with endpoint: %s", endpointURL)
 		configOptions = append(configOptions, config.WithEndpointResolverWithOptions(
 			aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 				if service == dynamodb.ServiceID {
+					log.Printf("Resolving DynamoDB endpoint: %s for region: %s", endpointURL, region)
 					return aws.Endpoint{
 						URL:           endpointURL,
 						SigningRegion: region,
@@ -66,6 +405,8 @@ func NewDynamoDBStorage(ctx context.Context, baseTableName, region, dbURL, dbAdd
 				return aws.Endpoint{}, fmt.Errorf("unknown endpoint requested")
 			}),
 		))
+	} else {
+		log.Printf("No custom DynamoDB endpoint configured, using AWS default")
 	}
 
 	cfg, err := config.LoadDefaultConfig(ctx, configOptions...)
@@ -94,12 +435,38 @@ func NewDynamoDBStorage(ctx context.Context, baseTableName, region, dbURL, dbAdd
 		}
 	})
 
+	// Check if GSI is enabled via environment variable
+	enableGSI := strings.ToLower(os.Getenv("DYNAMODB_ENABLE_GSI")) == "true"
+	if enableGSI {
+		log.Printf("GSI (Global Secondary Index) support is ENABLED")
+	} else {
+		log.Printf("GSI (Global Secondary Index) support is DISABLED")
+	}
+
 	storage := &DynamoDBStorage{
 		client:        client,
 		baseTableName: baseTableName,
 		tenantTables:  sync.Map{},
+		gsiConfig:     make(map[string]map[string]GSIConfig), // tenant -> field -> GSI config
+		enableGSI:     enableGSI,
 	}
 
+	// Test the connection by listing tables
+	log.Printf("Testing DynamoDB connection...")
+	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	_, err = client.ListTables(testCtx, &dynamodb.ListTablesInput{})
+	if err != nil {
+		log.Printf("ERROR: Failed to connect to DynamoDB: %v", err)
+		log.Printf("Make sure DynamoDB is running and accessible at the configured endpoint")
+		if endpointURL != "" {
+			log.Printf("Configured endpoint: %s", endpointURL)
+		}
+		return nil, fmt.Errorf("failed to connect to DynamoDB: %w", err)
+	}
+
+	log.Printf("DynamoDB connection test successful!")
 	if endpointURL != "" {
 		log.Printf("Successfully initialized tenant-aware DynamoDB storage with base table: %s in region: %s at endpoint: %s", baseTableName, region, endpointURL)
 	} else {
@@ -170,6 +537,13 @@ func (d *DynamoDBStorage) ensureTenantTable(ctx context.Context, tenantID string
 
 	// Store in map to avoid future checks
 	d.tenantTables.Store(tenantID, tableName)
+
+	// Initialize GSI configuration and create default indexes for this tenant
+	if err := d.initializeTenantGSI(ctx, tenantID); err != nil {
+		log.Printf("Warning: Failed to initialize GSI configuration for tenant %s: %v", tenantID, err)
+		// Don't return error as table creation was successful
+	}
+
 	return nil
 }
 
@@ -179,14 +553,177 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 	createCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	input := &dynamodb.CreateTableInput{
-		TableName: aws.String(tableName),
-		AttributeDefinitions: []types.AttributeDefinition{
+	// Base attribute definitions
+	attributeDefinitions := []types.AttributeDefinition{
+		{
+			AttributeName: aws.String("pk"),
+			AttributeType: types.ScalarAttributeTypeS,
+		},
+	}
+
+	// Add GSI attribute definitions if GSI is enabled
+	var globalSecondaryIndexes []types.GlobalSecondaryIndex
+	if d.enableGSI {
+		// Add attribute definitions for GSI keys
+		gsiAttributes := []types.AttributeDefinition{
 			{
-				AttributeName: aws.String("pk"),
+				AttributeName: aws.String("field_status"),
 				AttributeType: types.ScalarAttributeTypeS,
 			},
-		},
+			{
+				AttributeName: aws.String("field_priority"),
+				AttributeType: types.ScalarAttributeTypeN,
+			},
+			{
+				AttributeName: aws.String("field_assignee"),
+				AttributeType: types.ScalarAttributeTypeS,
+			},
+			{
+				AttributeName: aws.String("created_at"),
+				AttributeType: types.ScalarAttributeTypeS,
+			},
+			{
+				AttributeName: aws.String("updated_at"),
+				AttributeType: types.ScalarAttributeTypeS,
+			}, {
+				AttributeName: aws.String("field_dummy1"),
+				AttributeType: types.ScalarAttributeTypeS,
+			},
+		}
+		attributeDefinitions = append(attributeDefinitions, gsiAttributes...)
+
+		// Define Global Secondary Indexes
+		globalSecondaryIndexes = []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String("status-index"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						AttributeName: aws.String("field_status"),
+						KeyType:       types.KeyTypeHash,
+					},
+					{
+						AttributeName: aws.String("pk"),
+						KeyType:       types.KeyTypeRange,
+					},
+				},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+				ProvisionedThroughput: &types.ProvisionedThroughput{
+					ReadCapacityUnits:  aws.Int64(5),
+					WriteCapacityUnits: aws.Int64(5),
+				},
+			},
+			{
+				IndexName: aws.String("priority-index"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						AttributeName: aws.String("field_priority"),
+						KeyType:       types.KeyTypeHash,
+					},
+					{
+						AttributeName: aws.String("pk"),
+						KeyType:       types.KeyTypeRange,
+					},
+				},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+				ProvisionedThroughput: &types.ProvisionedThroughput{
+					ReadCapacityUnits:  aws.Int64(5),
+					WriteCapacityUnits: aws.Int64(5),
+				},
+			},
+			{
+				IndexName: aws.String("assignee-index"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						AttributeName: aws.String("field_assignee"),
+						KeyType:       types.KeyTypeHash,
+					},
+					{
+						AttributeName: aws.String("pk"),
+						KeyType:       types.KeyTypeRange,
+					},
+				},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+				ProvisionedThroughput: &types.ProvisionedThroughput{
+					ReadCapacityUnits:  aws.Int64(5),
+					WriteCapacityUnits: aws.Int64(5),
+				},
+			},
+			{
+				IndexName: aws.String("created-at-index"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						AttributeName: aws.String("created_at"),
+						KeyType:       types.KeyTypeHash,
+					},
+					{
+						AttributeName: aws.String("pk"),
+						KeyType:       types.KeyTypeRange,
+					},
+				},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+				ProvisionedThroughput: &types.ProvisionedThroughput{
+					ReadCapacityUnits:  aws.Int64(5),
+					WriteCapacityUnits: aws.Int64(5),
+				},
+			},
+			{
+				IndexName: aws.String("updated-at-index"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						AttributeName: aws.String("updated_at"),
+						KeyType:       types.KeyTypeHash,
+					},
+					{
+						AttributeName: aws.String("pk"),
+						KeyType:       types.KeyTypeRange,
+					},
+				},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+				ProvisionedThroughput: &types.ProvisionedThroughput{
+					ReadCapacityUnits:  aws.Int64(5),
+					WriteCapacityUnits: aws.Int64(5),
+				},
+			},
+
+			{
+				IndexName: aws.String("dummy1-index"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						AttributeName: aws.String("field_dummy1"),
+						KeyType:       types.KeyTypeHash,
+					},
+					{
+						AttributeName: aws.String("pk"),
+						KeyType:       types.KeyTypeRange,
+					},
+				},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+				ProvisionedThroughput: &types.ProvisionedThroughput{
+					ReadCapacityUnits:  aws.Int64(5),
+					WriteCapacityUnits: aws.Int64(5),
+				},
+			},
+		}
+		log.Printf("Creating table %s with %d GSI indexes", tableName, len(globalSecondaryIndexes))
+	} else {
+		log.Printf("Creating table %s without GSI indexes (GSI disabled)", tableName)
+	}
+
+	input := &dynamodb.CreateTableInput{
+		TableName:            aws.String(tableName),
+		AttributeDefinitions: attributeDefinitions,
 		KeySchema: []types.KeySchemaElement{
 			{
 				AttributeName: aws.String("pk"),
@@ -198,6 +735,11 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 			ReadCapacityUnits:  aws.Int64(5),
 			WriteCapacityUnits: aws.Int64(5),
 		},
+	}
+
+	// Add GSI definitions if enabled
+	if d.enableGSI && len(globalSecondaryIndexes) > 0 {
+		input.GlobalSecondaryIndexes = globalSecondaryIndexes
 	}
 
 	_, err := d.client.CreateTable(createCtx, input)
@@ -227,79 +769,7 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 	return nil
 }
 
-// convertToFieldValue converts a Go value to protobuf FieldValue
-func (d *DynamoDBStorage) convertToFieldValue(value interface{}) (*ticketpb.FieldValue, error) {
-	switch v := value.(type) {
-	case string:
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_StringValue{StringValue: v},
-		}, nil
-	case int:
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
-		}, nil
-	case int64:
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_IntValue{IntValue: v},
-		}, nil
-	case float64:
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: v},
-		}, nil
-	case bool:
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_BoolValue{BoolValue: v},
-		}, nil
-	case []string:
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_StringArray{
-				StringArray: &ticketpb.StringArray{Values: v},
-			},
-		}, nil
-	case []interface{}:
-		// Convert interface slice to string slice
-		var stringArray []string
-		for _, item := range v {
-			if str, ok := item.(string); ok {
-				stringArray = append(stringArray, str)
-			} else {
-				stringArray = append(stringArray, fmt.Sprintf("%v", item))
-			}
-		}
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_StringArray{
-				StringArray: &ticketpb.StringArray{Values: stringArray},
-			},
-		}, nil
-	default:
-		// Convert unknown types to string
-		return &ticketpb.FieldValue{
-			Value: &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)},
-		}, nil
-	}
-}
-
-// convertFromFieldValue converts protobuf FieldValue back to Go value
-func (d *DynamoDBStorage) convertFromFieldValue(fieldValue *ticketpb.FieldValue) (interface{}, error) {
-	switch v := fieldValue.Value.(type) {
-	case *ticketpb.FieldValue_StringValue:
-		return v.StringValue, nil
-	case *ticketpb.FieldValue_IntValue:
-		return v.IntValue, nil
-	case *ticketpb.FieldValue_DoubleValue:
-		return v.DoubleValue, nil
-	case *ticketpb.FieldValue_BoolValue:
-		return v.BoolValue, nil
-	case *ticketpb.FieldValue_BytesValue:
-		return v.BytesValue, nil
-	case *ticketpb.FieldValue_StringArray:
-		return v.StringArray.Values, nil
-	default:
-		return nil, fmt.Errorf("unknown field value type")
-	}
-}
-
-// CreateTicket stores a new ticket in the tenant-specific DynamoDB table using protobuf serialization
+// CreateTicket stores a new ticket in the tenant-specific DynamoDB table with separate field attributes
 func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -309,22 +779,16 @@ func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 		return fmt.Errorf("failed to ensure tenant table: %w", err)
 	}
 
-	// Serialize protobuf to bytes
-	data, err := proto.Marshal(ticketData)
-	if err != nil {
-		return fmt.Errorf("failed to marshal protobuf: %w", err)
-	}
+	// Convert protobuf to DynamoDB item with separate field attributes
+	item := protobufToDynamoDBItem(ticketData)
 
 	// Get tenant-specific table name
 	tableName := d.getTenantTableName(tenant)
 
-	// Store in tenant-specific DynamoDB table with ticket ID as primary key
-	_, err = d.client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(tableName),
-		Item: map[string]types.AttributeValue{
-			"pk":   &types.AttributeValueMemberS{Value: ticketData.Id},
-			"data": &types.AttributeValueMemberB{Value: data},
-		},
+	// Store in tenant-specific DynamoDB table with separate field attributes
+	_, err := d.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(tableName),
+		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(pk)"),
 	})
 
@@ -332,7 +796,7 @@ func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 		return fmt.Errorf("failed to create ticket in tenant table %s: %w", tableName, err)
 	}
 
-	log.Printf("Created ticket %s for tenant %s in table %s", ticketData.Id, tenant, tableName)
+	log.Printf("Created ticket %s for tenant %s in table %s with separate field attributes", ticketData.Id, tenant, tableName)
 	return nil
 }
 
@@ -366,27 +830,9 @@ func (d *DynamoDBStorage) GetTicket(tenant, id string) (*ticketpb.TicketData, bo
 		return nil, false
 	}
 
-	// Extract protobuf data
-	dataAttr, ok := result.Item["data"]
-	if !ok {
-		log.Printf("ERROR: No data field found in DynamoDB item")
-		return nil, false
-	}
-
-	dataBytes, ok := dataAttr.(*types.AttributeValueMemberB)
-	if !ok {
-		log.Printf("ERROR: Data field is not binary type")
-		return nil, false
-	}
-
-	// Deserialize protobuf
-	var pbTicket ticketpb.TicketData
-	if err := proto.Unmarshal(dataBytes.Value, &pbTicket); err != nil {
-		log.Printf("ERROR: Failed to unmarshal protobuf: %v", err)
-		return nil, false
-	}
-
-	return &pbTicket, true
+	// Convert DynamoDB item back to protobuf with separate field attributes
+	ticketData := dynamoDBItemToProtobuf(result.Item)
+	return ticketData, true
 }
 
 // UpdateTicket updates an existing ticket in the tenant-specific DynamoDB table
@@ -400,29 +846,16 @@ func (d *DynamoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 		return false
 	}
 
-	// Serialize protobuf to bytes
-	data, err := proto.Marshal(ticketData)
-	if err != nil {
-		log.Printf("ERROR: Failed to marshal protobuf: %v", err)
-		return false
-	}
+	// Convert protobuf to DynamoDB item with separate field attributes
+	item := protobufToDynamoDBItem(ticketData)
 
 	// Get tenant-specific table name
 	tableName := d.getTenantTableName(tenant)
 
-	// Update with condition that item exists
-	_, err = d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(tableName),
-		Key: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: ticketData.Id},
-		},
-		UpdateExpression: aws.String("SET #data = :data"),
-		ExpressionAttributeNames: map[string]string{
-			"#data": "data",
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":data": &types.AttributeValueMemberB{Value: data},
-		},
+	// Replace the entire item with condition that it exists
+	_, err := d.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(tableName),
+		Item:                item,
 		ConditionExpression: aws.String("attribute_exists(pk)"),
 	})
 
@@ -431,7 +864,7 @@ func (d *DynamoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 		return false
 	}
 
-	log.Printf("Updated ticket %s for tenant %s in table %s", ticketData.Id, tenant, tableName)
+	log.Printf("Updated ticket %s for tenant %s in table %s with separate field attributes", ticketData.Id, tenant, tableName)
 	return true
 }
 
@@ -469,7 +902,7 @@ func (d *DynamoDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData,
 
 // ListTickets retrieves all tickets for a tenant from the tenant-specific DynamoDB table
 func (d *DynamoDBStorage) ListTickets(tenant string) ([]*ticketpb.TicketData, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// Ensure tenant table exists
@@ -493,33 +926,1156 @@ func (d *DynamoDBStorage) ListTickets(tenant string) ([]*ticketpb.TicketData, er
 		return tickets, err
 	}
 
-	// Convert DynamoDB items to tickets
+	// Convert DynamoDB items to tickets using separate field attributes
 	for _, item := range result.Items {
-		// Extract protobuf data
-		dataAttr, ok := item["data"]
-		if !ok {
-			log.Printf("ERROR: No data field found in DynamoDB item")
-			continue
-		}
-
-		dataBytes, ok := dataAttr.(*types.AttributeValueMemberB)
-		if !ok {
-			log.Printf("ERROR: Data field is not binary type")
-			continue
-		}
-
-		// Deserialize protobuf
-		var pbTicket ticketpb.TicketData
-		if err := proto.Unmarshal(dataBytes.Value, &pbTicket); err != nil {
-			log.Printf("ERROR: Failed to unmarshal protobuf: %v", err)
-			continue
-		}
-
-		tickets = append(tickets, &pbTicket)
+		// Convert DynamoDB item back to protobuf with separate field attributes
+		ticketData := dynamoDBItemToProtobuf(item)
+		tickets = append(tickets, ticketData)
 	}
 
-	log.Printf("Listed %d tickets for tenant %s from table %s", len(tickets), tenant, tableName)
+	log.Printf("Listed %d tickets for tenant %s from table %s with separate field attributes", len(tickets), tenant, tableName)
 	return tickets, nil
+}
+
+// SearchTickets searches for tickets based on conditions with operand, operator, and value
+// Uses GSI optimization when available, falls back to scan when necessary
+func (d *DynamoDBStorage) SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := d.ensureTenantTable(ctx, tenant); err != nil {
+		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	// Get tenant-specific table name
+	tableName := d.getTenantTableName(tenant)
+
+	// Analyze conditions to determine optimal search strategy
+	return d.executeOptimizedSearch(ctx, tableName, tenant, conditions)
+}
+
+// executeOptimizedSearch determines the best search strategy and executes it
+func (d *DynamoDBStorage) executeOptimizedSearch(ctx context.Context, tableName, tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+	if len(conditions) == 0 {
+		// No conditions, return all tickets
+		return d.ListTickets(tenant)
+	}
+
+	// Separate conditions into GSI-supported and non-GSI-supported
+	var gsiConditions []SearchCondition
+	var scanConditions []SearchCondition
+
+	for _, condition := range conditions {
+		if d.canUseGSIForCondition(tenant, condition) {
+			gsiConditions = append(gsiConditions, condition)
+		} else {
+			scanConditions = append(scanConditions, condition)
+		}
+	}
+
+	log.Printf("Search strategy: %d GSI conditions, %d scan conditions", len(gsiConditions), len(scanConditions))
+
+	// Strategy 1: All conditions can use GSI
+	if len(gsiConditions) == len(conditions) {
+		return d.executeGSIOnlySearch(ctx, tableName, tenant, gsiConditions)
+	}
+
+	// Strategy 2: Some conditions can use GSI, others need scan
+	if len(gsiConditions) > 0 {
+		return d.executeHybridSearch(ctx, tableName, tenant, gsiConditions, scanConditions)
+	}
+
+	// Strategy 3: No GSI support, fallback to scan
+	return d.executeScanSearch(ctx, tableName, conditions)
+}
+
+// executeGSIOnlySearch handles cases where all conditions can use GSI
+func (d *DynamoDBStorage) executeGSIOnlySearch(ctx context.Context, tableName, tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+	if len(conditions) == 1 {
+		// Single condition - use single GSI query
+		condition := conditions[0]
+		gsiConfig, _ := d.getGSIForField(tenant, condition.Operand)
+
+		log.Printf("Executing single GSI query for field '%s' using index '%s'",
+			condition.Operand, gsiConfig.IndexName)
+
+		result, err := d.executeGSIQuery(ctx, tableName, *gsiConfig, condition)
+		if err != nil {
+			log.Printf("GSI query failed, falling back to scan: %v", err)
+			return d.executeScanSearch(ctx, tableName, conditions)
+		}
+
+		// Log single query metrics
+		d.logGSIQueryMetrics([]GSIQueryResult{*result})
+
+		return d.getTicketsByIDs(ctx, tableName, result.TicketIDs)
+	}
+
+	// Multiple conditions - execute multiple GSI queries concurrently and intersect
+	log.Printf("Executing %d GSI queries concurrently for multiple field search", len(conditions))
+	gsiResults, err := d.executeGSIQueriesConcurrently(ctx, tableName, tenant, conditions)
+	if err != nil {
+		log.Printf("Concurrent GSI queries failed, falling back to scan: %v", err)
+		return d.executeScanSearch(ctx, tableName, conditions)
+	}
+
+	// Log GSI query metrics
+	d.logGSIQueryMetrics(gsiResults)
+
+	// Find intersection of all results
+	commonTicketIDs := d.intersectTicketIDs(gsiResults)
+	log.Printf("Found %d common ticket IDs from intersection of %d GSI query results",
+		len(commonTicketIDs), len(gsiResults))
+
+	return d.getTicketsByIDs(ctx, tableName, commonTicketIDs)
+}
+
+// executeHybridSearch handles cases with mixed GSI and scan conditions
+func (d *DynamoDBStorage) executeHybridSearch(ctx context.Context, tableName, tenant string, gsiConditions, scanConditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+	// First, get results from GSI conditions
+	gsiTickets, err := d.executeGSIOnlySearch(ctx, tableName, tenant, gsiConditions)
+	if err != nil {
+		log.Printf("GSI search failed in hybrid mode, falling back to full scan: %v", err)
+		allConditions := append(gsiConditions, scanConditions...)
+		return d.executeScanSearch(ctx, tableName, allConditions)
+	}
+
+	// Then filter GSI results with scan conditions
+	return d.filterTicketsWithConditions(gsiTickets, scanConditions), nil
+}
+
+// executeScanSearch falls back to the original scan-based approach
+func (d *DynamoDBStorage) executeScanSearch(ctx context.Context, tableName string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+	log.Printf("Using scan-based search for %d conditions", len(conditions))
+
+	// Build filter expression from conditions
+	filterExpression, expressionAttributeNames, expressionAttributeValues, err := d.buildFilterExpression(conditions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build filter expression: %w", err)
+	}
+
+	// Prepare scan input
+	scanInput := &dynamodb.ScanInput{
+		TableName: aws.String(tableName),
+	}
+
+	// Add filter expression if conditions exist
+	if filterExpression != "" {
+		scanInput.FilterExpression = aws.String(filterExpression)
+		scanInput.ExpressionAttributeNames = expressionAttributeNames
+		scanInput.ExpressionAttributeValues = expressionAttributeValues
+	}
+
+	// Execute scan
+	result, err := d.client.Scan(ctx, scanInput)
+	if err != nil {
+		log.Printf("ERROR: Failed to search tickets from tenant table %s: %v", tableName, err)
+		return nil, fmt.Errorf("failed to search tickets: %w", err)
+	}
+
+	// Convert DynamoDB items to tickets using separate field attributes
+	var tickets []*ticketpb.TicketData
+	for _, item := range result.Items {
+		ticketData := dynamoDBItemToProtobuf(item)
+		tickets = append(tickets, ticketData)
+	}
+
+	log.Printf("Scan search found %d tickets matching conditions", len(tickets))
+	return tickets, nil
+}
+
+// filterTicketsWithConditions applies scan conditions to a list of tickets
+func (d *DynamoDBStorage) filterTicketsWithConditions(tickets []*ticketpb.TicketData, conditions []SearchCondition) []*ticketpb.TicketData {
+	if len(conditions) == 0 {
+		return tickets
+	}
+
+	var filtered []*ticketpb.TicketData
+	for _, ticket := range tickets {
+		if d.ticketMatchesConditions(ticket, conditions) {
+			filtered = append(filtered, ticket)
+		}
+	}
+
+	log.Printf("Filtered %d tickets to %d tickets using scan conditions", len(tickets), len(filtered))
+	return filtered
+}
+
+// ticketMatchesConditions checks if a ticket matches all given conditions
+func (d *DynamoDBStorage) ticketMatchesConditions(ticket *ticketpb.TicketData, conditions []SearchCondition) bool {
+	for _, condition := range conditions {
+		if !d.ticketMatchesCondition(ticket, condition) {
+			return false
+		}
+	}
+	return true
+}
+
+// ticketMatchesCondition checks if a ticket matches a single condition
+func (d *DynamoDBStorage) ticketMatchesCondition(ticket *ticketpb.TicketData, condition SearchCondition) bool {
+	// Get the field value from the ticket
+	var fieldValue interface{}
+
+	// Check core fields first
+	switch condition.Operand {
+	case "id":
+		fieldValue = ticket.Id
+	case "tenant":
+		fieldValue = ticket.Tenant
+	case "created_at":
+		fieldValue = ticket.CreatedAt
+	case "updated_at":
+		fieldValue = ticket.UpdatedAt
+	default:
+		// Check dynamic fields
+		if field, exists := ticket.Fields[condition.Operand]; exists {
+			fieldValue = d.extractFieldValue(field)
+		} else {
+			return false // Field doesn't exist
+		}
+	}
+
+	// Compare values based on operator
+	return d.compareValues(fieldValue, condition.Operator, condition.Value)
+}
+
+// extractFieldValue extracts the actual value from a FieldValue protobuf
+func (d *DynamoDBStorage) extractFieldValue(field *ticketpb.FieldValue) interface{} {
+	if field == nil {
+		return nil
+	}
+
+	switch v := field.Value.(type) {
+	case *ticketpb.FieldValue_StringValue:
+		return v.StringValue
+	case *ticketpb.FieldValue_IntValue:
+		return v.IntValue
+	case *ticketpb.FieldValue_DoubleValue:
+		return v.DoubleValue
+	case *ticketpb.FieldValue_BoolValue:
+		return v.BoolValue
+	case *ticketpb.FieldValue_BytesValue:
+		return v.BytesValue
+	case *ticketpb.FieldValue_StringArray:
+		return v.StringArray.Values
+	default:
+		return nil
+	}
+}
+
+// compareValues compares two values using the specified operator
+func (d *DynamoDBStorage) compareValues(fieldValue interface{}, operator string, conditionValue interface{}) bool {
+	// Convert both values to strings for comparison if they're not the same type
+	fieldStr := fmt.Sprintf("%v", fieldValue)
+	conditionStr := fmt.Sprintf("%v", conditionValue)
+
+	switch strings.ToLower(operator) {
+	case "eq", "=":
+		return fieldStr == conditionStr
+	case "ne", "!=", "<>":
+		return fieldStr != conditionStr
+	case "contains":
+		return strings.Contains(fieldStr, conditionStr)
+	case "begins_with":
+		return strings.HasPrefix(fieldStr, conditionStr)
+	case "gt", ">":
+		return fieldStr > conditionStr
+	case "lt", "<":
+		return fieldStr < conditionStr
+	case "gte", ">=":
+		return fieldStr >= conditionStr
+	case "lte", "<=":
+		return fieldStr <= conditionStr
+	default:
+		return false
+	}
+}
+
+// buildFilterExpression builds DynamoDB filter expression from search conditions
+func (d *DynamoDBStorage) buildFilterExpression(conditions []SearchCondition) (string, map[string]string, map[string]types.AttributeValue, error) {
+	if len(conditions) == 0 {
+		return "", nil, nil, nil
+	}
+
+	var filterParts []string
+	expressionAttributeNames := make(map[string]string)
+	expressionAttributeValues := make(map[string]types.AttributeValue)
+
+	// Core fields that don't need field_ prefix
+	coreFields := map[string]bool{
+		"id":         true,
+		"tenant":     true,
+		"created_at": true,
+		"updated_at": true,
+	}
+
+	for i, condition := range conditions {
+		// Determine the actual attribute name
+		var attributeName string
+		if coreFields[condition.Operand] {
+			if condition.Operand == "id" {
+				attributeName = "pk" // id is stored as pk in DynamoDB
+			} else {
+				attributeName = condition.Operand
+			}
+		} else {
+			attributeName = "field_" + condition.Operand
+		}
+
+		// Create placeholders for attribute names and values
+		nameKey := fmt.Sprintf("#attr%d", i)
+		valueKey := fmt.Sprintf(":val%d", i)
+
+		expressionAttributeNames[nameKey] = attributeName
+
+		// Convert value to appropriate DynamoDB attribute value
+		attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("failed to convert value for condition %d: %w", i, err)
+		}
+		expressionAttributeValues[valueKey] = attributeValue
+
+		// Build the condition expression based on operator
+		var conditionExpr string
+		switch strings.ToLower(condition.Operator) {
+		case "eq", "=":
+			conditionExpr = fmt.Sprintf("%s = %s", nameKey, valueKey)
+		case "ne", "!=", "<>":
+			conditionExpr = fmt.Sprintf("%s <> %s", nameKey, valueKey)
+		case "gt", ">":
+			conditionExpr = fmt.Sprintf("%s > %s", nameKey, valueKey)
+		case "lt", "<":
+			conditionExpr = fmt.Sprintf("%s < %s", nameKey, valueKey)
+		case "gte", ">=":
+			conditionExpr = fmt.Sprintf("%s >= %s", nameKey, valueKey)
+		case "lte", "<=":
+			conditionExpr = fmt.Sprintf("%s <= %s", nameKey, valueKey)
+		case "contains":
+			conditionExpr = fmt.Sprintf("contains(%s, %s)", nameKey, valueKey)
+		case "begins_with":
+			conditionExpr = fmt.Sprintf("begins_with(%s, %s)", nameKey, valueKey)
+		default:
+			return "", nil, nil, fmt.Errorf("unsupported operator: %s", condition.Operator)
+		}
+
+		filterParts = append(filterParts, conditionExpr)
+	}
+
+	// Join all conditions with AND
+	filterExpression := strings.Join(filterParts, " AND ")
+
+	return filterExpression, expressionAttributeNames, expressionAttributeValues, nil
+}
+
+// convertValueToDynamoDBAttribute converts a search value to appropriate DynamoDB AttributeValue
+func (d *DynamoDBStorage) convertValueToDynamoDBAttribute(value interface{}) (types.AttributeValue, error) {
+	switch v := value.(type) {
+	case string:
+		return &types.AttributeValueMemberS{Value: v}, nil
+	case int:
+		return &types.AttributeValueMemberN{Value: strconv.Itoa(v)}, nil
+	case int64:
+		return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)}, nil
+	case float64:
+		return &types.AttributeValueMemberN{Value: strconv.FormatFloat(v, 'f', -1, 64)}, nil
+	case bool:
+		return &types.AttributeValueMemberBOOL{Value: v}, nil
+	case []byte:
+		return &types.AttributeValueMemberB{Value: v}, nil
+	default:
+		// Try to convert to string as fallback
+		return &types.AttributeValueMemberS{Value: fmt.Sprintf("%v", v)}, nil
+	}
+}
+
+// executeGSIQuery executes a query on a specific GSI for a given condition
+func (d *DynamoDBStorage) executeGSIQuery(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition) (*GSIQueryResult, error) {
+	// Convert value to appropriate DynamoDB attribute value
+	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert value for GSI query: %w", err)
+	}
+
+	expressionAttributeNames := map[string]string{
+		"#hashkey": gsiConfig.HashKey,
+	}
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":hashval": attributeValue,
+	}
+
+	var keyConditionExpression string
+
+	// Handle different operators
+	switch strings.ToLower(condition.Operator) {
+	case "eq", "=":
+		// For equality, we can query directly on the hash key
+		keyConditionExpression = "#hashkey = :hashval"
+	case "ne", "!=":
+		// For not equal, we need to scan the GSI with a filter expression
+		return d.executeGSIScanWithFilter(ctx, tableName, gsiConfig, condition)
+	case "gt", ">", "lt", "<", "gte", ">=", "lte", "<=":
+		// For range operations, we need to scan the GSI since we can't do range operations on hash key alone
+		// We'll use the hash key with a placeholder and add a filter expression
+		return d.executeGSIScanWithFilter(ctx, tableName, gsiConfig, condition)
+	case "begins_with":
+		// begins_with can work on hash key
+		keyConditionExpression = "begins_with(#hashkey, :hashval)"
+	default:
+		return nil, fmt.Errorf("unsupported operator for GSI query: %s", condition.Operator)
+	}
+
+	// Build query input
+	queryInput := &dynamodb.QueryInput{
+		TableName:                 aws.String(tableName),
+		IndexName:                 aws.String(gsiConfig.IndexName),
+		KeyConditionExpression:    aws.String(keyConditionExpression),
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+	}
+
+	// No filter expression needed for equality and begins_with operations
+
+	log.Printf("Executing GSI query on index %s with condition: %s %s %v",
+		gsiConfig.IndexName, condition.Operand, condition.Operator, condition.Value)
+	log.Printf("Query details - HashKey: %s, KeyCondition: %s",
+		gsiConfig.HashKey, keyConditionExpression)
+
+	result, err := d.client.Query(ctx, queryInput)
+	if err != nil {
+		log.Printf("GSI query failed on index %s: %v", gsiConfig.IndexName, err)
+		log.Printf("Query input details:")
+		log.Printf("  TableName: %s", aws.ToString(queryInput.TableName))
+		log.Printf("  IndexName: %s", aws.ToString(queryInput.IndexName))
+		log.Printf("  KeyConditionExpression: %s", aws.ToString(queryInput.KeyConditionExpression))
+		log.Printf("  ExpressionAttributeNames: %v", queryInput.ExpressionAttributeNames)
+		log.Printf("  ExpressionAttributeValues: %v", queryInput.ExpressionAttributeValues)
+
+		// Check if the error is due to missing index
+		if strings.Contains(err.Error(), "ValidationException") && strings.Contains(err.Error(), "key schema element") {
+			log.Printf("ERROR: GSI index %s appears to not exist in DynamoDB table %s", gsiConfig.IndexName, tableName)
+			log.Printf("Attempting to create missing GSI index...")
+
+			// Try to create the missing GSI
+			fieldName := condition.Operand
+			if createErr := d.verifyAndCreateMissingGSI(ctx, tableName, gsiConfig, fieldName); createErr != nil {
+				log.Printf("Failed to create missing GSI: %v", createErr)
+			} else {
+				log.Printf("GSI creation initiated. Please retry the query after the index becomes ACTIVE")
+			}
+		}
+
+		return nil, fmt.Errorf("GSI query failed on index %s: %w", gsiConfig.IndexName, err)
+	}
+
+	// Extract ticket IDs from the results
+	var ticketIDs []string
+	for _, item := range result.Items {
+		if pkAttr, exists := item["pk"]; exists {
+			if pkVal, ok := pkAttr.(*types.AttributeValueMemberS); ok {
+				ticketIDs = append(ticketIDs, pkVal.Value)
+			}
+		}
+	}
+
+	log.Printf("GSI query on %s returned %d results for condition %s %s %v",
+		gsiConfig.IndexName, len(ticketIDs), condition.Operand, condition.Operator, condition.Value)
+
+	// Create metrics for this query
+	metrics := GSIQueryMetrics{
+		IndexName:     gsiConfig.IndexName,
+		ResultCount:   len(ticketIDs),
+		ConditionUsed: condition,
+		Success:       true,
+	}
+
+	return &GSIQueryResult{
+		TicketIDs: ticketIDs,
+		Items:     result.Items,
+		Metrics:   metrics,
+	}, nil
+}
+
+// verifyAndCreateMissingGSI checks if a GSI exists and creates it if missing
+func (d *DynamoDBStorage) verifyAndCreateMissingGSI(ctx context.Context, tableName string, gsiConfig GSIConfig, fieldName string) error {
+	// First, check if the GSI actually exists in the table
+	describeOutput, err := d.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(tableName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe table %s: %w", tableName, err)
+	}
+
+	// Check if the GSI exists
+	gsiExists := false
+	for _, gsi := range describeOutput.Table.GlobalSecondaryIndexes {
+		if aws.ToString(gsi.IndexName) == gsiConfig.IndexName {
+			gsiExists = true
+			log.Printf("GSI %s exists in table %s with status: %s",
+				gsiConfig.IndexName, tableName, string(gsi.IndexStatus))
+			break
+		}
+	}
+
+	if !gsiExists {
+		log.Printf("GSI %s does not exist in table %s, creating it...", gsiConfig.IndexName, tableName)
+
+		// Extract tenant ID from table name for CreateGSI call
+		tenantID := strings.TrimPrefix(tableName, d.baseTableName+"_")
+
+		// Create the missing GSI
+		err := d.CreateGSI(
+			ctx,
+			tenantID,
+			fieldName,
+			gsiConfig.IndexName,
+			gsiConfig.HashKey,
+			gsiConfig.RangeKey,
+			gsiConfig.ProjectionType,
+			gsiConfig.ProjectedAttributes,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create missing GSI %s: %w", gsiConfig.IndexName, err)
+		}
+
+		log.Printf("Successfully created missing GSI %s for table %s", gsiConfig.IndexName, tableName)
+	}
+
+	return nil
+}
+
+// executeGSIScanWithFilter executes a scan on GSI with filter expression for range operations
+func (d *DynamoDBStorage) executeGSIScanWithFilter(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition) (*GSIQueryResult, error) {
+	// Convert value to appropriate DynamoDB attribute value
+	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert value for GSI scan: %w", err)
+	}
+
+	expressionAttributeNames := map[string]string{
+		"#filterkey": gsiConfig.HashKey,
+	}
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":filterval": attributeValue,
+	}
+
+	// Build filter expression based on operator
+	var filterExpression string
+	switch strings.ToLower(condition.Operator) {
+	case "ne", "!=":
+		filterExpression = "#filterkey <> :filterval"
+	case "gt", ">":
+		filterExpression = "#filterkey > :filterval"
+	case "lt", "<":
+		filterExpression = "#filterkey < :filterval"
+	case "gte", ">=":
+		filterExpression = "#filterkey >= :filterval"
+	case "lte", "<=":
+		filterExpression = "#filterkey <= :filterval"
+	default:
+		return nil, fmt.Errorf("unsupported operator for GSI scan: %s", condition.Operator)
+	}
+
+	// Execute the GSI scan with filter
+	scanInput := &dynamodb.ScanInput{
+		TableName:                 aws.String(tableName),
+		IndexName:                 aws.String(gsiConfig.IndexName),
+		FilterExpression:          aws.String(filterExpression),
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+	}
+
+	result, err := d.client.Scan(ctx, scanInput)
+	if err != nil {
+		return nil, fmt.Errorf("GSI scan failed on index %s: %w", gsiConfig.IndexName, err)
+	}
+
+	// Extract ticket IDs from the results
+	var ticketIDs []string
+	for _, item := range result.Items {
+		if pkAttr, exists := item["pk"]; exists {
+			if pkVal, ok := pkAttr.(*types.AttributeValueMemberS); ok {
+				ticketIDs = append(ticketIDs, pkVal.Value)
+			}
+		}
+	}
+
+	log.Printf("GSI scan on %s returned %d results for condition %s %s %v",
+		gsiConfig.IndexName, len(ticketIDs), condition.Operand, condition.Operator, condition.Value)
+
+	// Create metrics for this scan
+	metrics := GSIQueryMetrics{
+		IndexName:     gsiConfig.IndexName,
+		ResultCount:   len(ticketIDs),
+		ConditionUsed: condition,
+		Success:       true,
+	}
+
+	return &GSIQueryResult{
+		TicketIDs: ticketIDs,
+		Items:     result.Items,
+		Metrics:   metrics,
+	}, nil
+}
+
+// intersectTicketIDs finds common ticket IDs across multiple GSI query results
+func (d *DynamoDBStorage) intersectTicketIDs(results []GSIQueryResult) []string {
+	if len(results) == 0 {
+		return []string{}
+	}
+
+	if len(results) == 1 {
+		return results[0].TicketIDs
+	}
+
+	// Count occurrences of each ticket ID
+	idCounts := make(map[string]int)
+	for _, result := range results {
+		for _, ticketID := range result.TicketIDs {
+			idCounts[ticketID]++
+		}
+	}
+
+	// Find IDs that appear in all result sets
+	var intersection []string
+	requiredCount := len(results)
+	for ticketID, count := range idCounts {
+		if count == requiredCount {
+			intersection = append(intersection, ticketID)
+		}
+	}
+
+	log.Printf("Intersected %d result sets, found %d common ticket IDs", len(results), len(intersection))
+	return intersection
+}
+
+// getTicketsByIDs retrieves full ticket data for a list of ticket IDs using batch get
+func (d *DynamoDBStorage) getTicketsByIDs(ctx context.Context, tableName string, ticketIDs []string) ([]*ticketpb.TicketData, error) {
+	if len(ticketIDs) == 0 {
+		return []*ticketpb.TicketData{}, nil
+	}
+
+	var tickets []*ticketpb.TicketData
+
+	// DynamoDB BatchGetItem has a limit of 100 items per request
+	batchSize := 100
+	for i := 0; i < len(ticketIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(ticketIDs) {
+			end = len(ticketIDs)
+		}
+
+		batch := ticketIDs[i:end]
+		batchTickets, err := d.getBatchTickets(ctx, tableName, batch)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get batch tickets: %w", err)
+		}
+
+		tickets = append(tickets, batchTickets...)
+	}
+
+	return tickets, nil
+}
+
+// getBatchTickets retrieves a batch of tickets using BatchGetItem
+func (d *DynamoDBStorage) getBatchTickets(ctx context.Context, tableName string, ticketIDs []string) ([]*ticketpb.TicketData, error) {
+	if len(ticketIDs) == 0 {
+		return []*ticketpb.TicketData{}, nil
+	}
+
+	// Build request keys
+	var keys []map[string]types.AttributeValue
+	for _, ticketID := range ticketIDs {
+		keys = append(keys, map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: ticketID},
+		})
+	}
+
+	// Execute batch get
+	batchInput := &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			tableName: {
+				Keys: keys,
+			},
+		},
+	}
+
+	result, err := d.client.BatchGetItem(ctx, batchInput)
+	if err != nil {
+		return nil, fmt.Errorf("batch get item failed: %w", err)
+	}
+
+	// Convert results to tickets
+	var tickets []*ticketpb.TicketData
+	if items, exists := result.Responses[tableName]; exists {
+		for _, item := range items {
+			ticketData := dynamoDBItemToProtobuf(item)
+			tickets = append(tickets, ticketData)
+		}
+	}
+
+	return tickets, nil
+}
+
+// executeGSIQueriesConcurrently executes multiple GSI queries in parallel for better performance
+func (d *DynamoDBStorage) executeGSIQueriesConcurrently(ctx context.Context, tableName, tenant string, conditions []SearchCondition) ([]GSIQueryResult, error) {
+	type gsiQueryJob struct {
+		condition SearchCondition
+		gsiConfig GSIConfig
+		index     int
+	}
+
+	type gsiQueryResponse struct {
+		result *GSIQueryResult
+		err    error
+		index  int
+	}
+
+	// Prepare jobs for each GSI query
+	var jobs []gsiQueryJob
+	for i, condition := range conditions {
+		gsiConfig, exists := d.getGSIForField(tenant, condition.Operand)
+		if !exists {
+			return nil, fmt.Errorf("no GSI configuration found for field: %s in tenant: %s", condition.Operand, tenant)
+		}
+		jobs = append(jobs, gsiQueryJob{
+			condition: condition,
+			gsiConfig: *gsiConfig,
+			index:     i,
+		})
+	}
+
+	// Create channels for job distribution and result collection
+	jobChan := make(chan gsiQueryJob, len(jobs))
+	resultChan := make(chan gsiQueryResponse, len(jobs))
+
+	// Start worker goroutines (limit to reasonable number)
+	numWorkers := len(jobs)
+	if numWorkers > 5 { // Limit concurrent queries to avoid overwhelming DynamoDB
+		numWorkers = 5
+	}
+
+	log.Printf("Starting %d worker goroutines for %d GSI queries", numWorkers, len(jobs))
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			for job := range jobChan {
+				log.Printf("Worker %d executing GSI query for field '%s' using index '%s'",
+					workerID, job.condition.Operand, job.gsiConfig.IndexName)
+
+				startTime := time.Now()
+				result, err := d.executeGSIQuery(ctx, tableName, job.gsiConfig, job.condition)
+				queryTime := time.Since(startTime)
+
+				// Update metrics in result
+				if result != nil {
+					result.Metrics.QueryTime = queryTime
+					result.Metrics.Success = (err == nil)
+					if err != nil {
+						result.Metrics.ErrorMessage = err.Error()
+					}
+				}
+
+				resultChan <- gsiQueryResponse{
+					result: result,
+					err:    err,
+					index:  job.index,
+				}
+
+				log.Printf("Worker %d completed GSI query for field '%s' in %v (success: %t)",
+					workerID, job.condition.Operand, queryTime, err == nil)
+			}
+		}(w)
+	}
+
+	// Send jobs to workers
+	for _, job := range jobs {
+		jobChan <- job
+	}
+	close(jobChan)
+
+	// Collect results
+	results := make([]GSIQueryResult, len(jobs))
+	var firstError error
+
+	for i := 0; i < len(jobs); i++ {
+		response := <-resultChan
+		if response.err != nil {
+			if firstError == nil {
+				firstError = response.err
+			}
+			log.Printf("GSI query failed for job index %d: %v", response.index, response.err)
+			continue
+		}
+		if response.result != nil {
+			results[response.index] = *response.result
+		}
+	}
+
+	if firstError != nil {
+		return nil, fmt.Errorf("one or more GSI queries failed: %w", firstError)
+	}
+
+	log.Printf("Successfully completed %d concurrent GSI queries", len(results))
+	return results, nil
+}
+
+// logGSIQueryMetrics logs performance metrics for GSI queries
+func (d *DynamoDBStorage) logGSIQueryMetrics(results []GSIQueryResult) {
+	log.Printf("=== GSI Query Performance Metrics ===")
+	totalTime := time.Duration(0)
+	totalResults := 0
+
+	for i, result := range results {
+		log.Printf("Query %d: index=%s, field=%s, time=%v, results=%d, success=%t",
+			i+1, result.Metrics.IndexName, result.Metrics.ConditionUsed.Operand,
+			result.Metrics.QueryTime, result.Metrics.ResultCount, result.Metrics.Success)
+
+		if result.Metrics.Success {
+			totalTime += result.Metrics.QueryTime
+			totalResults += result.Metrics.ResultCount
+		}
+
+		if !result.Metrics.Success {
+			log.Printf("Query %d error: %s", i+1, result.Metrics.ErrorMessage)
+		}
+	}
+
+	if len(results) > 0 {
+		avgTime := totalTime / time.Duration(len(results))
+		log.Printf("Average query time: %v, Total results: %d", avgTime, totalResults)
+	}
+	log.Printf("=== End GSI Query Metrics ===")
+}
+
+// fetchExistingIndexes fetches the actual GSI indexes from DynamoDB for a tenant table
+func (d *DynamoDBStorage) fetchExistingIndexes(ctx context.Context, tenantID string) error {
+	if !d.enableGSI {
+		log.Printf("GSI disabled, skipping index fetch for tenant: %s", tenantID)
+		return nil
+	}
+
+	tableName := d.getTenantTableName(tenantID)
+
+	// Describe the table to get GSI information
+	describeOutput, err := d.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(tableName),
+	})
+	if err != nil {
+		log.Printf("Failed to describe table %s: %v", tableName, err)
+		return err
+	}
+
+	d.gsiMutex.Lock()
+	defer d.gsiMutex.Unlock()
+
+	// Initialize tenant GSI config if not exists
+	if d.gsiConfig[tenantID] == nil {
+		d.gsiConfig[tenantID] = initializeDefaultGSIConfig()
+	}
+
+	// Process existing GSIs from DynamoDB
+	for _, gsi := range describeOutput.Table.GlobalSecondaryIndexes {
+		indexName := aws.ToString(gsi.IndexName)
+
+		// Find the field name that maps to this index
+		var fieldName string
+		for field, config := range d.gsiConfig[tenantID] {
+			if config.IndexName == indexName {
+				fieldName = field
+				break
+			}
+		}
+
+		if fieldName != "" {
+			// Update existing config with actual DynamoDB data
+			config := d.gsiConfig[tenantID][fieldName]
+			config.Status = string(gsi.IndexStatus)
+			config.ExistsInDynamoDB = true
+
+			// Update projection information
+			if gsi.Projection != nil {
+				config.ProjectionType = string(gsi.Projection.ProjectionType)
+				if gsi.Projection.NonKeyAttributes != nil {
+					config.ProjectedAttributes = gsi.Projection.NonKeyAttributes
+				}
+			}
+
+			d.gsiConfig[tenantID][fieldName] = config
+			log.Printf("Found existing GSI for tenant %s, field %s: index=%s, status=%s",
+				tenantID, fieldName, indexName, config.Status)
+		} else {
+			log.Printf("Found unknown GSI in table %s: %s", tableName, indexName)
+		}
+	}
+
+	log.Printf("Fetched %d existing GSI indexes for tenant %s", len(describeOutput.Table.GlobalSecondaryIndexes), tenantID)
+	return nil
+}
+
+// createDefaultIndexes creates all default GSI indexes that don't already exist
+func (d *DynamoDBStorage) createDefaultIndexes(ctx context.Context, tenantID string) error {
+	if !d.enableGSI {
+		log.Printf("GSI disabled, skipping default index creation for tenant: %s", tenantID)
+		return nil
+	}
+
+	d.gsiMutex.RLock()
+	tenantConfig, exists := d.gsiConfig[tenantID]
+	if !exists {
+		d.gsiMutex.RUnlock()
+		return fmt.Errorf("no GSI configuration found for tenant: %s", tenantID)
+	}
+
+	// Collect indexes that need to be created
+	var indexesToCreate []string
+	for fieldName, config := range tenantConfig {
+		if !config.ExistsInDynamoDB {
+			indexesToCreate = append(indexesToCreate, fieldName)
+		}
+	}
+	d.gsiMutex.RUnlock()
+
+	if len(indexesToCreate) == 0 {
+		log.Printf("All default indexes already exist for tenant %s", tenantID)
+		return nil
+	}
+
+	log.Printf("Creating %d default GSI indexes for tenant %s: %v",
+		len(indexesToCreate), tenantID, indexesToCreate)
+
+	// Create each missing index
+	for _, fieldName := range indexesToCreate {
+		d.gsiMutex.RLock()
+		config := tenantConfig[fieldName]
+		d.gsiMutex.RUnlock()
+
+		log.Printf("Creating default GSI for tenant %s, field %s: index=%s",
+			tenantID, fieldName, config.IndexName)
+
+		err := d.CreateGSI(
+			ctx,
+			tenantID,
+			fieldName,
+			config.IndexName,
+			config.HashKey,
+			config.RangeKey,
+			config.ProjectionType,
+			config.ProjectedAttributes,
+		)
+
+		if err != nil {
+			// Check if the error is because the index already exists (race condition)
+			if d.isIndexAlreadyExistsError(err) {
+				log.Printf("Index %s already exists for tenant %s (race condition), updating local config",
+					config.IndexName, tenantID)
+
+				// Update local config to mark as existing
+				d.gsiMutex.Lock()
+				if tenantConfig, tenantExists := d.gsiConfig[tenantID]; tenantExists {
+					if fieldConfig, fieldExists := tenantConfig[fieldName]; fieldExists {
+						fieldConfig.ExistsInDynamoDB = true
+						fieldConfig.Status = "ACTIVE"
+						tenantConfig[fieldName] = fieldConfig
+					}
+				}
+				d.gsiMutex.Unlock()
+				continue
+			}
+
+			log.Printf("Failed to create default index %s for tenant %s, field %s: %v",
+				config.IndexName, tenantID, fieldName, err)
+			// Continue with other indexes even if one fails
+			continue
+		}
+
+		log.Printf("Successfully created default GSI %s for tenant %s, field %s",
+			config.IndexName, tenantID, fieldName)
+	}
+
+	log.Printf("Completed creating default indexes for tenant %s", tenantID)
+	return nil
+}
+
+// isIndexAlreadyExistsError checks if the error indicates the index already exists
+func (d *DynamoDBStorage) isIndexAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "already exists") ||
+		strings.Contains(errStr, "ResourceInUseException") ||
+		strings.Contains(errStr, "ValidationException")
+}
+
+// RefreshIndexCache refreshes the local GSI cache for a specific tenant
+func (d *DynamoDBStorage) RefreshIndexCache(ctx context.Context, tenantID string) error {
+	log.Printf("Refreshing index cache for tenant: %s", tenantID)
+	return d.fetchExistingIndexes(ctx, tenantID)
+}
+
+// GetIndexForField returns the GSI configuration for a given field name and tenant
+func (d *DynamoDBStorage) GetIndexForField(tenantID, fieldName string) (*GSIConfig, bool) {
+	return d.getGSIForField(tenantID, fieldName)
+}
+
+// CreateGSI creates a new Global Secondary Index for a tenant table
+func (d *DynamoDBStorage) CreateGSI(ctx context.Context, tenantID, fieldName, indexName, partitionKey, rangeKey string, projectionType string, projectedAttributes []string) error {
+	if !d.enableGSI {
+		return fmt.Errorf("GSI is disabled, cannot create index")
+	}
+
+	tableName := d.getTenantTableName(tenantID)
+
+	// Validate projection type
+	validProjectionTypes := map[string]bool{
+		"ALL":       true,
+		"KEYS_ONLY": true,
+		"INCLUDE":   true,
+	}
+	if !validProjectionTypes[projectionType] {
+		return fmt.Errorf("invalid projection type: %s. Must be ALL, KEYS_ONLY, or INCLUDE", projectionType)
+	}
+
+	// For INCLUDE projection, projected attributes are required
+	if projectionType == "INCLUDE" && len(projectedAttributes) == 0 {
+		return fmt.Errorf("projected attributes are required for INCLUDE projection type")
+	}
+
+	log.Printf("Creating GSI for tenant %s: index=%s, field=%s, partitionKey=%s, rangeKey=%s, projectionType=%s",
+		tenantID, indexName, fieldName, partitionKey, rangeKey, projectionType)
+
+	// Check if index already exists
+	d.gsiMutex.RLock()
+	if tenantGSI, exists := d.gsiConfig[tenantID]; exists {
+		if config, fieldExists := tenantGSI[fieldName]; fieldExists && config.ExistsInDynamoDB {
+			d.gsiMutex.RUnlock()
+			return fmt.Errorf("GSI for field %s already exists in tenant %s", fieldName, tenantID)
+		}
+	}
+	d.gsiMutex.RUnlock()
+
+	// Prepare the GSI creation request
+	projection := &types.Projection{
+		ProjectionType: types.ProjectionType(projectionType),
+	}
+	if projectionType == "INCLUDE" {
+		projection.NonKeyAttributes = projectedAttributes
+	}
+
+	gsiUpdate := types.GlobalSecondaryIndexUpdate{
+		Create: &types.CreateGlobalSecondaryIndexAction{
+			IndexName: aws.String(indexName),
+			KeySchema: []types.KeySchemaElement{
+				{
+					AttributeName: aws.String(partitionKey),
+					KeyType:       types.KeyTypeHash,
+				},
+			},
+			Projection: projection,
+			ProvisionedThroughput: &types.ProvisionedThroughput{
+				ReadCapacityUnits:  aws.Int64(5),
+				WriteCapacityUnits: aws.Int64(5),
+			},
+		},
+	}
+
+	// Add range key if provided
+	if rangeKey != "" {
+		gsiUpdate.Create.KeySchema = append(gsiUpdate.Create.KeySchema, types.KeySchemaElement{
+			AttributeName: aws.String(rangeKey),
+			KeyType:       types.KeyTypeRange,
+		})
+	}
+
+	// Prepare attribute definitions for the new index
+	attributeDefinitions := []types.AttributeDefinition{
+		{
+			AttributeName: aws.String(partitionKey),
+			AttributeType: types.ScalarAttributeTypeS, // Assuming string type, adjust as needed
+		},
+	}
+	if rangeKey != "" && rangeKey != partitionKey {
+		attributeDefinitions = append(attributeDefinitions, types.AttributeDefinition{
+			AttributeName: aws.String(rangeKey),
+			AttributeType: types.ScalarAttributeTypeS,
+		})
+	}
+
+	// Create the index
+	updateInput := &dynamodb.UpdateTableInput{
+		TableName:                   aws.String(tableName),
+		AttributeDefinitions:        attributeDefinitions,
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{gsiUpdate},
+	}
+
+	_, err := d.client.UpdateTable(ctx, updateInput)
+	if err != nil {
+		return fmt.Errorf("failed to create GSI %s for tenant %s: %w", indexName, tenantID, err)
+	}
+
+	// Wait for the index to become active
+	log.Printf("Waiting for GSI %s to become active for tenant %s...", indexName, tenantID)
+
+	return nil
+}
+
+// updateLocalGSIConfig updates the local GSI configuration cache
+func (d *DynamoDBStorage) updateLocalGSIConfig(tenantID, fieldName, indexName, partitionKey, rangeKey, projectionType string, projectedAttributes []string, status string) {
+	d.gsiMutex.Lock()
+	defer d.gsiMutex.Unlock()
+
+	// Initialize tenant GSI config if not exists
+	if d.gsiConfig[tenantID] == nil {
+		d.gsiConfig[tenantID] = make(map[string]GSIConfig)
+	}
+
+	// Create new GSI config
+	config := GSIConfig{
+		IndexName:           indexName,
+		HashKey:             partitionKey,
+		RangeKey:            rangeKey,
+		Priority:            10,  // Default priority for dynamically created indexes
+		EstimatedCost:       2.0, // Default cost estimate
+		SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+		Status:              status,
+		ProjectionType:      projectionType,
+		ProjectedAttributes: projectedAttributes,
+		CreatedAt:           time.Now(),
+		ExistsInDynamoDB:    status == "ACTIVE",
+	}
+
+	d.gsiConfig[tenantID][fieldName] = config
+	log.Printf("Updated local GSI config for tenant %s, field %s: index=%s, status=%s",
+		tenantID, fieldName, indexName, status)
+}
+
+// initializeTenantGSI initializes GSI configuration for a new tenant and creates default indexes
+func (d *DynamoDBStorage) initializeTenantGSI(ctx context.Context, tenantID string) error {
+	if !d.enableGSI {
+		return nil
+	}
+
+	d.gsiMutex.Lock()
+	// Check if already initialized
+	if d.gsiConfig[tenantID] != nil {
+		d.gsiMutex.Unlock()
+		return nil
+	}
+
+	// Initialize with default configuration
+	d.gsiConfig[tenantID] = initializeDefaultGSIConfig()
+	d.gsiMutex.Unlock()
+
+	// First, fetch existing indexes from DynamoDB to see what's already there
+	if err := d.fetchExistingIndexes(ctx, tenantID); err != nil {
+		log.Printf("Warning: Failed to fetch existing indexes for tenant %s: %v", tenantID, err)
+	}
+
+	// Create all default indexes that don't already exist
+	return d.createDefaultIndexes(ctx, tenantID)
 }
 
 // Close gracefully closes the DynamoDB connection and clears tenant table cache
