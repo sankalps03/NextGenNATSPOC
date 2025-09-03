@@ -451,6 +451,13 @@ func (s *CommentActivityService) Start() error {
 		s.subscribeToTicketEvents()
 	}()
 
+	// Start tenant registration listener
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.startTenantRegistrationListener()
+	}()
+
 	log.Printf("Comment & Activity service started successfully")
 	return nil
 }
@@ -1110,6 +1117,180 @@ func (s *CommentActivityService) respondWithError(msg *nats.Msg, errorType, mess
 	if err := msg.Respond(responseData); err != nil {
 		log.Printf("Failed to send error response: %v", err)
 	}
+}
+
+func (s *CommentActivityService) startTenantRegistrationListener() {
+	// Subscribe to tenant registration events for this service
+	sub, err := s.natsConn.Subscribe("tenant.register.comment-activity-service", s.handleTenantRegistration)
+	if err != nil {
+		log.Printf("Failed to subscribe to tenant registration events: %v", err)
+		return
+	}
+	defer sub.Unsubscribe()
+
+	log.Printf("Comment & Activity service listening for tenant registrations")
+
+	// Keep subscription alive until shutdown
+	select {
+	case <-s.shutdownCh:
+		return
+	}
+}
+
+func (s *CommentActivityService) handleTenantRegistration(msg *nats.Msg) {
+	var registrationData struct {
+		TenantID   string `json:"tenant_id"`
+		Action     string `json:"action"`
+		StreamName string `json:"stream_name"`
+	}
+
+	if err := json.Unmarshal(msg.Data, &registrationData); err != nil {
+		log.Printf("Failed to unmarshal tenant registration: %v", err)
+		return
+	}
+
+	switch registrationData.Action {
+	case "register":
+		log.Printf("Registering consumers for new tenant: %s", registrationData.TenantID)
+
+		// Create KV buckets for tenant
+		if err := s.createTenantKVs(registrationData.TenantID); err != nil {
+			log.Printf("Failed to create KV buckets for tenant %s: %v", registrationData.TenantID, err)
+		}
+
+		// Create consumer for this tenant's stream to process comment/activity events
+		if err := s.createTenantConsumer(registrationData.TenantID, registrationData.StreamName); err != nil {
+			log.Printf("Failed to create consumer for tenant %s: %v", registrationData.TenantID, err)
+		} else {
+			log.Printf("Successfully created consumer for tenant %s", registrationData.TenantID)
+		}
+
+	case "unregister":
+		log.Printf("Unregistering consumers for tenant: %s", registrationData.TenantID)
+
+		// Delete KV buckets for tenant
+		if err := s.deleteTenantKVs(registrationData.TenantID); err != nil {
+			log.Printf("Failed to delete KV buckets for tenant %s: %v", registrationData.TenantID, err)
+		}
+
+		// Remove consumer for this tenant
+		if err := s.removeTenantConsumer(registrationData.TenantID); err != nil {
+			log.Printf("Failed to remove consumer for tenant %s: %v", registrationData.TenantID, err)
+		} else {
+			log.Printf("Successfully removed consumer for tenant %s", registrationData.TenantID)
+		}
+	}
+}
+
+func (s *CommentActivityService) createTenantConsumer(tenantID, streamName string) error {
+	ctx := context.Background()
+
+	// Create consumer for tenant-specific comment/activity events
+	consumerName := fmt.Sprintf("comment-activity-service-%s", tenantID)
+	filterSubjects := []string{
+		fmt.Sprintf("comments.%s.>", tenantID),   // Listen to comment events
+		fmt.Sprintf("activities.%s.>", tenantID), // Listen to activity events
+		fmt.Sprintf("tickets.%s.>", tenantID),    // Listen to ticket events to create activities
+	}
+
+	// Create consumers for each filter subject
+	for _, filterSubject := range filterSubjects {
+		consumer, err := s.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+			Name:          fmt.Sprintf("%s-%s", consumerName, strings.ReplaceAll(filterSubject, ".", "-")),
+			FilterSubject: filterSubject,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			DeliverPolicy: jetstream.DeliverAllPolicy,
+			ReplayPolicy:  jetstream.ReplayInstantPolicy,
+			Description:   fmt.Sprintf("Consumer for comment-activity service processing tenant %s events", tenantID),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create consumer for %s: %w", filterSubject, err)
+		}
+
+		// Start consuming messages
+		_, err = consumer.Consume(func(msg jetstream.Msg) {
+			if err := s.processTenantMessage(tenantID, msg); err != nil {
+				log.Printf("Failed to process message for tenant %s: %v", tenantID, err)
+				msg.Nak()
+			} else {
+				msg.Ack()
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("failed to start consuming for %s: %w", filterSubject, err)
+		}
+
+		log.Printf("Created consumer for tenant %s with filter %s", tenantID, filterSubject)
+	}
+
+	return nil
+}
+
+func (s *CommentActivityService) removeTenantConsumer(tenantID string) error {
+	// Note: In this simplified implementation, we don't track individual consumers
+	// In a production system, you would want to properly track and stop consumers
+	log.Printf("Removed consumer tracking for tenant %s", tenantID)
+	return nil
+}
+
+func (s *CommentActivityService) processTenantMessage(tenantID string, msg jetstream.Msg) error {
+	// Validate message is for the correct tenant
+	if !s.validateMessageTenant(msg, tenantID) {
+		log.Printf("Message tenant validation failed for %s", tenantID)
+		return fmt.Errorf("message tenant validation failed")
+	}
+
+	// Process the message based on the subject
+	subject := msg.Subject()
+
+	if strings.Contains(subject, "tickets.") {
+		// Handle ticket events to create activities
+		return s.processTicketEventForActivities(tenantID, msg)
+	} else if strings.Contains(subject, "comments.") {
+		// Handle comment events
+		return s.processCommentEvent(tenantID, msg)
+	} else if strings.Contains(subject, "activities.") {
+		// Handle activity events
+		return s.processActivityEvent(tenantID, msg)
+	}
+
+	log.Printf("Unknown message type for tenant %s: %s", tenantID, subject)
+	return nil
+}
+
+func (s *CommentActivityService) validateMessageTenant(msg jetstream.Msg, expectedTenantID string) bool {
+	// Check tenant ID in headers
+	if tenantID := msg.Headers().Get("Tenant-ID"); tenantID != "" {
+		return tenantID == expectedTenantID
+	}
+
+	// Check tenant ID in subject
+	subject := msg.Subject()
+	if strings.Contains(subject, fmt.Sprintf(".%s.", expectedTenantID)) {
+		return true
+	}
+
+	return false
+}
+
+func (s *CommentActivityService) processTicketEventForActivities(tenantID string, msg jetstream.Msg) error {
+	// This would be similar to the existing handleTicketEventNew logic
+	log.Printf("Processing ticket event for activities for tenant %s: %s", tenantID, msg.Subject())
+	return s.handleTicketEventNew(msg)
+}
+
+func (s *CommentActivityService) processCommentEvent(tenantID string, msg jetstream.Msg) error {
+	// Process comment-specific events
+	log.Printf("Processing comment event for tenant %s: %s", tenantID, msg.Subject())
+	// Add your comment event processing logic here
+	return nil
+}
+
+func (s *CommentActivityService) processActivityEvent(tenantID string, msg jetstream.Msg) error {
+	// Process activity-specific events
+	log.Printf("Processing activity event for tenant %s: %s", tenantID, msg.Subject())
+	// Add your activity event processing logic here
+	return nil
 }
 
 func (s *CommentActivityService) Shutdown() {

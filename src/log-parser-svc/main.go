@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,15 +16,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 type LogParserService struct {
-	natsConn    *nats.Conn
-	js          nats.JetStreamContext
-	serviceName string
-	parsers     []LogParser
-	shutdownCh  chan struct{}
-	wg          sync.WaitGroup
+	natsConn        *nats.Conn
+	js              jetstream.JetStream
+	serviceName     string
+	parsers         []LogParser
+	shutdownCh      chan struct{}
+	wg              sync.WaitGroup
+	tenantConsumers map[string]jetstream.Consumer
+	mu              sync.RWMutex
 }
 
 type LogEntry struct {
@@ -83,6 +87,12 @@ type Config struct {
 	LogLevel    string
 }
 
+type TenantRegistrationRequest struct {
+	TenantID   string `json:"tenant_id"`
+	Action     string `json:"action"`
+	StreamName string `json:"stream_name"`
+}
+
 func main() {
 	config := loadConfig()
 
@@ -133,7 +143,7 @@ func NewLogParserService(config Config) (*LogParserService, error) {
 	}
 
 	// Create JetStream context
-	js, err := natsConn.JetStream()
+	js, err := jetstream.New(natsConn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
@@ -144,10 +154,11 @@ func NewLogParserService(config Config) (*LogParserService, error) {
 	}
 
 	service := &LogParserService{
-		natsConn:    natsConn,
-		js:          js,
-		serviceName: config.ServiceName,
-		shutdownCh:  make(chan struct{}),
+		natsConn:        natsConn,
+		js:              js,
+		serviceName:     config.ServiceName,
+		shutdownCh:      make(chan struct{}),
+		tenantConsumers: make(map[string]jetstream.Consumer),
 	}
 
 	// Initialize parsers
@@ -156,15 +167,16 @@ func NewLogParserService(config Config) (*LogParserService, error) {
 	return service, nil
 }
 
-func ensureStreams(js nats.JetStreamContext) error {
+func ensureStreams(js jetstream.JetStream) error {
 	// Ensure PARSED_LOGS stream exists
 	streamName := "PARSED_LOGS"
-	_, err := js.StreamInfo(streamName)
+	ctx := context.Background()
+	_, err := js.Stream(ctx, streamName)
 	if err != nil {
-		_, err = js.AddStream(&nats.StreamConfig{
+		_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 			Name:     streamName,
 			Subjects: []string{"log.parsed", "log.failed", "log.structured"},
-			Storage:  nats.FileStorage,
+			Storage:  jetstream.FileStorage,
 			MaxMsgs:  2000000,
 			MaxAge:   48 * time.Hour,
 		})
@@ -193,89 +205,11 @@ func (s *LogParserService) initializeParsers() {
 }
 
 func (s *LogParserService) Start() error {
-	// Subscribe to raw logs
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.subscribeToRawLogs()
-	}()
-
-	// Subscribe to batch logs
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.subscribeToBatchLogs()
-	}()
+	// Start tenant registration listener
+	go s.startTenantRegistrationListener()
 
 	log.Printf("Log parser service started successfully")
 	return nil
-}
-
-func (s *LogParserService) subscribeToRawLogs() {
-	sub, err := s.js.Subscribe("log.raw", s.handleRawLog, nats.Durable("log-parser-raw"))
-	if err != nil {
-		log.Printf("Failed to subscribe to raw logs: %v", err)
-		return
-	}
-	defer sub.Unsubscribe()
-
-	log.Printf("Subscribed to log.raw")
-	<-s.shutdownCh
-}
-
-func (s *LogParserService) subscribeToBatchLogs() {
-	sub, err := s.js.Subscribe("log.batch", s.handleBatchLog, nats.Durable("log-parser-batch"))
-	if err != nil {
-		log.Printf("Failed to subscribe to batch logs: %v", err)
-		return
-	}
-	defer sub.Unsubscribe()
-
-	log.Printf("Subscribed to log.batch")
-	<-s.shutdownCh
-}
-
-func (s *LogParserService) handleRawLog(msg *nats.Msg) {
-	var logEntry LogEntry
-	if err := json.Unmarshal(msg.Data, &logEntry); err != nil {
-		log.Printf("Failed to unmarshal raw log: %v", err)
-		msg.Ack()
-		return
-	}
-
-	parsedLog := s.parseLogEntry(logEntry)
-
-	// Publish parsed log
-	if err := s.publishParsedLog(parsedLog); err != nil {
-		log.Printf("Failed to publish parsed log: %v", err)
-		// Don't ack if we can't publish
-		return
-	}
-
-	msg.Ack()
-}
-
-func (s *LogParserService) handleBatchLog(msg *nats.Msg) {
-	var logEntries []LogEntry
-	if err := json.Unmarshal(msg.Data, &logEntries); err != nil {
-		log.Printf("Failed to unmarshal batch logs: %v", err)
-		msg.Ack()
-		return
-	}
-
-	var parsedLogs []ParsedLog
-	for _, logEntry := range logEntries {
-		parsedLog := s.parseLogEntry(logEntry)
-		parsedLogs = append(parsedLogs, parsedLog)
-	}
-
-	// Publish batch of parsed logs
-	if err := s.publishParsedLogBatch(parsedLogs); err != nil {
-		log.Printf("Failed to publish parsed log batch: %v", err)
-		return
-	}
-
-	msg.Ack()
 }
 
 func (s *LogParserService) parseLogEntry(logEntry LogEntry) ParsedLog {
@@ -323,12 +257,13 @@ func (s *LogParserService) publishParsedLog(parsedLog ParsedLog) error {
 		return fmt.Errorf("failed to marshal parsed log: %w", err)
 	}
 
-	subject := "log.parsed"
+	// Publish to tenant-specific subject
+	subject := fmt.Sprintf("logs.%s.parsed", parsedLog.TenantID)
 	if parsedLog.ParseStatus == "failed" {
-		subject = "log.failed"
+		subject = fmt.Sprintf("logs.%s.failed", parsedLog.TenantID)
 	}
 
-	_, err = s.js.Publish(subject, data)
+	_, err = s.js.Publish(context.Background(), subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish to NATS: %w", err)
 	}
@@ -337,17 +272,187 @@ func (s *LogParserService) publishParsedLog(parsedLog ParsedLog) error {
 }
 
 func (s *LogParserService) publishParsedLogBatch(parsedLogs []ParsedLog) error {
-	data, err := json.Marshal(parsedLogs)
-	if err != nil {
-		return fmt.Errorf("failed to marshal parsed logs: %w", err)
+	// Group logs by tenant
+	tenantLogs := make(map[string][]ParsedLog)
+	for _, log := range parsedLogs {
+		tenantLogs[log.TenantID] = append(tenantLogs[log.TenantID], log)
 	}
 
-	_, err = s.js.Publish("log.structured", data)
-	if err != nil {
-		return fmt.Errorf("failed to publish to NATS: %w", err)
+	// Publish each tenant's logs separately
+	for tenantID, logs := range tenantLogs {
+		data, err := json.Marshal(logs)
+		if err != nil {
+			return fmt.Errorf("failed to marshal parsed logs for tenant %s: %w", tenantID, err)
+		}
+
+		subject := fmt.Sprintf("logs.%s.structured", tenantID)
+		_, err = s.js.Publish(context.Background(), subject, data)
+		if err != nil {
+			return fmt.Errorf("failed to publish to NATS for tenant %s: %w", tenantID, err)
+		}
 	}
 
 	return nil
+}
+
+func (s *LogParserService) startTenantRegistrationListener() {
+	ctx := context.Background()
+
+	// Create consumer for tenant management events
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "TENANT_MANAGEMENT", jetstream.ConsumerConfig{
+		Name:          "log-parser-tenant-registration",
+		FilterSubject: "tenant.register.log-parser-service",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
+	})
+	if err != nil {
+		log.Printf("Failed to create tenant registration consumer: %v", err)
+		return
+	}
+
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get messages from tenant registration consumer: %v", err)
+		return
+	}
+
+	log.Printf("Started tenant registration listener")
+
+	for {
+		select {
+		case <-s.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next tenant registration message: %v", err)
+				continue
+			}
+			s.handleTenantRegistration(msg)
+		}
+	}
+}
+
+func (s *LogParserService) handleTenantRegistration(msg jetstream.Msg) {
+	var req TenantRegistrationRequest
+	if err := json.Unmarshal(msg.Data(), &req); err != nil {
+		log.Printf("Failed to unmarshal tenant registration request: %v", err)
+		msg.Ack()
+		return
+	}
+
+	log.Printf("Processing tenant registration: %s action for tenant %s", req.Action, req.TenantID)
+
+	switch req.Action {
+	case "register":
+		if err := s.createTenantConsumer(req.TenantID, req.StreamName); err != nil {
+			log.Printf("Failed to create tenant consumer for %s: %v", req.TenantID, err)
+		} else {
+			log.Printf("Successfully created consumer for tenant %s", req.TenantID)
+		}
+	case "unregister":
+		if err := s.removeTenantConsumer(req.TenantID); err != nil {
+			log.Printf("Failed to remove tenant consumer for %s: %v", req.TenantID, err)
+		} else {
+			log.Printf("Successfully removed consumer for tenant %s", req.TenantID)
+		}
+	default:
+		log.Printf("Unknown tenant registration action: %s", req.Action)
+	}
+
+	msg.Ack()
+}
+
+func (s *LogParserService) createTenantConsumer(tenantID, streamName string) error {
+	ctx := context.Background()
+	consumerName := fmt.Sprintf("log-parser-%s", tenantID)
+
+	// Create consumer for tenant's raw log events
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		Name:          consumerName,
+		FilterSubject: fmt.Sprintf("logs.%s.raw", tenantID),
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverNewPolicy,
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create consumer for tenant %s: %w", tenantID, err)
+	}
+
+	// Store the consumer
+	s.mu.Lock()
+	s.tenantConsumers[tenantID] = consumer
+	s.mu.Unlock()
+
+	// Start processing raw logs for this tenant
+	go s.processTenantRawLogs(tenantID, consumer)
+
+	return nil
+}
+
+func (s *LogParserService) removeTenantConsumer(tenantID string) error {
+	s.mu.Lock()
+	consumer, exists := s.tenantConsumers[tenantID]
+	if exists {
+		delete(s.tenantConsumers, tenantID)
+	}
+	s.mu.Unlock()
+
+	if exists {
+		// Consumer cleanup is handled by NATS when the service shuts down
+		_ = consumer // Acknowledge the consumer variable
+		log.Printf("Removed consumer tracking for tenant %s", tenantID)
+	}
+
+	return nil
+}
+
+func (s *LogParserService) processTenantRawLogs(tenantID string, consumer jetstream.Consumer) {
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get messages from tenant %s raw log consumer: %v", tenantID, err)
+		return
+	}
+
+	log.Printf("Started processing raw logs for tenant %s", tenantID)
+
+	for {
+		select {
+		case <-s.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next raw log message for tenant %s: %v", tenantID, err)
+				continue
+			}
+			s.processTenantRawLogMessage(tenantID, msg)
+		}
+	}
+}
+
+func (s *LogParserService) processTenantRawLogMessage(tenantID string, msg jetstream.Msg) {
+	var logEntry LogEntry
+	if err := json.Unmarshal(msg.Data(), &logEntry); err != nil {
+		log.Printf("Failed to unmarshal raw log for tenant %s: %v", tenantID, err)
+		msg.Ack()
+		return
+	}
+
+	// Parse the log entry
+	parsedLog := s.parseLogEntry(logEntry)
+
+	// Publish parsed log
+	if err := s.publishParsedLog(parsedLog); err != nil {
+		log.Printf("Failed to publish parsed log for tenant %s: %v", tenantID, err)
+		// Don't ack if we can't publish
+		return
+	}
+
+	msg.Ack()
 }
 
 func (s *LogParserService) Shutdown() {

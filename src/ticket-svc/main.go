@@ -27,13 +27,144 @@ type Meta struct {
 }
 
 type Ticket struct {
+	// Core Fields
 	Id          string `json:"id"`
 	Tenant      string `json:"tenant"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
-	CreatedBy   string `json:"created_by"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	Name        string `json:"name"`
+	Subject     string `json:"subject"`
+
+	// Status & Priority
+	Status            string `json:"status"`
+	StatusId          string `json:"statusid"`
+	StatusChangedTime string `json:"statuschangedtime"`
+	Priority          string `json:"priority"`
+	PriorityId        string `json:"priorityid"`
+	Urgency           string `json:"urgency"`
+	UrgencyId         string `json:"urgencyid"`
+	Impact            string `json:"impact"`
+	ImpactId          string `json:"impactid"`
+
+	// User Fields
+	CreatedBy    string `json:"created_by"`
+	CreatedById  string `json:"createdbyid"`
+	UpdatedById  string `json:"updatedbyid"`
+	Requester    string `json:"requester"`
+	RequesterId  string `json:"requesterid"`
+	Assignee     string `json:"assignee"`
+	TechnicianId string `json:"technicianid"`
+	ClosedBy     string `json:"closedby"`
+	ResolvedBy   string `json:"resolvedby"`
+
+	// Time Fields
+	CreatedAt            string `json:"created_at"`
+	CreatedTime          string `json:"createdtime"`
+	CreatedDate          string `json:"createddate"`
+	UpdatedAt            string `json:"updated_at"`
+	UpdatedTime          string `json:"updatedtime"`
+	LastUpdatedDate      string `json:"lastupdateddate"`
+	DueBy                string `json:"dueby"`
+	FirstResponseDueBy   string `json:"firstresponsedueby"`
+	ResolvedDate         string `json:"resolveddate"`
+	ClosedDate           string `json:"closeddate"`
+	LastApprovalDate     string `json:"lastapprovaldate"`
+	LastApprovedDate     string `json:"lastapproveddate"`
+	LastClosedTime       string `json:"lastclosedtime"`
+	LastOpenedTime       string `json:"lastopenedtime"`
+	LastResolvedTime     string `json:"lastresolvedtime"`
+	LastViolationTime    string `json:"lastviolationtime"`
+	OldDueBy             string `json:"olddueby"`
+	OldResponseDue       string `json:"oldresponsedue"`
+	ResponseDue          string `json:"responsedue"`
+	AskFeedbackDate      string `json:"askfeedbackdate"`
+	FirstFeedbackDate    string `json:"firstfeedbackdate"`
+	GroupChangedTime     string `json:"groupchangedtime"`
+	LastOlaViolationTime string `json:"lastolaviolationtime"`
+	OlaDueBy             string `json:"oladueby"`
+	OldOlaDueBy          string `json:"oldoladueby"`
+	LastUcViolationTime  string `json:"lastucviolationtime"`
+	OldUcDueBy           string `json:"olducdueby"`
+	UcDueBy              string `json:"ucdueby"`
+	RemovedTime          string `json:"removedtime"`
+
+	// Organization Fields
+	Company         string `json:"company"`
+	CompanyId       string `json:"companyid"`
+	Location        string `json:"location"`
+	LocationId      string `json:"locationid"`
+	Department      string `json:"department"`
+	DepartmentId    string `json:"departmentid"`
+	TechnicianGroup string `json:"techniciangroup"`
+	GroupId         string `json:"groupid"`
+	VendorId        string `json:"vendorid"`
+
+	// Category & Service
+	Category            string `json:"category"`
+	CategoryId          string `json:"categoryid"`
+	ServiceCategory     string `json:"servicecategory"`
+	ServiceCatalog      string `json:"servicecatalog"`
+	ServiceCatalogId    string `json:"servicecatalogid"`
+	SuggestedCategoryId string `json:"suggestedcategoryid"`
+	SuggestedGroupId    string `json:"suggestedgroupid"`
+
+	// Approval Fields
+	ApprovalStatus string `json:"approvalstatus"`
+	ApprovalType   string `json:"approvaltype"`
+
+	// Source & Type
+	Source      string `json:"source"`
+	SourceId    string `json:"sourceid"`
+	Type        string `json:"type"`
+	RequestType string `json:"requesttype"`
+	OobType     string `json:"oobtype"`
+
+	// Support & SLA
+	SupportLevel             string `json:"supportlevel"`
+	FirstResponseTime        string `json:"firstresponsetime"`
+	ResolutionDueLevel       string `json:"resolutionduelevel"`
+	ResolutionEscalationTime string `json:"resolutionescalationtime"`
+	ResponseDueLevel         string `json:"responseduelevel"`
+	ResponseDueViolated      string `json:"responsedueviolated"`
+	ResponseEscalationTime   string `json:"responseescalationtime"`
+	SlaViolated              string `json:"slaviolated"`
+	ViolatedSlaId            string `json:"violatedslaid"`
+	OlaDueLevel              string `json:"oladuelevel"`
+	OlaEscalationTime        string `json:"olaescalationtime"`
+	OlaViolated              string `json:"olaviolated"`
+	UcDueLevel               string `json:"ucduelevel"`
+	UcEscalationTime         string `json:"ucescalationtime"`
+	UcViolated               string `json:"ucviolated"`
+	ViolatedUcId             string `json:"violateducid"`
+
+	// Duration Fields
+	TotalOnHoldDuration   string `json:"totalonholdduration"`
+	TotalResolutionTime   string `json:"totalresolutiontime"`
+	TotalSlaPauseTime     string `json:"totalslapausetime"`
+	TotalWorkingTime      string `json:"totalworkingtime"`
+	TotalUcOnHoldDuration string `json:"totaluconholdduration"`
+	TotalUcPauseTime      string `json:"totalucpausetime"`
+	TotalUcWorkingTime    string `json:"totalucworkingtime"`
+	TotalUcResolutionTime string `json:"totalucresolutiontime"`
+
+	// Misc Fields
+	Tags                   string `json:"tags"`
+	Removed                string `json:"removed"`
+	RemovedById            string `json:"removedbyid"`
+	DueTimeManuallyUpdated string `json:"duetimemanuallyupdated"`
+	Reopened               string `json:"reopened"`
+	OriginalDescription    string `json:"originaldescription"`
+	TemplateId             string `json:"templateid"`
+	CallFrom               string `json:"callfrom"`
+	EmailReadConfigEmail   string `json:"emailreadconfigemail"`
+	EmailReadConfigId      string `json:"emailreadconfigid"`
+	PurchaseRequest        string `json:"purchaserequest"`
+	Spam                   string `json:"spam"`
+	VipRequest             string `json:"viprequest"`
+	TransitionModelId      string `json:"transitionmodelid"`
+	Migrated               string `json:"migrated"`
+	MergedRequest          string `json:"mergedrequest"`
+	MessengerConfigId      string `json:"messengerconfigid"`
 }
 
 type TicketEvent struct {
@@ -63,13 +194,13 @@ type NATSStorage struct {
 }
 
 type TicketService struct {
-	natsManager      *NATSManager
-	storage          *NATSStorage
-	opensearchClient *opensearch.Client
-	config           *Config
-	tenantConsumers  map[string]jetstream.Consumer
-	tenantMu         sync.RWMutex
-	shutdownCh       chan struct{}
+	natsManager          *NATSManager
+	storage              *NATSStorage
+	opensearchClient     *opensearch.Client
+	config               *Config
+	tenantConsumers      map[string]jetstream.Consumer
+	tenantConsumersMutex sync.RWMutex
+	shutdownCh           chan struct{}
 }
 
 type CreateTicketRequest struct {
@@ -101,6 +232,12 @@ type TenantEvent struct {
 	EventType string `json:"event_type"` // tenant.created, tenant.deleted
 	TenantID  string `json:"tenant_id"`
 	Timestamp string `json:"timestamp"`
+}
+
+type TenantRegistrationRequest struct {
+	TenantID   string `json:"tenant_id"`
+	Action     string `json:"action"`
+	StreamName string `json:"stream_name"`
 }
 
 type ServiceRequest struct {
@@ -564,12 +701,15 @@ func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	subject := "ticket.create"
+	// Use tenant-aware subject hierarchy
+	subject := fmt.Sprintf("tickets.%s.created", tenant)
 	headers := map[string]string{
-		"tenant":       tenant,
-		"schema":       "ticket.create@v1",
+		"Tenant-ID":    tenant,
+		"Event-Type":   "ticket.created",
+		"Schema":       "ticket.create@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
+		"Ticket-ID":    ticket.Id,
 	}
 
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
@@ -591,12 +731,15 @@ func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	subject := "ticket.update"
+	// Use tenant-aware subject hierarchy
+	subject := fmt.Sprintf("tickets.%s.updated", tenant)
 	headers := map[string]string{
-		"tenant":       tenant,
-		"schema":       "ticket.update@v1",
+		"Tenant-ID":    tenant,
+		"Event-Type":   "ticket.updated",
+		"Schema":       "ticket.update@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
+		"Ticket-ID":    ticket.Id,
 	}
 
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
@@ -771,9 +914,129 @@ func (ts *TicketService) createTenantOpenSearchIndex(tenantID string) error {
 				"tenant": {"type": "keyword"},
 				"title": {"type": "text"},
 				"description": {"type": "text"},
+				"name": {"type": "text"},
+				"subject": {"type": "text"},
+				
+				"status": {"type": "keyword"},
+				"statusid": {"type": "keyword"},
+				"statuschangedtime": {"type": "date"},
+				"priority": {"type": "keyword"},
+				"priorityid": {"type": "keyword"},
+				"urgency": {"type": "keyword"},
+				"urgencyid": {"type": "keyword"},
+				"impact": {"type": "keyword"},
+				"impactid": {"type": "keyword"},
+				
 				"created_by": {"type": "keyword"},
+				"createdbyid": {"type": "keyword"},
+				"updatedbyid": {"type": "keyword"},
+				"requester": {"type": "keyword"},
+				"requesterid": {"type": "keyword"},
+				"assignee": {"type": "keyword"},
+				"technicianid": {"type": "keyword"},
+				"closedby": {"type": "keyword"},
+				"resolvedby": {"type": "keyword"},
+				
 				"created_at": {"type": "date"},
-				"updated_at": {"type": "date"}
+				"createdtime": {"type": "date"},
+				"createddate": {"type": "date"},
+				"updated_at": {"type": "date"},
+				"updatedtime": {"type": "date"},
+				"lastupdateddate": {"type": "date"},
+				"dueby": {"type": "date"},
+				"firstresponsedueby": {"type": "date"},
+				"resolveddate": {"type": "date"},
+				"closeddate": {"type": "date"},
+				"lastapprovaldate": {"type": "date"},
+				"lastapproveddate": {"type": "date"},
+				"lastclosedtime": {"type": "date"},
+				"lastopenedtime": {"type": "date"},
+				"lastresolvedtime": {"type": "date"},
+				"lastviolationtime": {"type": "date"},
+				"olddueby": {"type": "date"},
+				"oldresponsedue": {"type": "date"},
+				"responsedue": {"type": "date"},
+				"askfeedbackdate": {"type": "date"},
+				"firstfeedbackdate": {"type": "date"},
+				"groupchangedtime": {"type": "date"},
+				"lastolaviolationtime": {"type": "date"},
+				"oladueby": {"type": "date"},
+				"oldoladueby": {"type": "date"},
+				"lastucviolationtime": {"type": "date"},
+				"olducdueby": {"type": "date"},
+				"ucdueby": {"type": "date"},
+				"removedtime": {"type": "date"},
+				
+				"company": {"type": "keyword"},
+				"companyid": {"type": "keyword"},
+				"location": {"type": "keyword"},
+				"locationid": {"type": "keyword"},
+				"department": {"type": "keyword"},
+				"departmentid": {"type": "keyword"},
+				"techniciangroup": {"type": "keyword"},
+				"groupid": {"type": "keyword"},
+				"vendorid": {"type": "keyword"},
+				
+				"category": {"type": "keyword"},
+				"categoryid": {"type": "keyword"},
+				"servicecategory": {"type": "keyword"},
+				"servicecatalog": {"type": "keyword"},
+				"servicecatalogid": {"type": "keyword"},
+				"suggestedcategoryid": {"type": "keyword"},
+				"suggestedgroupid": {"type": "keyword"},
+				
+				"approvalstatus": {"type": "keyword"},
+				"approvaltype": {"type": "keyword"},
+				
+				"source": {"type": "keyword"},
+				"sourceid": {"type": "keyword"},
+				"type": {"type": "keyword"},
+				"requesttype": {"type": "keyword"},
+				"oobtype": {"type": "keyword"},
+				
+				"supportlevel": {"type": "keyword"},
+				"firstresponsetime": {"type": "keyword"},
+				"resolutionduelevel": {"type": "keyword"},
+				"resolutionescalationtime": {"type": "keyword"},
+				"responseduelevel": {"type": "keyword"},
+				"responsedueviolated": {"type": "keyword"},
+				"responseescalationtime": {"type": "keyword"},
+				"slaviolated": {"type": "keyword"},
+				"violatedslaid": {"type": "keyword"},
+				"oladuelevel": {"type": "keyword"},
+				"olaescalationtime": {"type": "keyword"},
+				"olaviolated": {"type": "keyword"},
+				"ucduelevel": {"type": "keyword"},
+				"ucescalationtime": {"type": "keyword"},
+				"ucviolated": {"type": "keyword"},
+				"violateducid": {"type": "keyword"},
+				
+				"totalonholdduration": {"type": "long"},
+				"totalresolutiontime": {"type": "long"},
+				"totalslapausetime": {"type": "long"},
+				"totalworkingtime": {"type": "long"},
+				"totaluconholdduration": {"type": "long"},
+				"totalucpausetime": {"type": "long"},
+				"totalucworkingtime": {"type": "long"},
+				"totalucresolutiontime": {"type": "long"},
+				
+				"tags": {"type": "text"},
+				"removed": {"type": "keyword"},
+				"removedbyid": {"type": "keyword"},
+				"duetimemanuallyupdated": {"type": "keyword"},
+				"reopened": {"type": "keyword"},
+				"originaldescription": {"type": "text"},
+				"templateid": {"type": "keyword"},
+				"callfrom": {"type": "keyword"},
+				"emailreadconfigemail": {"type": "keyword"},
+				"emailreadconfigid": {"type": "keyword"},
+				"purchaserequest": {"type": "keyword"},
+				"spam": {"type": "keyword"},
+				"viprequest": {"type": "keyword"},
+				"transitionmodelid": {"type": "keyword"},
+				"migrated": {"type": "keyword"},
+				"mergedrequest": {"type": "keyword"},
+				"messengerconfigid": {"type": "keyword"}
 			}
 		}
 	}`
@@ -845,9 +1108,129 @@ func (ts *TicketService) ensureOpenSearchIndex() error {
 				"tenant": {"type": "keyword"},
 				"title": {"type": "text"},
 				"description": {"type": "text"},
+				"name": {"type": "text"},
+				"subject": {"type": "text"},
+				
+				"status": {"type": "keyword"},
+				"statusid": {"type": "keyword"},
+				"statuschangedtime": {"type": "date"},
+				"priority": {"type": "keyword"},
+				"priorityid": {"type": "keyword"},
+				"urgency": {"type": "keyword"},
+				"urgencyid": {"type": "keyword"},
+				"impact": {"type": "keyword"},
+				"impactid": {"type": "keyword"},
+				
 				"created_by": {"type": "keyword"},
+				"createdbyid": {"type": "keyword"},
+				"updatedbyid": {"type": "keyword"},
+				"requester": {"type": "keyword"},
+				"requesterid": {"type": "keyword"},
+				"assignee": {"type": "keyword"},
+				"technicianid": {"type": "keyword"},
+				"closedby": {"type": "keyword"},
+				"resolvedby": {"type": "keyword"},
+				
 				"created_at": {"type": "date"},
-				"updated_at": {"type": "date"}
+				"createdtime": {"type": "date"},
+				"createddate": {"type": "date"},
+				"updated_at": {"type": "date"},
+				"updatedtime": {"type": "date"},
+				"lastupdateddate": {"type": "date"},
+				"dueby": {"type": "date"},
+				"firstresponsedueby": {"type": "date"},
+				"resolveddate": {"type": "date"},
+				"closeddate": {"type": "date"},
+				"lastapprovaldate": {"type": "date"},
+				"lastapproveddate": {"type": "date"},
+				"lastclosedtime": {"type": "date"},
+				"lastopenedtime": {"type": "date"},
+				"lastresolvedtime": {"type": "date"},
+				"lastviolationtime": {"type": "date"},
+				"olddueby": {"type": "date"},
+				"oldresponsedue": {"type": "date"},
+				"responsedue": {"type": "date"},
+				"askfeedbackdate": {"type": "date"},
+				"firstfeedbackdate": {"type": "date"},
+				"groupchangedtime": {"type": "date"},
+				"lastolaviolationtime": {"type": "date"},
+				"oladueby": {"type": "date"},
+				"oldoladueby": {"type": "date"},
+				"lastucviolationtime": {"type": "date"},
+				"olducdueby": {"type": "date"},
+				"ucdueby": {"type": "date"},
+				"removedtime": {"type": "date"},
+				
+				"company": {"type": "keyword"},
+				"companyid": {"type": "keyword"},
+				"location": {"type": "keyword"},
+				"locationid": {"type": "keyword"},
+				"department": {"type": "keyword"},
+				"departmentid": {"type": "keyword"},
+				"techniciangroup": {"type": "keyword"},
+				"groupid": {"type": "keyword"},
+				"vendorid": {"type": "keyword"},
+				
+				"category": {"type": "keyword"},
+				"categoryid": {"type": "keyword"},
+				"servicecategory": {"type": "keyword"},
+				"servicecatalog": {"type": "keyword"},
+				"servicecatalogid": {"type": "keyword"},
+				"suggestedcategoryid": {"type": "keyword"},
+				"suggestedgroupid": {"type": "keyword"},
+				
+				"approvalstatus": {"type": "keyword"},
+				"approvaltype": {"type": "keyword"},
+				
+				"source": {"type": "keyword"},
+				"sourceid": {"type": "keyword"},
+				"type": {"type": "keyword"},
+				"requesttype": {"type": "keyword"},
+				"oobtype": {"type": "keyword"},
+				
+				"supportlevel": {"type": "keyword"},
+				"firstresponsetime": {"type": "keyword"},
+				"resolutionduelevel": {"type": "keyword"},
+				"resolutionescalationtime": {"type": "keyword"},
+				"responseduelevel": {"type": "keyword"},
+				"responsedueviolated": {"type": "keyword"},
+				"responseescalationtime": {"type": "keyword"},
+				"slaviolated": {"type": "keyword"},
+				"violatedslaid": {"type": "keyword"},
+				"oladuelevel": {"type": "keyword"},
+				"olaescalationtime": {"type": "keyword"},
+				"olaviolated": {"type": "keyword"},
+				"ucduelevel": {"type": "keyword"},
+				"ucescalationtime": {"type": "keyword"},
+				"ucviolated": {"type": "keyword"},
+				"violateducid": {"type": "keyword"},
+				
+				"totalonholdduration": {"type": "long"},
+				"totalresolutiontime": {"type": "long"},
+				"totalslapausetime": {"type": "long"},
+				"totalworkingtime": {"type": "long"},
+				"totaluconholdduration": {"type": "long"},
+				"totalucpausetime": {"type": "long"},
+				"totalucworkingtime": {"type": "long"},
+				"totalucresolutiontime": {"type": "long"},
+				
+				"tags": {"type": "text"},
+				"removed": {"type": "keyword"},
+				"removedbyid": {"type": "keyword"},
+				"duetimemanuallyupdated": {"type": "keyword"},
+				"reopened": {"type": "keyword"},
+				"originaldescription": {"type": "text"},
+				"templateid": {"type": "keyword"},
+				"callfrom": {"type": "keyword"},
+				"emailreadconfigemail": {"type": "keyword"},
+				"emailreadconfigid": {"type": "keyword"},
+				"purchaserequest": {"type": "keyword"},
+				"spam": {"type": "keyword"},
+				"viprequest": {"type": "keyword"},
+				"transitionmodelid": {"type": "keyword"},
+				"migrated": {"type": "keyword"},
+				"mergedrequest": {"type": "keyword"},
+				"messengerconfigid": {"type": "keyword"}
 			}
 		}
 	}`
@@ -964,9 +1347,30 @@ func (ts *TicketService) searchTickets(tenant string, req SearchRequest) (*Searc
 	if req.Query != "" {
 		mustQueries = append(mustQueries, map[string]interface{}{
 			"multi_match": map[string]interface{}{
-				"query":  req.Query,
-				"fields": []string{"title^2", "description", "created_by"},
-				"type":   "best_fields",
+				"query": req.Query,
+				"fields": []string{
+					"title^3",
+					"subject^3",
+					"name^2",
+					"description^2",
+					"originaldescription",
+					"tags^2",
+					"created_by",
+					"requester",
+					"assignee",
+					"company",
+					"category",
+					"location",
+					"department",
+					"status",
+					"priority",
+					"urgency",
+					"impact",
+					"source",
+					"type",
+					"techniciangroup",
+				},
+				"type": "best_fields",
 			},
 		})
 	} else {
@@ -1185,7 +1589,10 @@ func main() {
 	}
 
 	// Start tenant management consumer
-	go service.startTenantManagementConsumer()
+	//go service.startTenantManagementConsumer()
+
+	// Start tenant registration listener
+	go service.startTenantRegistrationListener()
 
 	sub, err := natsManager.conn.Subscribe("ticket.service", service.handleServiceRequest)
 	if err != nil {
@@ -1210,4 +1617,195 @@ func main() {
 	}
 
 	log.Println("Service exited")
+}
+
+func (ts *TicketService) startTenantRegistrationListener() {
+	ctx := context.Background()
+
+	// Create consumer for tenant management events
+	consumer, err := ts.natsManager.js.CreateOrUpdateConsumer(ctx, "TENANT_MANAGEMENT", jetstream.ConsumerConfig{
+		Name:          "ticket-service-tenant-registration",
+		FilterSubject: "tenant.register.ticket-service",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
+	})
+	if err != nil {
+		log.Printf("Failed to create tenant registration consumer: %v", err)
+		return
+	}
+
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get messages from tenant registration consumer: %v", err)
+		return
+	}
+
+	log.Printf("Started tenant registration listener")
+
+	for {
+		select {
+		case <-ts.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next tenant registration message: %v", err)
+				continue
+			}
+			ts.handleTenantRegistration(msg)
+		}
+	}
+}
+
+func (ts *TicketService) handleTenantRegistration(msg jetstream.Msg) {
+	var req TenantRegistrationRequest
+	if err := json.Unmarshal(msg.Data(), &req); err != nil {
+		log.Printf("Failed to unmarshal tenant registration request: %v", err)
+		msg.Ack()
+		return
+	}
+
+	log.Printf("Processing tenant registration: %s action for tenant %s", req.Action, req.TenantID)
+
+	switch req.Action {
+	case "register":
+		// Create consumer for this tenant's stream to process ticket events
+		if err := ts.createTenantConsumer(req.TenantID, req.StreamName); err != nil {
+			log.Printf("Failed to create consumer for tenant %s: %v", req.TenantID, err)
+		} else {
+			log.Printf("Successfully created consumer for tenant %s", req.TenantID)
+		}
+	case "unregister":
+		// Remove consumer for this tenant
+		if err := ts.removeTenantConsumer(req.TenantID); err != nil {
+			log.Printf("Failed to remove consumer for tenant %s: %v", req.TenantID, err)
+		} else {
+			log.Printf("Successfully removed consumer for tenant %s", req.TenantID)
+		}
+	default:
+		log.Printf("Unknown tenant registration action: %s", req.Action)
+	}
+
+	msg.Ack()
+}
+
+func (ts *TicketService) createTenantConsumer(tenantID, streamName string) error {
+	ctx := context.Background()
+
+	// Create consumer for tenant-specific ticket events
+	consumerName := fmt.Sprintf("ticket-service-%s", tenantID)
+	filterSubject := fmt.Sprintf("tickets.%s.>", tenantID)
+
+	consumer, err := ts.natsManager.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		Name:          consumerName,
+		FilterSubject: filterSubject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
+		Description:   fmt.Sprintf("Consumer for ticket service processing tenant %s events", tenantID),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create consumer %s: %w", consumerName, err)
+	}
+
+	// Store consumer reference
+	ts.tenantConsumersMutex.Lock()
+	ts.tenantConsumers[tenantID] = consumer
+	ts.tenantConsumersMutex.Unlock()
+
+	// Start processing messages for this tenant
+	go ts.processTenantMessages(tenantID, consumer)
+
+	return nil
+}
+
+func (ts *TicketService) removeTenantConsumer(tenantID string) error {
+	ts.tenantConsumersMutex.Lock()
+	defer ts.tenantConsumersMutex.Unlock()
+
+	consumer, exists := ts.tenantConsumers[tenantID]
+	if !exists {
+		return fmt.Errorf("consumer for tenant %s not found", tenantID)
+	}
+
+	// Remove from tracking
+	delete(ts.tenantConsumers, tenantID)
+
+	// Note: JetStream consumers don't have explicit stop method
+	// The consumer will be cleaned up when the service shuts down
+	_ = consumer // Acknowledge the consumer variable
+	log.Printf("Removed consumer tracking for tenant %s", tenantID)
+	return nil
+}
+
+func (ts *TicketService) processTenantMessages(tenantID string, consumer jetstream.Consumer) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic in tenant message processor for %s: %v", tenantID, r)
+		}
+	}()
+
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get message iterator for tenant %s: %v", tenantID, err)
+		return
+	}
+
+	log.Printf("Started processing messages for tenant %s", tenantID)
+
+	for {
+		select {
+		case <-ts.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next message for tenant %s: %v", tenantID, err)
+				continue
+			}
+
+			// Validate message is for the correct tenant
+			if !ts.validateMessageTenant(msg, tenantID) {
+				log.Printf("Message tenant validation failed for %s", tenantID)
+				msg.Nak()
+				continue
+			}
+
+			// Process the message (implement your business logic here)
+			if err := ts.processTicketMessage(tenantID, msg); err != nil {
+				log.Printf("Failed to process message for tenant %s: %v", tenantID, err)
+				msg.Nak()
+			} else {
+				msg.Ack()
+			}
+		}
+	}
+}
+
+func (ts *TicketService) validateMessageTenant(msg jetstream.Msg, expectedTenantID string) bool {
+	// Check tenant ID in headers
+	if tenantID := msg.Headers().Get("Tenant-ID"); tenantID != "" {
+		return tenantID == expectedTenantID
+	}
+
+	// Check tenant ID in subject
+	subject := msg.Subject()
+	if strings.HasPrefix(subject, fmt.Sprintf("tickets.%s.", expectedTenantID)) {
+		return true
+	}
+
+	return false
+}
+
+func (ts *TicketService) processTicketMessage(tenantID string, msg jetstream.Msg) error {
+	// Implement your ticket message processing logic here
+	log.Printf("Processing ticket message for tenant %s: %s", tenantID, msg.Subject())
+
+	// For now, just log the message
+	// In a real implementation, you would parse the message and handle it appropriately
+
+	return nil
 }

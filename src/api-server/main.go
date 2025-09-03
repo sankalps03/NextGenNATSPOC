@@ -66,6 +66,15 @@ type Notification struct {
 	DeliveredAt *time.Time `json:"delivered_at,omitempty"`
 }
 
+type Tenant struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
 type CreateTicketRequest struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
@@ -77,6 +86,17 @@ type UpdateTicketRequest struct {
 	Description *string `json:"description,omitempty"`
 }
 
+type CreateTenantRequest struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type UpdateTenantRequest struct {
+	Name   *string `json:"name,omitempty"`
+	Email  *string `json:"email,omitempty"`
+	Status *string `json:"status,omitempty"`
+}
+
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message,omitempty"`
@@ -84,6 +104,7 @@ type ErrorResponse struct {
 
 type APIHandler struct {
 	natsManager *NATSManager
+	tenantKV    jetstream.KeyValue
 }
 
 func tenantMiddleware(next http.Handler) http.Handler {
@@ -139,6 +160,17 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	// Validate tenant exists first
+	if !h.validateTenant(tenant) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error:   "invalid_tenant",
+			Message: fmt.Sprintf("Tenant %s does not exist or is not active", tenant),
+		})
+		return
+	}
 
 	var req CreateTicketRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -424,6 +456,248 @@ func (h *APIHandler) GetNotification(w http.ResponseWriter, r *http.Request) {
 	w.Write(response)
 }
 
+func (h *APIHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
+	var req CreateTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_json", Message: err.Error()})
+		return
+	}
+
+	if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Email) == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error:   "validation_failed",
+			Message: "name and email are required and cannot be empty",
+		})
+		return
+	}
+
+	tenantID := uuid.New().String()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	tenant := Tenant{
+		ID:        tenantID,
+		Name:      req.Name,
+		Email:     req.Email,
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	tenantData, err := json.Marshal(tenant)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal tenant: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
+		return
+	}
+
+	_, err = h.tenantKV.Put(r.Context(), tenantID, tenantData)
+	if err != nil {
+		log.Printf("ERROR: Failed to store tenant in KV: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	// Create tenant through tenant manager service
+	if err := h.createTenantViaTenantManager(r.Context(), tenantID, &tenant); err != nil {
+		log.Printf("ERROR: Failed to create tenant via tenant manager: %v", err)
+
+		if deleteErr := h.tenantKV.Delete(r.Context(), tenantID); deleteErr != nil {
+			log.Printf("ERROR: Failed to cleanup tenant KV entry after tenant creation failure: %v", deleteErr)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "tenant_creation_failed", Message: "Failed to create tenant resources"})
+		return
+	}
+
+	// Note: Event publishing is now handled by the tenant manager service
+	// No need to publish duplicate events here
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(tenant)
+}
+
+func (h *APIHandler) GetTenant(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	tenantID := vars["id"]
+
+	entry, err := h.tenantKV.Get(r.Context(), tenantID)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "tenant_not_found", Message: "Tenant not found"})
+			return
+		}
+		log.Printf("ERROR: Failed to get tenant from KV: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(entry.Value())
+}
+
+func (h *APIHandler) UpdateTenant(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	tenantID := vars["id"]
+
+	var req UpdateTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_json", Message: err.Error()})
+		return
+	}
+
+	entry, err := h.tenantKV.Get(r.Context(), tenantID)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "tenant_not_found", Message: "Tenant not found"})
+			return
+		}
+		log.Printf("ERROR: Failed to get tenant from KV: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	var tenant Tenant
+	if err := json.Unmarshal(entry.Value(), &tenant); err != nil {
+		log.Printf("ERROR: Failed to unmarshal tenant: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
+		return
+	}
+
+	if req.Name != nil {
+		tenant.Name = *req.Name
+	}
+	if req.Email != nil {
+		tenant.Email = *req.Email
+	}
+	if req.Status != nil {
+		tenant.Status = *req.Status
+	}
+	tenant.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	tenantData, err := json.Marshal(tenant)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal updated tenant: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
+		return
+	}
+
+	_, err = h.tenantKV.Put(r.Context(), tenantID, tenantData)
+	if err != nil {
+		log.Printf("ERROR: Failed to update tenant in KV: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tenant)
+}
+
+func (h *APIHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	tenantID := vars["id"]
+
+	entry, err := h.tenantKV.Get(r.Context(), tenantID)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "tenant_not_found", Message: "Tenant not found"})
+			return
+		}
+		log.Printf("ERROR: Failed to get tenant from KV: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	var tenant Tenant
+	if err := json.Unmarshal(entry.Value(), &tenant); err != nil {
+		log.Printf("ERROR: Failed to unmarshal tenant: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
+		return
+	}
+
+	err = h.tenantKV.Delete(r.Context(), tenantID)
+	if err != nil {
+		log.Printf("ERROR: Failed to delete tenant from KV: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	// Delete tenant through tenant manager service
+	if err := h.deleteTenantViaTenantManager(r.Context(), tenantID, &tenant); err != nil {
+		log.Printf("ERROR: Failed to delete tenant via tenant manager: %v", err)
+		// Continue with API response even if tenant manager call fails
+	}
+
+	// Note: Event publishing is now handled by the tenant manager service
+	// No need to publish duplicate events here
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *APIHandler) ListTenants(w http.ResponseWriter, r *http.Request) {
+	keys, err := h.tenantKV.Keys(r.Context())
+	if err != nil {
+		log.Printf("ERROR: Failed to list tenant keys: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+		return
+	}
+
+	var tenants []Tenant
+	for _, key := range keys {
+		entry, err := h.tenantKV.Get(r.Context(), key)
+		if err != nil {
+			log.Printf("WARN: Failed to get tenant %s: %v", key, err)
+			continue
+		}
+
+		var tenant Tenant
+		if err := json.Unmarshal(entry.Value(), &tenant); err != nil {
+			log.Printf("WARN: Failed to unmarshal tenant %s: %v", key, err)
+			continue
+		}
+		tenants = append(tenants, tenant)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tenants)
+}
+
 func (h *APIHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	health := map[string]string{"status": "healthy"}
 
@@ -449,6 +723,96 @@ func (h *APIHandler) sendNATSRequest(subject string, requestData interface{}, ti
 	}
 
 	return msg.Data, nil
+}
+
+func (h *APIHandler) validateTenant(tenantID string) bool {
+	// Validate tenant directly from tenant KV store
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := h.tenantKV.Get(ctx, tenantID)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			log.Printf("DEBUG: Tenant %s not found in KV store", tenantID)
+			return false
+		}
+		log.Printf("ERROR: Failed to validate tenant %s from KV store: %v", tenantID, err)
+		return false
+	}
+
+	log.Printf("DEBUG: Tenant %s validated successfully from KV store", tenantID)
+	return true
+}
+
+func (h *APIHandler) createTenantViaTenantManager(ctx context.Context, tenantID string, tenant *Tenant) error {
+	// Create tenant creation event that tenant manager will process
+	eventData := map[string]interface{}{
+		"event_id":   uuid.New().String(),
+		"event_type": "tenant.created",
+		"tenant_id":  tenantID,
+		"name":       tenant.Name,
+		"email":      tenant.Email,
+		"status":     "active",
+		"timestamp":  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	eventPayload, err := json.Marshal(eventData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tenant creation event: %w", err)
+	}
+
+	// Publish to tenant events stream for tenant manager to process
+	natsMsg := &nats.Msg{
+		Subject: "tenant.created",
+		Data:    eventPayload,
+		Header:  make(nats.Header),
+	}
+	natsMsg.Header.Set("Tenant-ID", tenantID)
+	natsMsg.Header.Set("Event-Type", "tenant.created")
+	natsMsg.Header.Set("Content-Type", "application/json")
+	natsMsg.Header.Set("Timestamp", time.Now().UTC().Format(time.RFC3339))
+
+	if _, err := h.natsManager.js.PublishMsg(ctx, natsMsg); err != nil {
+		return fmt.Errorf("failed to publish tenant creation event: %w", err)
+	}
+
+	log.Printf("Published tenant.created event for tenant: %s", tenantID)
+	return nil
+}
+
+func (h *APIHandler) deleteTenantViaTenantManager(ctx context.Context, tenantID string, tenant *Tenant) error {
+	// Create tenant deletion event that tenant manager will process
+	eventData := map[string]interface{}{
+		"event_id":   uuid.New().String(),
+		"event_type": "tenant.deleted",
+		"tenant_id":  tenantID,
+		"name":       tenant.Name,
+		"email":      tenant.Email,
+		"timestamp":  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	eventPayload, err := json.Marshal(eventData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tenant deletion event: %w", err)
+	}
+
+	// Publish to tenant events stream for tenant manager to process
+	natsMsg := &nats.Msg{
+		Subject: "tenant.deleted",
+		Data:    eventPayload,
+		Header:  make(nats.Header),
+	}
+	natsMsg.Header.Set("Tenant-ID", tenantID)
+	natsMsg.Header.Set("Event-Type", "tenant.deleted")
+	natsMsg.Header.Set("Content-Type", "application/json")
+	natsMsg.Header.Set("Timestamp", time.Now().UTC().Format(time.RFC3339))
+
+	if _, err := h.natsManager.js.PublishMsg(ctx, natsMsg); err != nil {
+		return fmt.Errorf("failed to publish tenant deletion event: %w", err)
+	}
+
+	log.Printf("Published tenant.deleted event for tenant: %s", tenantID)
+	return nil
 }
 
 func connectNATS(urls string) (*NATSManager, error) {
@@ -485,6 +849,40 @@ func connectNATS(urls string) (*NATSManager, error) {
 	log.Printf("Successfully connected to NATS cluster: %v (active: %s)", serverList, conn.ConnectedUrl())
 	return &NATSManager{conn: conn, js: js}, nil
 }
+
+func createTenantKV(js jetstream.JetStream) (jetstream.KeyValue, error) {
+	ctx := context.Background()
+	bucketName := "tenants"
+
+	kv, err := js.KeyValue(ctx, bucketName)
+	if err != nil {
+		if err == jetstream.ErrBucketNotFound {
+			log.Printf("Creating KV bucket: %s", bucketName)
+			kv, err = js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+				Bucket:      bucketName,
+				Description: "Tenant management storage",
+				History:     3,
+				TTL:         0,
+				MaxBytes:    -1,
+				Storage:     jetstream.FileStorage,
+				Replicas:    1,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create KV bucket %s: %w", bucketName, err)
+			}
+			log.Printf("Successfully created KV bucket: %s", bucketName)
+		} else {
+			return nil, fmt.Errorf("failed to access KV bucket %s: %w", bucketName, err)
+		}
+	} else {
+		log.Printf("Using existing KV bucket: %s", bucketName)
+	}
+
+	return kv, nil
+}
+
+// Stream management is now handled by the tenant-manager-service
+// These functions are no longer needed
 
 func loadConfig() *Config {
 	return &Config{
@@ -523,6 +921,12 @@ func setupRouter(handler *APIHandler) *mux.Router {
 	api.HandleFunc("/notifications", handler.ListNotifications).Methods("GET")
 	api.HandleFunc("/notifications/{id}", handler.GetNotification).Methods("GET")
 
+	r.HandleFunc("/api/v1/tenants", handler.CreateTenant).Methods("POST")
+	r.HandleFunc("/api/v1/tenants", handler.ListTenants).Methods("GET")
+	r.HandleFunc("/api/v1/tenants/{id}", handler.GetTenant).Methods("GET")
+	r.HandleFunc("/api/v1/tenants/{id}", handler.UpdateTenant).Methods("PUT")
+	r.HandleFunc("/api/v1/tenants/{id}", handler.DeleteTenant).Methods("DELETE")
+
 	return r
 }
 
@@ -535,8 +939,14 @@ func main() {
 		log.Fatalf("Failed to connect to NATS: %v", err)
 	}
 
+	tenantKV, err := createTenantKV(natsManager.js)
+	if err != nil {
+		log.Fatalf("Failed to create tenant KV: %v", err)
+	}
+
 	handler := &APIHandler{
 		natsManager: natsManager,
+		tenantKV:    tenantKV,
 	}
 
 	router := setupRouter(handler)

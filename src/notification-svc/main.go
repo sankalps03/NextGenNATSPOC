@@ -143,6 +143,9 @@ func (ns *NotificationService) Start() error {
 		return fmt.Errorf("failed to setup service subscription: %v", err)
 	}
 
+	// Start tenant registration listener
+	go ns.startTenantRegistrationListener()
+
 	log.Printf("Notification service started successfully")
 	return nil
 }
@@ -633,6 +636,168 @@ func (ns *NotificationService) Stop() error {
 	ns.logWritersMutex.Unlock()
 
 	log.Printf("Notification service stopped")
+	return nil
+}
+
+func (ns *NotificationService) startTenantRegistrationListener() {
+	// Subscribe to tenant registration events for this service
+	sub, err := ns.natsConn.Subscribe("tenant.register.notification-service", ns.handleTenantRegistration)
+	if err != nil {
+		log.Printf("Failed to subscribe to tenant registration events: %v", err)
+		return
+	}
+	defer sub.Unsubscribe()
+
+	log.Printf("Notification service listening for tenant registrations")
+
+	// Keep subscription alive until shutdown
+	select {
+	case <-ns.shutdown:
+		return
+	}
+}
+
+func (ns *NotificationService) handleTenantRegistration(msg *nats.Msg) {
+	var registrationData struct {
+		TenantID   string `json:"tenant_id"`
+		Action     string `json:"action"`
+		StreamName string `json:"stream_name"`
+	}
+
+	if err := json.Unmarshal(msg.Data, &registrationData); err != nil {
+		log.Printf("Failed to unmarshal tenant registration: %v", err)
+		return
+	}
+
+	switch registrationData.Action {
+	case "register":
+		log.Printf("Registering consumers for new tenant: %s", registrationData.TenantID)
+
+		// Create consumer for this tenant's stream to process notification events
+		if err := ns.createTenantConsumer(registrationData.TenantID, registrationData.StreamName); err != nil {
+			log.Printf("Failed to create consumer for tenant %s: %v", registrationData.TenantID, err)
+		} else {
+			log.Printf("Successfully created consumer for tenant %s", registrationData.TenantID)
+		}
+
+	case "unregister":
+		log.Printf("Unregistering consumers for tenant: %s", registrationData.TenantID)
+
+		// Remove consumer for this tenant
+		if err := ns.removeTenantConsumer(registrationData.TenantID); err != nil {
+			log.Printf("Failed to remove consumer for tenant %s: %v", registrationData.TenantID, err)
+		} else {
+			log.Printf("Successfully removed consumer for tenant %s", registrationData.TenantID)
+		}
+	}
+}
+
+func (ns *NotificationService) createTenantConsumer(tenantID, streamName string) error {
+	ctx := context.Background()
+
+	// Create consumer for tenant-specific notification events
+	consumerName := fmt.Sprintf("notification-service-%s", tenantID)
+	filterSubjects := []string{
+		fmt.Sprintf("tickets.%s.>", tenantID),       // Listen to ticket events to create notifications
+		fmt.Sprintf("notifications.%s.>", tenantID), // Listen to notification events
+	}
+
+	// Create consumers for each filter subject
+	for _, filterSubject := range filterSubjects {
+		consumer, err := ns.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+			Name:          fmt.Sprintf("%s-%s", consumerName, strings.ReplaceAll(filterSubject, ".", "-")),
+			FilterSubject: filterSubject,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			DeliverPolicy: jetstream.DeliverAllPolicy,
+			ReplayPolicy:  jetstream.ReplayInstantPolicy,
+			Description:   fmt.Sprintf("Consumer for notification service processing tenant %s events", tenantID),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create consumer for %s: %w", filterSubject, err)
+		}
+
+		// Start consuming messages
+		_, err = consumer.Consume(func(msg jetstream.Msg) {
+			if err := ns.processTenantMessage(tenantID, msg); err != nil {
+				log.Printf("Failed to process message for tenant %s: %v", tenantID, err)
+				msg.Nak()
+			} else {
+				msg.Ack()
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("failed to start consuming for %s: %w", filterSubject, err)
+		}
+
+		log.Printf("Created consumer for tenant %s with filter %s", tenantID, filterSubject)
+	}
+
+	return nil
+}
+
+func (ns *NotificationService) removeTenantConsumer(tenantID string) error {
+	// Note: In this simplified implementation, we don't track individual consumers
+	// In a production system, you would want to properly track and stop consumers
+	log.Printf("Removed consumer tracking for tenant %s", tenantID)
+	return nil
+}
+
+func (ns *NotificationService) processTenantMessage(tenantID string, msg jetstream.Msg) error {
+	// Validate message is for the correct tenant
+	if !ns.validateMessageTenant(msg, tenantID) {
+		log.Printf("Message tenant validation failed for %s", tenantID)
+		return fmt.Errorf("message tenant validation failed")
+	}
+
+	// Process the message based on the subject
+	subject := msg.Subject()
+
+	if strings.Contains(subject, "tickets.") {
+		// Handle ticket events to create notifications
+		return ns.processTicketEventForNotifications(tenantID, msg)
+	} else if strings.Contains(subject, "notifications.") {
+		// Handle notification events
+		return ns.processNotificationEvent(tenantID, msg)
+	}
+
+	log.Printf("Unknown message type for tenant %s: %s", tenantID, subject)
+	return nil
+}
+
+func (ns *NotificationService) validateMessageTenant(msg jetstream.Msg, expectedTenantID string) bool {
+	// Check tenant ID in headers
+	if tenantID := msg.Headers().Get("Tenant-ID"); tenantID != "" {
+		return tenantID == expectedTenantID
+	}
+
+	// Check tenant ID in subject
+	subject := msg.Subject()
+	if strings.Contains(subject, fmt.Sprintf(".%s.", expectedTenantID)) {
+		return true
+	}
+
+	return false
+}
+
+func (ns *NotificationService) processTicketEventForNotifications(tenantID string, msg jetstream.Msg) error {
+	// Parse the ticket event and determine if we should create a notification
+	var ticketEvent TicketEvent
+	if err := json.Unmarshal(msg.Data(), &ticketEvent); err != nil {
+		return fmt.Errorf("failed to unmarshal ticket event: %w", err)
+	}
+
+	// Check if we should create a notification based on the existing logic
+	if ns.shouldCreateNotification(ticketEvent) {
+		return ns.processEvent(msg)
+	}
+
+	return nil
+}
+
+func (ns *NotificationService) processNotificationEvent(tenantID string, msg jetstream.Msg) error {
+	// Process notification-specific events
+	log.Printf("Processing notification event for tenant %s: %s", tenantID, msg.Subject())
+	// Add your notification event processing logic here
 	return nil
 }
 
