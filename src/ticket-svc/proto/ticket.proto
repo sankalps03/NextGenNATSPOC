@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package ticketpb;
+
+option go_package = "github.com/platform/ticket-svc/pb/proto;ticketpb";
+
+// TicketData represents the dynamic ticket data stored as protobuf
+message  TicketData {
+  // Core required fields
+  string id = 1;
+  string tenant = 2;
+  string created_at = 3;
+  string updated_at = 4;
+  
+  // Dynamic fields stored as key-value pairs
+  map<string, FieldValue> fields = 5;
+}
+
+// FieldValue represents a dynamic field value with type information
+message FieldValue {
+  oneof value {
+    string string_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+    bytes bytes_value = 5;
+    StringArray string_array = 6;
+  }
+}
+
+// StringArray for storing arrays of strings
+message StringArray {
+  repeated string values = 1;
+}
+
+// Meta represents event metadata
+message Meta {
+  string event_id = 1;
+  string tenant = 2;
+  string occurred_at = 3;
+  string schema = 4;
+}
+
+// TicketEvent represents a ticket domain event
+message TicketEvent {
+  Meta meta = 1;
+  TicketData data = 2;
+}

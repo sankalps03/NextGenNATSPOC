@@ -4,17 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	storage2 "github.com/platform/ticket-svc/storage"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	ticketpb "github.com/platform/ticket-svc/pb/proto"
 )
 
 type Meta struct {
@@ -24,25 +25,21 @@ type Meta struct {
 	Schema     string `json:"schema"`
 }
 
-type Ticket struct {
-	Id          string `json:"id"`
-	Tenant      string `json:"tenant"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	CreatedBy   string `json:"created_by"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
-}
-
 type TicketEvent struct {
-	Meta *Meta   `json:"meta"`
-	Data *Ticket `json:"data"`
+	Meta *Meta                `json:"meta"`
+	Data *ticketpb.TicketData `json:"data"`
 }
 
 type Config struct {
-	NATSUrl     string
-	ServiceName string
-	LogLevel    string
+	NATSUrl         string
+	ServiceName     string
+	LogLevel        string
+	DynamoDBTable   string
+	DynamoDBURL     string // DynamoDB endpoint URL (for local development)
+	DynamoDBAddress string // DynamoDB address (alternative to URL)
+	AWSRegion       string
+	StorageType     string // "dynamodb" or "dynamodb-dynamic"
+	StorageMode     string // "fixed" or "dynamic" (for DynamoDB schema)
 }
 
 type NATSManager struct {
@@ -50,26 +47,12 @@ type NATSManager struct {
 	js   jetstream.JetStream
 }
 
-type InMemoryStorage struct {
-	mu      sync.RWMutex
-	tenants map[string]map[string]*Ticket
-}
-
 type TicketService struct {
 	natsManager *NATSManager
-	storage     *InMemoryStorage
+	storage     storage2.TicketStorage
 }
 
-type CreateTicketRequest struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	CreatedBy   string `json:"created_by"`
-}
-
-type UpdateTicketRequest struct {
-	Title       *string `json:"title,omitempty"`
-	Description *string `json:"description,omitempty"`
-}
+// Removed hardcoded request structs - now using dynamic field handling
 
 type ServiceRequest struct {
 	Action   string      `json:"action"`
@@ -83,78 +66,135 @@ type ErrorResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func NewInMemoryStorage() *InMemoryStorage {
-	return &InMemoryStorage{
-		tenants: make(map[string]map[string]*Ticket),
+// ResponseWithLatency wraps responses with database latency information
+type ResponseWithLatency struct {
+	Data            interface{} `json:"data"`
+	DatabaseLatency string      `json:"database_latency_ms"`
+}
+
+// convertToFieldValue converts a Go value to protobuf FieldValue
+func convertToFieldValue(value interface{}) (*ticketpb.FieldValue, error) {
+	switch v := value.(type) {
+	case string:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: v},
+		}, nil
+	case int:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
+		}, nil
+	case int64:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_IntValue{IntValue: v},
+		}, nil
+	case float64:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: v},
+		}, nil
+	case bool:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_BoolValue{BoolValue: v},
+		}, nil
+	case []string:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: v},
+			},
+		}, nil
+	case []interface{}:
+		// Convert interface slice to string slice
+		var stringArray []string
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				stringArray = append(stringArray, str)
+			} else {
+				stringArray = append(stringArray, fmt.Sprintf("%v", item))
+			}
+		}
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: stringArray},
+			},
+		}, nil
+	default:
+		// Convert unknown types to string
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)},
+		}, nil
 	}
 }
 
-func (s *InMemoryStorage) ensureTenant(tenant string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.tenants[tenant]; !exists {
-		s.tenants[tenant] = make(map[string]*Ticket)
+// convertMapToFields converts a map[string]interface{} to protobuf fields
+func convertMapToFields(data map[string]interface{}) (map[string]*ticketpb.FieldValue, error) {
+	fields := make(map[string]*ticketpb.FieldValue)
+
+	for key, value := range data {
+		fieldValue, err := convertToFieldValue(value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert field %s: %w", key, err)
+		}
+		fields[key] = fieldValue
 	}
+
+	return fields, nil
 }
 
-func (s *InMemoryStorage) CreateTicket(tenant string, ticket *Ticket) {
-	s.ensureTenant(tenant)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tenants[tenant][ticket.Id] = ticket
-}
-
-func (s *InMemoryStorage) GetTicket(tenant, id string) (*Ticket, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		ticket, found := tenantTickets[id]
-		return ticket, found
-	}
-	return nil, false
-}
-
-func (s *InMemoryStorage) UpdateTicket(tenant string, ticket *Ticket) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		if _, found := tenantTickets[ticket.Id]; found {
-			tenantTickets[ticket.Id] = ticket
-			return true
+// checkForSeverityInFields checks if any field contains severity keywords
+func (ts *TicketService) checkForSeverityInFields(fields map[string]*ticketpb.FieldValue) bool {
+	for _, fieldValue := range fields {
+		if stringVal := fieldValue.GetStringValue(); stringVal != "" {
+			if containsSeverity(stringVal) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-func (s *InMemoryStorage) DeleteTicket(tenant, id string) (*Ticket, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		if ticket, found := tenantTickets[id]; found {
-			delete(tenantTickets, id)
-			return ticket, true
-		}
+// fieldsEqual compares two FieldValue instances for equality
+func fieldsEqual(a, b *ticketpb.FieldValue) bool {
+	if a == nil && b == nil {
+		return true
 	}
-	return nil, false
-}
-
-func (s *InMemoryStorage) ListTickets(tenant string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var tickets []*Ticket
-	response := make(map[string]interface{})
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		for _, ticket := range tenantTickets {
-			tickets = append(tickets, ticket)
-		}
-	} else {
-		tickets = []*Ticket{}
+	if a == nil || b == nil {
+		return false
 	}
 
-	response["tickets"] = tickets
-	response["tenant"] = tenant
-
-	return response
+	switch aVal := a.Value.(type) {
+	case *ticketpb.FieldValue_StringValue:
+		if bVal, ok := b.Value.(*ticketpb.FieldValue_StringValue); ok {
+			return aVal.StringValue == bVal.StringValue
+		}
+	case *ticketpb.FieldValue_IntValue:
+		if bVal, ok := b.Value.(*ticketpb.FieldValue_IntValue); ok {
+			return aVal.IntValue == bVal.IntValue
+		}
+	case *ticketpb.FieldValue_DoubleValue:
+		if bVal, ok := b.Value.(*ticketpb.FieldValue_DoubleValue); ok {
+			return aVal.DoubleValue == bVal.DoubleValue
+		}
+	case *ticketpb.FieldValue_BoolValue:
+		if bVal, ok := b.Value.(*ticketpb.FieldValue_BoolValue); ok {
+			return aVal.BoolValue == bVal.BoolValue
+		}
+	case *ticketpb.FieldValue_BytesValue:
+		if bVal, ok := b.Value.(*ticketpb.FieldValue_BytesValue); ok {
+			return string(aVal.BytesValue) == string(bVal.BytesValue)
+		}
+	case *ticketpb.FieldValue_StringArray:
+		if bVal, ok := b.Value.(*ticketpb.FieldValue_StringArray); ok {
+			if len(aVal.StringArray.Values) != len(bVal.StringArray.Values) {
+				return false
+			}
+			for i, v := range aVal.StringArray.Values {
+				if v != bVal.StringArray.Values[i] {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
@@ -202,149 +242,185 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 }
 
 func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, error) {
+	// Convert req.Data to map[string]interface{} for dynamic field handling
+	var fieldData map[string]interface{}
+
 	dataBytes, err := json.Marshal(req.Data)
 	if err != nil {
 		return nil, err
 	}
 
-	var createReq CreateTicketRequest
-	if err := json.Unmarshal(dataBytes, &createReq); err != nil {
+	if err := json.Unmarshal(dataBytes, &fieldData); err != nil {
 		return nil, err
 	}
 
-	if strings.TrimSpace(createReq.Title) == "" || strings.TrimSpace(createReq.CreatedBy) == "" {
-		return ErrorResponse{
-			Error:   "validation_failed",
-			Message: "title and created_by are required and cannot be empty",
-		}, nil
-	}
-
-	if len(createReq.Title) > 200 {
-		return ErrorResponse{
-			Error:   "validation_failed",
-			Message: "title must be 200 characters or less",
-		}, nil
-	}
-
-	if len(createReq.Description) > 2000 {
-		return ErrorResponse{
-			Error:   "validation_failed",
-			Message: "description must be 2000 characters or less",
-		}, nil
+	// Convert dynamic fields to protobuf FieldValue types
+	fields, err := convertMapToFields(fieldData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert fields: %w", err)
 	}
 
 	now := time.Now().Format(time.RFC3339)
-	ticket := &Ticket{
-		Id:          uuid.New().String(),
-		Tenant:      req.Tenant,
-		Title:       createReq.Title,
-		Description: createReq.Description,
-		CreatedBy:   createReq.CreatedBy,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+
+	// Create protobuf TicketData with dynamic fields
+	ticketData := &ticketpb.TicketData{
+		Id:        uuid.New().String(),
+		Tenant:    req.Tenant,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Fields:    fields,
 	}
 
-	ts.storage.CreateTicket(req.Tenant, ticket)
+	// Measure database latency
+	dbStart := time.Now()
+	if err := ts.storage.CreateTicket(req.Tenant, ticketData); err != nil {
+		return nil, fmt.Errorf("failed to create ticket: %w", err)
+	}
+	dbLatency := time.Since(dbStart)
 
-	if err := ts.publishTicketCreated(context.Background(), req.Tenant, ticket); err != nil {
-		log.Printf("ERROR: Failed to publish ticket created event for tenant=%s ticket_id=%s: %v", req.Tenant, ticket.Id, err)
+	if err := ts.publishTicketCreated(context.Background(), req.Tenant, ticketData); err != nil {
+		log.Printf("ERROR: Failed to publish ticket created event for tenant=%s ticket_id=%s: %v", req.Tenant, ticketData.Id, err)
 	}
 
-	if containsSeverity(createReq.Description) {
-		if err := ts.publishNotificationRequested(context.Background(), req.Tenant, ticket); err != nil {
-			log.Printf("ERROR: Failed to publish notification requested event for tenant=%s ticket_id=%s: %v", req.Tenant, ticket.Id, err)
+	// Check for severity in any description-like field for notification
+	if ts.checkForSeverityInFields(fields) {
+		if err := ts.publishNotificationRequested(context.Background(), req.Tenant, ticketData); err != nil {
+			log.Printf("ERROR: Failed to publish notification requested event for tenant=%s ticket_id=%s: %v", req.Tenant, ticketData.Id, err)
 		}
 	}
 
-	return ticket, nil
+	return ResponseWithLatency{
+		Data:            ticketData,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
 }
 
 func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, error) {
-	return ts.storage.ListTickets(req.Tenant), nil
+	// Measure database latency
+	dbStart := time.Now()
+	tickets, err := ts.storage.ListTickets(req.Tenant)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tickets: %w", err)
+	}
+
+	return ResponseWithLatency{
+		Data: map[string]interface{}{
+			"tickets": tickets,
+			"tenant":  req.Tenant,
+		},
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
 }
 
 func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error) {
-	ticket, found := ts.storage.GetTicket(req.Tenant, req.TicketID)
+	// Measure database latency
+	dbStart := time.Now()
+	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID)
+	dbLatency := time.Since(dbStart)
+
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
 	}
 
-	if err := ts.publishTicketRead(context.Background(), req.Tenant, ticket); err != nil {
+	if err := ts.publishTicketRead(context.Background(), req.Tenant, ticketData); err != nil {
 		log.Printf("ERROR: Failed to publish ticket read event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 	}
 
-	return ticket, nil
+	return ResponseWithLatency{
+		Data:            ticketData,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
 }
 
 func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, error) {
-	ticket, found := ts.storage.GetTicket(req.Tenant, req.TicketID)
+	// Measure database latency for get operation
+	dbStart := time.Now()
+	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID)
+	getLatency := time.Since(dbStart)
+
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
 	}
+
+	// Convert req.Data to map[string]interface{} for dynamic field handling
+	var updateData map[string]interface{}
 
 	dataBytes, err := json.Marshal(req.Data)
 	if err != nil {
 		return nil, err
 	}
 
-	var updateReq UpdateTicketRequest
-	if err := json.Unmarshal(dataBytes, &updateReq); err != nil {
+	if err := json.Unmarshal(dataBytes, &updateData); err != nil {
 		return nil, err
 	}
 
 	updated := false
 
-	if updateReq.Title != nil && *updateReq.Title != ticket.Title {
-		if len(*updateReq.Title) > 200 {
-			return ErrorResponse{
-				Error:   "validation_failed",
-				Message: "title must be 200 characters or less",
-			}, nil
+	// Update fields dynamically
+	for fieldName, newValue := range updateData {
+		// Convert new value to protobuf FieldValue
+		newFieldValue, err := convertToFieldValue(newValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert field %s: %w", fieldName, err)
 		}
-		ticket.Title = *updateReq.Title
-		updated = true
+
+		// Check if field value has actually changed
+		currentFieldValue, exists := ticketData.Fields[fieldName]
+		if !exists || !fieldsEqual(currentFieldValue, newFieldValue) {
+			ticketData.Fields[fieldName] = newFieldValue
+			updated = true
+		}
 	}
 
-	if updateReq.Description != nil && *updateReq.Description != ticket.Description {
-		if len(*updateReq.Description) > 2000 {
-			return ErrorResponse{
-				Error:   "validation_failed",
-				Message: "description must be 2000 characters or less",
-			}, nil
-		}
-		ticket.Description = *updateReq.Description
-		updated = true
-	}
-
+	var updateLatency time.Duration
 	if updated {
-		ticket.UpdatedAt = time.Now().Format(time.RFC3339)
-		ts.storage.UpdateTicket(req.Tenant, ticket)
+		ticketData.UpdatedAt = time.Now().Format(time.RFC3339)
 
-		if err := ts.publishTicketUpdated(context.Background(), req.Tenant, ticket); err != nil {
+		// Measure database latency for update operation
+		updateStart := time.Now()
+		ts.storage.UpdateTicket(req.Tenant, ticketData)
+		updateLatency = time.Since(updateStart)
+
+		if err := ts.publishTicketUpdated(context.Background(), req.Tenant, ticketData); err != nil {
 			log.Printf("ERROR: Failed to publish ticket updated event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 		}
 
-		if containsSeverity(ticket.Description) {
-			if err := ts.publishNotificationRequested(context.Background(), req.Tenant, ticket); err != nil {
+		if ts.checkForSeverityInFields(ticketData.Fields) {
+			if err := ts.publishNotificationRequested(context.Background(), req.Tenant, ticketData); err != nil {
 				log.Printf("ERROR: Failed to publish notification requested event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 			}
 		}
 	}
 
-	return ticket, nil
+	// Total database latency includes both get and update operations
+	totalDbLatency := getLatency + updateLatency
+
+	return ResponseWithLatency{
+		Data:            ticketData,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(totalDbLatency.Nanoseconds())/1000000),
+	}, nil
 }
 
 func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, error) {
-	ticket, found := ts.storage.DeleteTicket(req.Tenant, req.TicketID)
+	// Measure database latency
+	dbStart := time.Now()
+	ticketData, found := ts.storage.DeleteTicket(req.Tenant, req.TicketID)
+	dbLatency := time.Since(dbStart)
+
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
 	}
 
-	if err := ts.publishTicketDeleted(context.Background(), req.Tenant, ticket); err != nil {
+	if err := ts.publishTicketDeleted(context.Background(), req.Tenant, ticketData); err != nil {
 		log.Printf("ERROR: Failed to publish ticket deleted event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 	}
 
-	return map[string]string{"status": "deleted"}, nil
+	return ResponseWithLatency{
+		Data:            map[string]string{"status": "deleted"},
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
 }
 
 func connectNATS(urls string) (*NATSManager, error) {
@@ -397,7 +473,7 @@ func (nm *NATSManager) PublishEvent(ctx context.Context, subject string, payload
 	return err
 }
 
-func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string, ticket *Ticket) error {
+func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -405,7 +481,7 @@ func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.create@v1",
 		},
-		Data: ticket,
+		Data: ticketData,
 	}
 
 	payload, err := json.Marshal(event)
@@ -424,7 +500,7 @@ func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string, ticket *Ticket) error {
+func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -432,7 +508,7 @@ func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.update@v1",
 		},
-		Data: ticket,
+		Data: ticketData,
 	}
 
 	payload, err := json.Marshal(event)
@@ -451,7 +527,7 @@ func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string, ticket *Ticket) error {
+func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -459,7 +535,7 @@ func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.delete@v1",
 		},
-		Data: ticket,
+		Data: ticketData,
 	}
 
 	payload, err := json.Marshal(event)
@@ -478,7 +554,7 @@ func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, ticket *Ticket) error {
+func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -486,7 +562,7 @@ func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, t
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.read@v1",
 		},
-		Data: ticket,
+		Data: ticketData,
 	}
 
 	payload, err := json.Marshal(event)
@@ -505,7 +581,7 @@ func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, t
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenant string, ticket *Ticket) error {
+func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -513,7 +589,7 @@ func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenan
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "notification.event@v1",
 		},
-		Data: ticket,
+		Data: ticketData,
 	}
 
 	payload, err := json.Marshal(event)
@@ -539,9 +615,15 @@ func containsSeverity(description string) bool {
 
 func loadConfig() *Config {
 	return &Config{
-		NATSUrl:     getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
-		ServiceName: getEnv("SERVICE_NAME", "ticket-service"),
-		LogLevel:    getEnv("LOG_LEVEL", "info"),
+		NATSUrl:         getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
+		ServiceName:     getEnv("SERVICE_NAME", "ticket-service"),
+		LogLevel:        getEnv("LOG_LEVEL", "info"),
+		DynamoDBTable:   getEnv("DYNAMODB_TABLE", "tickets"),
+		DynamoDBURL:     getEnv("DYNAMODB_URL", ""),
+		DynamoDBAddress: getEnv("DYNAMODB_ADDRESS", ""),
+		AWSRegion:       getEnv("AWS_REGION", "us-east-1"),
+		StorageType:     getEnv("STORAGE_TYPE", "dynamodb-dynamic"),
+		StorageMode:     getEnv("STORAGE_MODE", "dynamic"),
 	}
 }
 
@@ -561,7 +643,15 @@ func main() {
 		log.Fatalf("Failed to connect to NATS: %v", err)
 	}
 
-	storage := NewInMemoryStorage()
+	// Initialize storage based on configuration
+	var storage storage2.TicketStorage
+
+	dynamoStorage, err := storage2.NewDynamoDBStorage(context.Background(), config.DynamoDBTable, config.AWSRegion, config.DynamoDBURL, config.DynamoDBAddress)
+	if err != nil {
+		log.Fatalf("Failed to initialize DynamoDB dynamic storage: %v", err)
+	}
+	storage = dynamoStorage
+	log.Printf("Using DynamoDB dynamic storage (protobuf) with table: %s in region: %s", config.DynamoDBTable, config.AWSRegion)
 
 	service := &TicketService{
 		natsManager: natsManager,
@@ -581,6 +671,13 @@ func main() {
 	<-c
 
 	log.Println("Shutting down service...")
+
+	// Close storage connection
+	if storage != nil {
+		if err := storage.Close(); err != nil {
+			log.Printf("Error closing storage: %v", err)
+		}
+	}
 
 	if natsManager != nil && natsManager.conn != nil {
 		natsManager.conn.Close()

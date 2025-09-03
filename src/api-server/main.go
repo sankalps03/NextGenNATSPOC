@@ -66,16 +66,7 @@ type Notification struct {
 	DeliveredAt *time.Time `json:"delivered_at,omitempty"`
 }
 
-type CreateTicketRequest struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	CreatedBy   string `json:"created_by"`
-}
-
-type UpdateTicketRequest struct {
-	Title       *string `json:"title,omitempty"`
-	Description *string `json:"description,omitempty"`
-}
+// Removed hardcoded request structs - now using dynamic field handling
 
 type ErrorResponse struct {
 	Error   string `json:"error"`
@@ -140,48 +131,19 @@ func corsMiddleware(next http.Handler) http.Handler {
 func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 
-	var req CreateTicketRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Accept any JSON data for dynamic field handling
+	var ticketData map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&ticketData); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_json", Message: err.Error()})
 		return
 	}
 
-	if strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.CreatedBy) == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "validation_failed",
-			Message: "title and created_by are required and cannot be empty",
-		})
-		return
-	}
-
-	if len(req.Title) > 200 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "validation_failed",
-			Message: "title must be 200 characters or less",
-		})
-		return
-	}
-
-	if len(req.Description) > 2000 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "validation_failed",
-			Message: "description must be 2000 characters or less",
-		})
-		return
-	}
-
 	requestData := map[string]interface{}{
 		"action": "create",
 		"tenant": tenant,
-		"data":   req,
+		"data":   ticketData,
 	}
 
 	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
@@ -193,18 +155,9 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var ticket Ticket
-	if err := json.Unmarshal(response, &ticket); err != nil {
-		log.Printf("ERROR: Failed to unmarshal ticket response: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(ticket)
+	w.Write(response)
 }
 
 func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
@@ -267,31 +220,12 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
-	var req UpdateTicketRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Accept any JSON data for dynamic field handling
+	var updateData map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_json", Message: err.Error()})
-		return
-	}
-
-	if req.Title != nil && len(*req.Title) > 200 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "validation_failed",
-			Message: "title must be 200 characters or less",
-		})
-		return
-	}
-
-	if req.Description != nil && len(*req.Description) > 2000 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error:   "validation_failed",
-			Message: "description must be 2000 characters or less",
-		})
 		return
 	}
 
@@ -299,7 +233,7 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 		"action":    "update",
 		"tenant":    tenant,
 		"ticket_id": ticketID,
-		"data":      req,
+		"data":      updateData,
 	}
 
 	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)

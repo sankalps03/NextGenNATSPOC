@@ -46,18 +46,17 @@ type Notification struct {
 }
 
 type TicketEvent struct {
-	Meta   EventMeta `json:"meta"`
-	Ticket Ticket    `json:"data"`
+	Meta   EventMeta  `json:"meta"`
+	Ticket TicketData `json:"data"`
 }
 
-type Ticket struct {
-	ID          string    `json:"id"`
-	Tenant      string    `json:"tenant"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	CreatedBy   string    `json:"created_by"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+// TicketData represents the dynamic ticket data from protobuf
+type TicketData struct {
+	ID        string                 `json:"id"`
+	Tenant    string                 `json:"tenant"`
+	CreatedAt string                 `json:"created_at"`
+	UpdatedAt string                 `json:"updated_at"`
+	Fields    map[string]interface{} `json:"fields"`
 }
 
 type EventMeta struct {
@@ -82,6 +81,47 @@ type ServiceRequest struct {
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message,omitempty"`
+}
+
+// ResponseWithLatency wraps responses with storage latency information
+type ResponseWithLatency struct {
+	Data           interface{} `json:"data"`
+	StorageLatency string      `json:"storage_latency_ms"`
+}
+
+// Helper functions to extract field values from dynamic ticket data
+func (td *TicketData) GetStringField(fieldName string) string {
+	if td.Fields == nil {
+		return ""
+	}
+
+	if fieldValue, exists := td.Fields[fieldName]; exists {
+		// Handle nested field structure from protobuf
+		if fieldMap, ok := fieldValue.(map[string]interface{}); ok {
+			if stringValue, exists := fieldMap["string_value"]; exists {
+				if str, ok := stringValue.(string); ok {
+					return str
+				}
+			}
+		}
+		// Handle direct string value
+		if str, ok := fieldValue.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+func (td *TicketData) GetTitle() string {
+	return td.GetStringField("title")
+}
+
+func (td *TicketData) GetDescription() string {
+	return td.GetStringField("description")
+}
+
+func (td *TicketData) GetCreatedBy() string {
+	return td.GetStringField("created_by")
 }
 
 const (
@@ -209,16 +249,22 @@ func (ns *NotificationService) handleListNotifications(req ServiceRequest) inter
 	status := req.Params["status"]
 	channel := req.Params["channel"]
 
+	// Measure storage latency
+	storageStart := time.Now()
 	ns.mutex.RLock()
 	tenantNotifications, exists := ns.notifications[tenant]
 	if !exists {
 		ns.mutex.RUnlock()
-		return map[string]interface{}{
-			"notifications": []Notification{},
-			"total":         0,
-			"page":          page,
-			"size":          size,
-			"tenant":        tenant,
+		storageLatency := time.Since(storageStart)
+		return ResponseWithLatency{
+			Data: map[string]interface{}{
+				"notifications": []Notification{},
+				"total":         0,
+				"page":          page,
+				"size":          size,
+				"tenant":        tenant,
+			},
+			StorageLatency: fmt.Sprintf("%.2f", float64(storageLatency.Nanoseconds())/1000000),
 		}
 	}
 
@@ -233,6 +279,7 @@ func (ns *NotificationService) handleListNotifications(req ServiceRequest) inter
 		filtered = append(filtered, notification)
 	}
 	ns.mutex.RUnlock()
+	storageLatency := time.Since(storageStart)
 
 	total := len(filtered)
 	start := (page - 1) * size
@@ -246,17 +293,22 @@ func (ns *NotificationService) handleListNotifications(req ServiceRequest) inter
 
 	result := filtered[start:end]
 
-	return map[string]interface{}{
-		"notifications": result,
-		"total":         total,
-		"page":          page,
-		"size":          size,
+	return ResponseWithLatency{
+		Data: map[string]interface{}{
+			"notifications": result,
+			"total":         total,
+			"page":          page,
+			"size":          size,
+		},
+		StorageLatency: fmt.Sprintf("%.2f", float64(storageLatency.Nanoseconds())/1000000),
 	}
 }
 
 func (ns *NotificationService) handleGetNotification(req ServiceRequest) interface{} {
 	tenant := strings.ToLower(req.Tenant)
 
+	// Measure storage latency
+	storageStart := time.Now()
 	ns.mutex.RLock()
 	tenantNotifications, exists := ns.notifications[tenant]
 	if !exists {
@@ -266,12 +318,16 @@ func (ns *NotificationService) handleGetNotification(req ServiceRequest) interfa
 
 	notification, exists := tenantNotifications[req.NotificationID]
 	ns.mutex.RUnlock()
+	storageLatency := time.Since(storageStart)
 
 	if !exists {
 		return ErrorResponse{Error: "notification_not_found"}
 	}
 
-	return notification
+	return ResponseWithLatency{
+		Data:           notification,
+		StorageLatency: fmt.Sprintf("%.2f", float64(storageLatency.Nanoseconds())/1000000),
+	}
 }
 
 func (ns *NotificationService) loadTemplates() error {
@@ -435,7 +491,7 @@ func (ns *NotificationService) processEvent(msg jetstream.Msg) error {
 }
 
 func (ns *NotificationService) shouldCreateNotification(event TicketEvent) bool {
-	description := strings.ToLower(event.Ticket.Description)
+	description := strings.ToLower(event.Ticket.GetDescription())
 	return strings.Contains(description, "critical") || strings.Contains(description, "major")
 }
 
@@ -455,19 +511,19 @@ func (ns *NotificationService) createNotification(event TicketEvent) *Notificati
 	id := uuid.New().String()
 	now := time.Now()
 
-	description := strings.ToLower(event.Ticket.Description)
+	description := strings.ToLower(event.Ticket.GetDescription())
 	severity := SeverityMajor
 	if strings.Contains(description, "critical") {
 		severity = SeverityCritical
 	}
 
-	message := ns.generateMessage(severity, event.Ticket.ID, event.Ticket.Title)
+	message := ns.generateMessage(severity, event.Ticket.ID, event.Ticket.GetTitle())
 
 	return &Notification{
 		ID:          id,
 		Tenant:      event.Ticket.Tenant,
 		TicketID:    event.Ticket.ID,
-		TicketTitle: event.Ticket.Title,
+		TicketTitle: event.Ticket.GetTitle(),
 		Severity:    severity,
 		Message:     message,
 		Channel:     ChannelLog,

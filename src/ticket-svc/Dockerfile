@@ -1,20 +1,28 @@
 # Build stage
 FROM golang:1.24-alpine AS builder
 
-# Install git and ca-certificates (needed for fetching dependencies)
-RUN apk add --no-cache git ca-certificates tzdata
+# Install protobuf compiler and required tools
+RUN apk add --no-cache git ca-certificates tzdata protobuf protobuf-dev
+
+# Install protoc-gen-go
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 
 # Set working directory
 WORKDIR /app
 
-# Copy go mod files from project root
-COPY ../../go.mod ../../go.sum ./
+# Copy go mod files
+COPY go.mod go.sum ./
 
 # Download dependencies
 RUN go mod download
 
+# Copy proto files and generate protobuf code
+COPY proto/ ./proto/
+RUN mkdir -p pb
+RUN protoc --go_out=pb --go_opt=paths=source_relative proto/ticket.proto
+
 # Copy source code
-COPY main.go .
+COPY . .
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
