@@ -4,8 +4,8 @@ go 1.24
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/gorilla/mux v1.8.1
 	github.com/nats-io/nats.go v1.34.1
+	github.com/opensearch-project/opensearch-go/v2 v2.3.0
 )
 
 require (

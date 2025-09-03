@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,19 +15,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 type CommentActivityService struct {
-	natsConn    *nats.Conn
-	js          nats.JetStreamContext
-	serviceName string
-	shutdownCh  chan struct{}
-	wg          sync.WaitGroup
-
-	// In-memory storage (POC only)
-	comments   map[string]map[string]*Comment // tenant_id -> comment_id -> Comment
-	activities map[string][]*Activity         // tenant_id -> []Activity
-	mu         sync.RWMutex
+	natsConn      *nats.Conn
+	js            jetstream.JetStream
+	commentsKVs   map[string]jetstream.KeyValue
+	activitiesKVs map[string]jetstream.KeyValue
+	serviceName   string
+	shutdownCh    chan struct{}
+	wg            sync.WaitGroup
+	mu            sync.RWMutex
 }
 
 type Comment struct {
@@ -100,6 +100,13 @@ type Config struct {
 	LogLevel    string
 }
 
+type TenantEvent struct {
+	EventID   string `json:"event_id"`
+	EventType string `json:"event_type"` // tenant.created, tenant.deleted
+	TenantID  string `json:"tenant_id"`
+	Timestamp string `json:"timestamp"`
+}
+
 func main() {
 	config := loadConfig()
 
@@ -139,6 +146,7 @@ func getEnv(key, defaultValue string) string {
 }
 
 func NewCommentActivityService(config Config) (*CommentActivityService, error) {
+
 	// Connect to NATS
 	natsConn, err := nats.Connect(strings.Join(config.NATSURLs, ","),
 		nats.Name(config.ServiceName),
@@ -150,7 +158,7 @@ func NewCommentActivityService(config Config) (*CommentActivityService, error) {
 	}
 
 	// Create JetStream context
-	js, err := natsConn.JetStream()
+	js, err := jetstream.New(natsConn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
@@ -161,26 +169,32 @@ func NewCommentActivityService(config Config) (*CommentActivityService, error) {
 	}
 
 	service := &CommentActivityService{
-		natsConn:    natsConn,
-		js:          js,
-		serviceName: config.ServiceName,
-		shutdownCh:  make(chan struct{}),
-		comments:    make(map[string]map[string]*Comment),
-		activities:  make(map[string][]*Activity),
+		natsConn:      natsConn,
+		js:            js,
+		commentsKVs:   make(map[string]jetstream.KeyValue),
+		activitiesKVs: make(map[string]jetstream.KeyValue),
+		serviceName:   config.ServiceName,
+		shutdownCh:    make(chan struct{}),
 	}
+
+	log.Printf("Successfully created KV buckets: comments, activities")
+	// Start tenant management consumer
+	go service.startTenantManagementConsumer()
 
 	return service, nil
 }
 
-func ensureStreams(js nats.JetStreamContext) error {
+func ensureStreams(js jetstream.JetStream) error {
+	ctx := context.Background()
+
 	// Ensure ACTIVITY_EVENTS stream exists
 	streamName := "ACTIVITY_EVENTS"
-	_, err := js.StreamInfo(streamName)
+	_, err := js.Stream(ctx, streamName)
 	if err != nil {
-		_, err = js.AddStream(&nats.StreamConfig{
+		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 			Name:     streamName,
 			Subjects: []string{"activity.created", "comment.created", "comment.updated"},
-			Storage:  nats.FileStorage,
+			Storage:  jetstream.FileStorage,
 			MaxMsgs:  1000000,
 			MaxAge:   7 * 24 * time.Hour, // 7 days
 		})
@@ -191,6 +205,235 @@ func ensureStreams(js nats.JetStreamContext) error {
 	}
 
 	return nil
+}
+
+// KV Storage helper functions
+func (s *CommentActivityService) getTenantCommentsKV(tenantID string) (jetstream.KeyValue, error) {
+	s.mu.RLock()
+	kv, exists := s.commentsKVs[tenantID]
+	s.mu.RUnlock()
+
+	if exists {
+		return kv, nil
+	}
+
+	return nil, fmt.Errorf("comments KV bucket not found for tenant: %s", tenantID)
+}
+
+func (s *CommentActivityService) getTenantActivitiesKV(tenantID string) (jetstream.KeyValue, error) {
+	s.mu.RLock()
+	kv, exists := s.activitiesKVs[tenantID]
+	s.mu.RUnlock()
+
+	if exists {
+		return kv, nil
+	}
+
+	return nil, fmt.Errorf("activities KV bucket not found for tenant: %s", tenantID)
+}
+
+func (s *CommentActivityService) createTenantKVs(tenantID string) error {
+	ctx := context.Background()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Create comments KV bucket
+	commentsKV, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:      fmt.Sprintf("comments-%s", tenantID),
+		Description: fmt.Sprintf("Comments storage bucket for tenant %s", tenantID),
+		TTL:         0,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create comments KV bucket for tenant %s: %w", tenantID, err)
+	}
+
+	// Create activities KV bucket
+	activitiesKV, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:      fmt.Sprintf("activities-%s", tenantID),
+		Description: fmt.Sprintf("Activities storage bucket for tenant %s", tenantID),
+		TTL:         0,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create activities KV bucket for tenant %s: %w", tenantID, err)
+	}
+
+	s.commentsKVs[tenantID] = commentsKV
+	s.activitiesKVs[tenantID] = activitiesKV
+
+	log.Printf("Created KV buckets for tenant: %s", tenantID)
+	return nil
+}
+
+func (s *CommentActivityService) deleteTenantKVs(tenantID string) error {
+	ctx := context.Background()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Delete comments KV bucket
+	commentsBucket := fmt.Sprintf("comments-%s", tenantID)
+	err := s.js.DeleteKeyValue(ctx, commentsBucket)
+	if err != nil {
+		log.Printf("Failed to delete comments KV bucket for tenant %s: %v", tenantID, err)
+	}
+
+	// Delete activities KV bucket
+	activitiesBucket := fmt.Sprintf("activities-%s", tenantID)
+	err = s.js.DeleteKeyValue(ctx, activitiesBucket)
+	if err != nil {
+		log.Printf("Failed to delete activities KV bucket for tenant %s: %v", tenantID, err)
+	}
+
+	delete(s.commentsKVs, tenantID)
+	delete(s.activitiesKVs, tenantID)
+
+	log.Printf("Deleted KV buckets for tenant: %s", tenantID)
+	return nil
+}
+
+func (s *CommentActivityService) getCommentKey(commentID string) string {
+	return commentID
+}
+
+func (s *CommentActivityService) getActivityKey(activityID string) string {
+	return activityID
+}
+
+func (s *CommentActivityService) storeComment(comment *Comment) error {
+	ctx := context.Background()
+	kv, err := s.getTenantCommentsKV(comment.TenantID)
+	if err != nil {
+		return fmt.Errorf("failed to get tenant comments KV: %w", err)
+	}
+
+	key := s.getCommentKey(comment.ID)
+	data, err := json.Marshal(comment)
+	if err != nil {
+		return fmt.Errorf("failed to marshal comment: %w", err)
+	}
+
+	_, err = kv.Put(ctx, key, data)
+	if err != nil {
+		return fmt.Errorf("failed to store comment in KV: %w", err)
+	}
+	return nil
+}
+
+func (s *CommentActivityService) getComment(tenantID, commentID string) (*Comment, error) {
+	ctx := context.Background()
+	kv, err := s.getTenantCommentsKV(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tenant comments KV: %w", err)
+	}
+
+	key := s.getCommentKey(commentID)
+	entry, err := kv.Get(ctx, key)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			return nil, fmt.Errorf("comment not found")
+		}
+		return nil, fmt.Errorf("failed to get comment from KV: %w", err)
+	}
+
+	var comment Comment
+	if err := json.Unmarshal(entry.Value(), &comment); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal comment: %w", err)
+	}
+
+	return &comment, nil
+}
+
+func (s *CommentActivityService) getCommentsByTicket(tenantID, ticketID string) ([]*Comment, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var comments []*Comment
+
+	kv, err := s.getTenantCommentsKV(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tenant comments KV: %w", err)
+	}
+
+	watcher, err := kv.WatchAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create watcher for comments KV: %w", err)
+	}
+
+	for entry := range watcher.Updates() {
+		if entry == nil {
+			break
+		}
+
+		if entry.Operation() == jetstream.KeyValueDelete {
+			continue
+		}
+
+		var comment Comment
+		if err := json.Unmarshal(entry.Value(), &comment); err != nil {
+			continue
+		}
+
+		if comment.TicketID == ticketID {
+			comments = append(comments, &comment)
+		}
+	}
+
+	return comments, nil
+}
+
+func (s *CommentActivityService) storeActivity(activity *Activity) error {
+	ctx := context.Background()
+	kv, err := s.getTenantActivitiesKV(activity.TenantID)
+	if err != nil {
+		return fmt.Errorf("failed to get tenant activities KV: %w", err)
+	}
+
+	key := s.getActivityKey(activity.ID)
+	data, err := json.Marshal(activity)
+	if err != nil {
+		return fmt.Errorf("failed to marshal activity: %w", err)
+	}
+
+	_, err = kv.Put(ctx, key, data)
+	if err != nil {
+		return fmt.Errorf("failed to store activity in KV: %w", err)
+	}
+	return nil
+}
+
+func (s *CommentActivityService) getActivitiesByTicket(tenantID, ticketID string) ([]*Activity, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var activities []*Activity
+
+	kv, err := s.getTenantActivitiesKV(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tenant activities KV: %w", err)
+	}
+
+	watcher, err := kv.WatchAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create watcher for activities KV: %w", err)
+	}
+
+	for entry := range watcher.Updates() {
+		if entry == nil {
+			break
+		}
+
+		if entry.Operation() == jetstream.KeyValueDelete {
+			continue
+		}
+
+		var activity Activity
+		if err := json.Unmarshal(entry.Value(), &activity); err != nil {
+			continue
+		}
+
+		if activity.TicketID == ticketID {
+			activities = append(activities, &activity)
+		}
+	}
+
+	return activities, nil
 }
 
 func (s *CommentActivityService) Start() error {
@@ -225,16 +468,41 @@ func (s *CommentActivityService) subscribeToServiceRequests() {
 }
 
 func (s *CommentActivityService) subscribeToTicketEvents() {
+	ctx := context.Background()
+
 	// Subscribe to ticket events with durable consumer
-	sub, err := s.js.Subscribe("ticket.>", s.handleTicketEvent, nats.Durable("comment-activity-ticket-events"))
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "TICKETS", jetstream.ConsumerConfig{
+		Name:          "comment-activity-ticket-events",
+		FilterSubject: "ticket.>",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
 	if err != nil {
-		log.Printf("Failed to subscribe to ticket events: %v", err)
+		log.Printf("Failed to create consumer for ticket events: %v", err)
 		return
 	}
-	defer sub.Unsubscribe()
+
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get messages from consumer: %v", err)
+		return
+	}
 
 	log.Printf("Subscribed to ticket events")
-	<-s.shutdownCh
+
+	for {
+		select {
+		case <-s.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next message: %v", err)
+				continue
+			}
+			s.handleTicketEventNew(msg)
+		}
+	}
 }
 
 func (s *CommentActivityService) handleServiceRequest(msg *nats.Msg) {
@@ -286,13 +554,12 @@ func (s *CommentActivityService) handleAddComment(msg *nats.Msg, req ServiceRequ
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	// Store comment
-	s.mu.Lock()
-	if s.comments[req.TenantID] == nil {
-		s.comments[req.TenantID] = make(map[string]*Comment)
+	// Store comment in KV
+	if err := s.storeComment(comment); err != nil {
+		log.Printf("Failed to store comment in KV: %v", err)
+		s.respondWithError(msg, "storage_error", "Failed to store comment")
+		return
 	}
-	s.comments[req.TenantID][comment.ID] = comment
-	s.mu.Unlock()
 
 	// Create activity entry
 	activity := &Activity{
@@ -310,7 +577,9 @@ func (s *CommentActivityService) handleAddComment(msg *nats.Msg, req ServiceRequ
 		Timestamp: comment.CreatedAt,
 	}
 
-	s.addActivity(activity)
+	if err := s.storeActivity(activity); err != nil {
+		log.Printf("Failed to store activity in KV: %v", err)
+	}
 
 	// Publish events
 	s.publishCommentEvent(comment)
@@ -331,17 +600,13 @@ func (s *CommentActivityService) handleGetComments(msg *nats.Msg, req ServiceReq
 		return
 	}
 
-	// Get comments for the ticket
-	s.mu.RLock()
-	var comments []*Comment
-	if tenantComments, exists := s.comments[req.TenantID]; exists {
-		for _, comment := range tenantComments {
-			if comment.TicketID == getReq.TicketID {
-				comments = append(comments, comment)
-			}
-		}
+	// Get comments for the ticket from KV
+	comments, err := s.getCommentsByTicket(req.TenantID, getReq.TicketID)
+	if err != nil {
+		log.Printf("Failed to get comments from KV: %v", err)
+		s.respondWithError(msg, "storage_error", "Failed to retrieve comments")
+		return
 	}
-	s.mu.RUnlock()
 
 	// Sort by creation time
 	sort.Slice(comments, func(i, j int) bool {
@@ -386,17 +651,13 @@ func (s *CommentActivityService) handleGetActivities(msg *nats.Msg, req ServiceR
 		return
 	}
 
-	// Get activities for the ticket
-	s.mu.RLock()
-	var activities []*Activity
-	if tenantActivities, exists := s.activities[req.TenantID]; exists {
-		for _, activity := range tenantActivities {
-			if activity.TicketID == getReq.TicketID {
-				activities = append(activities, activity)
-			}
-		}
+	// Get activities for the ticket from KV
+	activities, err := s.getActivitiesByTicket(req.TenantID, getReq.TicketID)
+	if err != nil {
+		log.Printf("Failed to get activities from KV: %v", err)
+		s.respondWithError(msg, "storage_error", "Failed to retrieve activities")
+		return
 	}
-	s.mu.RUnlock()
 
 	// Sort by timestamp (newest first)
 	sort.Slice(activities, func(i, j int) bool {
@@ -441,34 +702,38 @@ func (s *CommentActivityService) handleGetTimeline(msg *nats.Msg, req ServiceReq
 		return
 	}
 
-	// Get all activities and comments for the ticket
-	s.mu.RLock()
+	// Get all activities and comments for the ticket from KV
 	var timeline []interface{}
 
-	// Add activities
-	if tenantActivities, exists := s.activities[req.TenantID]; exists {
-		for _, activity := range tenantActivities {
-			if activity.TicketID == getReq.TicketID {
-				timeline = append(timeline, map[string]interface{}{
-					"type": "activity",
-					"data": activity,
-				})
-			}
-		}
+	// Get activities
+	activities, err := s.getActivitiesByTicket(req.TenantID, getReq.TicketID)
+	if err != nil {
+		log.Printf("Failed to get activities from KV: %v", err)
+		activities = []*Activity{} // Continue with empty activities
 	}
 
-	// Add comments as activities
-	if tenantComments, exists := s.comments[req.TenantID]; exists {
-		for _, comment := range tenantComments {
-			if comment.TicketID == getReq.TicketID {
-				timeline = append(timeline, map[string]interface{}{
-					"type": "comment",
-					"data": comment,
-				})
-			}
-		}
+	// Add activities to timeline
+	for _, activity := range activities {
+		timeline = append(timeline, map[string]interface{}{
+			"type": "activity",
+			"data": activity,
+		})
 	}
-	s.mu.RUnlock()
+
+	// Get comments
+	comments, err := s.getCommentsByTicket(req.TenantID, getReq.TicketID)
+	if err != nil {
+		log.Printf("Failed to get comments from KV: %v", err)
+		comments = []*Comment{} // Continue with empty comments
+	}
+
+	// Add comments to timeline
+	for _, comment := range comments {
+		timeline = append(timeline, map[string]interface{}{
+			"type": "comment",
+			"data": comment,
+		})
+	}
 
 	// Sort by timestamp (newest first)
 	sort.Slice(timeline, func(i, j int) bool {
@@ -574,8 +839,156 @@ func (s *CommentActivityService) handleTicketEvent(msg *nats.Msg) {
 	}
 
 	if activity != nil {
-		s.addActivity(activity)
+		if err := s.storeActivity(activity); err != nil {
+			log.Printf("Failed to store activity in KV: %v", err)
+		}
 		s.publishActivityEvent(activity)
+	}
+
+	msg.Ack()
+}
+
+func (s *CommentActivityService) handleTicketEventNew(msg jetstream.Msg) {
+	var event TicketEvent
+	if err := json.Unmarshal(msg.Data(), &event); err != nil {
+		log.Printf("Failed to unmarshal ticket event: %v", err)
+		msg.Ack()
+		return
+	}
+
+	log.Printf("Processing ticket event: type=%s, ticket=%s, tenant=%s", event.EventType, event.TicketID, event.TenantID)
+
+	// Create activity based on event type
+	var activity *Activity
+
+	switch event.EventType {
+	case "ticket.created":
+		activity = &Activity{
+			ID:          uuid.New().String(),
+			TicketID:    event.TicketID,
+			TenantID:    event.TenantID,
+			Type:        "creation",
+			Description: fmt.Sprintf("Ticket created by %s", event.UserName),
+			UserID:      event.UserID,
+			UserName:    event.UserName,
+			Metadata:    map[string]interface{}{"event_id": event.EventID},
+			Timestamp:   event.Timestamp,
+		}
+
+	case "ticket.updated":
+		description := s.generateUpdateDescription(event.Changes, event.UserName)
+		activity = &Activity{
+			ID:          uuid.New().String(),
+			TicketID:    event.TicketID,
+			TenantID:    event.TenantID,
+			Type:        "update",
+			Description: description,
+			UserID:      event.UserID,
+			UserName:    event.UserName,
+			Metadata: map[string]interface{}{
+				"event_id": event.EventID,
+				"changes":  event.Changes,
+			},
+			Timestamp: event.Timestamp,
+		}
+
+	case "ticket.deleted":
+		activity = &Activity{
+			ID:          uuid.New().String(),
+			TicketID:    event.TicketID,
+			TenantID:    event.TenantID,
+			Type:        "deletion",
+			Description: fmt.Sprintf("Ticket deleted by %s", event.UserName),
+			UserID:      event.UserID,
+			UserName:    event.UserName,
+			Metadata:    map[string]interface{}{"event_id": event.EventID},
+			Timestamp:   event.Timestamp,
+		}
+	}
+
+	if activity != nil {
+		if err := s.storeActivity(activity); err != nil {
+			log.Printf("Failed to store activity in KV: %v", err)
+		}
+		s.publishActivityEvent(activity)
+	}
+
+	msg.Ack()
+}
+
+func (s *CommentActivityService) startTenantManagementConsumer() {
+	ctx := context.Background()
+
+	// Ensure TENANT_EVENTS stream exists
+	_, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     "TENANT_EVENTS",
+		Subjects: []string{"tenant.created", "tenant.deleted"},
+		Storage:  jetstream.FileStorage,
+		MaxMsgs:  1000000,
+		MaxAge:   7 * 24 * time.Hour, // 7 days
+	})
+	if err != nil {
+		log.Printf("Failed to create tenant events stream: %v", err)
+		return
+	}
+
+	// Create consumer for tenant events
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "TENANT_EVENTS", jetstream.ConsumerConfig{
+		Name:          "comment-activity-service-tenant-events",
+		FilterSubject: "tenant.>",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		log.Printf("Failed to create tenant events consumer: %v", err)
+		return
+	}
+
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get messages from tenant events consumer: %v", err)
+		return
+	}
+
+	log.Printf("Started tenant management consumer for comment activity service")
+
+	for {
+		select {
+		case <-s.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next tenant event message: %v", err)
+				continue
+			}
+			s.handleTenantEvent(msg)
+		}
+	}
+}
+
+func (s *CommentActivityService) handleTenantEvent(msg jetstream.Msg) {
+	var event TenantEvent
+	if err := json.Unmarshal(msg.Data(), &event); err != nil {
+		log.Printf("Failed to unmarshal tenant event: %v", err)
+		msg.Ack()
+		return
+	}
+
+	log.Printf("Processing tenant event for comments/activities: type=%s, tenant=%s", event.EventType, event.TenantID)
+
+	switch event.EventType {
+	case "tenant.created":
+		// Create KV buckets for tenant
+		if err := s.createTenantKVs(event.TenantID); err != nil {
+			log.Printf("Failed to create KV buckets for tenant %s: %v", event.TenantID, err)
+		}
+
+	case "tenant.deleted":
+		// Delete KV buckets for tenant
+		if err := s.deleteTenantKVs(event.TenantID); err != nil {
+			log.Printf("Failed to delete KV buckets for tenant %s: %v", event.TenantID, err)
+		}
 	}
 
 	msg.Ack()
@@ -629,15 +1042,6 @@ func (s *CommentActivityService) generateUpdateDescription(changes map[string]in
 	return fmt.Sprintf("%s %s", userName, strings.Join(descriptions, ", "))
 }
 
-func (s *CommentActivityService) addActivity(activity *Activity) {
-	s.mu.Lock()
-	if s.activities[activity.TenantID] == nil {
-		s.activities[activity.TenantID] = []*Activity{}
-	}
-	s.activities[activity.TenantID] = append(s.activities[activity.TenantID], activity)
-	s.mu.Unlock()
-}
-
 func (s *CommentActivityService) publishCommentEvent(comment *Comment) {
 	eventData := map[string]interface{}{
 		"event_type": "comment.created",
@@ -651,7 +1055,7 @@ func (s *CommentActivityService) publishCommentEvent(comment *Comment) {
 		return
 	}
 
-	if _, err := s.js.Publish("comment.created", data); err != nil {
+	if _, err := s.js.Publish(context.Background(), "comment.created", data); err != nil {
 		log.Printf("Failed to publish comment event: %v", err)
 	}
 }
@@ -669,7 +1073,7 @@ func (s *CommentActivityService) publishActivityEvent(activity *Activity) {
 		return
 	}
 
-	if _, err := s.js.Publish("activity.created", data); err != nil {
+	if _, err := s.js.Publish(context.Background(), "activity.created", data); err != nil {
 		log.Printf("Failed to publish activity event: %v", err)
 	}
 }

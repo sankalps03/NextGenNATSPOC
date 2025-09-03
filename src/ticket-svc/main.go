@@ -15,6 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/opensearch-project/opensearch-go/v2"
+	"github.com/opensearch-project/opensearch-go/v2/opensearchapi"
 )
 
 type Meta struct {
@@ -40,24 +42,34 @@ type TicketEvent struct {
 }
 
 type Config struct {
-	NATSUrl     string
-	ServiceName string
-	LogLevel    string
+	NATSUrl            string
+	ServiceName        string
+	LogLevel           string
+	OpenSearchURL      string
+	OpenSearchUsername string
+	OpenSearchPassword string
+	OpenSearchIndex    string
 }
 
 type NATSManager struct {
-	conn *nats.Conn
-	js   jetstream.JetStream
+	conn      *nats.Conn
+	js        jetstream.JetStream
+	kvBuckets map[string]jetstream.KeyValue
+	mu        sync.RWMutex
 }
 
-type InMemoryStorage struct {
-	mu      sync.RWMutex
-	tenants map[string]map[string]*Ticket
+type NATSStorage struct {
+	natsManager *NATSManager
 }
 
 type TicketService struct {
-	natsManager *NATSManager
-	storage     *InMemoryStorage
+	natsManager      *NATSManager
+	storage          *NATSStorage
+	opensearchClient *opensearch.Client
+	config           *Config
+	tenantConsumers  map[string]jetstream.Consumer
+	tenantMu         sync.RWMutex
+	shutdownCh       chan struct{}
 }
 
 type CreateTicketRequest struct {
@@ -69,6 +81,26 @@ type CreateTicketRequest struct {
 type UpdateTicketRequest struct {
 	Title       *string `json:"title,omitempty"`
 	Description *string `json:"description,omitempty"`
+}
+
+type SearchRequest struct {
+	Query   string            `json:"query"`
+	Filters map[string]string `json:"filters,omitempty"`
+	Limit   int               `json:"limit,omitempty"`
+	Offset  int               `json:"offset,omitempty"`
+}
+
+type SearchResponse struct {
+	Tickets []*Ticket `json:"tickets"`
+	Total   int64     `json:"total"`
+	TookMs  int64     `json:"took_ms"`
+}
+
+type TenantEvent struct {
+	EventID   string `json:"event_id"`
+	EventType string `json:"event_type"` // tenant.created, tenant.deleted
+	TenantID  string `json:"tenant_id"`
+	Timestamp string `json:"timestamp"`
 }
 
 type ServiceRequest struct {
@@ -83,72 +115,157 @@ type ErrorResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func NewInMemoryStorage() *InMemoryStorage {
-	return &InMemoryStorage{
-		tenants: make(map[string]map[string]*Ticket),
+func NewNATSStorage(natsManager *NATSManager) *NATSStorage {
+	return &NATSStorage{
+		natsManager: natsManager,
 	}
 }
 
-func (s *InMemoryStorage) ensureTenant(tenant string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.tenants[tenant]; !exists {
-		s.tenants[tenant] = make(map[string]*Ticket)
+func (s *NATSStorage) getTenantKV(tenantID string) (jetstream.KeyValue, error) {
+	s.natsManager.mu.RLock()
+	kv, exists := s.natsManager.kvBuckets[tenantID]
+	s.natsManager.mu.RUnlock()
+
+	if exists {
+		return kv, nil
 	}
+
+	return nil, fmt.Errorf("KV bucket not found for tenant: %s", tenantID)
 }
 
-func (s *InMemoryStorage) CreateTicket(tenant string, ticket *Ticket) {
-	s.ensureTenant(tenant)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tenants[tenant][ticket.Id] = ticket
+func (s *NATSStorage) getTicketKey(ticketID string) string {
+	return ticketID
 }
 
-func (s *InMemoryStorage) GetTicket(tenant, id string) (*Ticket, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		ticket, found := tenantTickets[id]
-		return ticket, found
+func (s *NATSStorage) CreateTicket(tenant string, ticket *Ticket) error {
+	kv, err := s.getTenantKV(tenant)
+	if err != nil {
+		return fmt.Errorf("failed to get tenant KV: %w", err)
 	}
-	return nil, false
+
+	key := s.getTicketKey(ticket.Id)
+	data, err := json.Marshal(ticket)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ticket: %w", err)
+	}
+
+	_, err = kv.Put(context.Background(), key, data)
+	if err != nil {
+		return fmt.Errorf("failed to store ticket in KV: %w", err)
+	}
+	return nil
 }
 
-func (s *InMemoryStorage) UpdateTicket(tenant string, ticket *Ticket) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		if _, found := tenantTickets[ticket.Id]; found {
-			tenantTickets[ticket.Id] = ticket
-			return true
+func (s *NATSStorage) GetTicket(tenant, id string) (*Ticket, bool) {
+	kv, err := s.getTenantKV(tenant)
+	if err != nil {
+		log.Printf("Error getting tenant KV: %v", err)
+		return nil, false
+	}
+
+	key := s.getTicketKey(id)
+	entry, err := kv.Get(context.Background(), key)
+	if err != nil {
+		if err == jetstream.ErrKeyNotFound {
+			return nil, false
 		}
+		log.Printf("Error getting ticket from KV: %v", err)
+		return nil, false
 	}
-	return false
+
+	var ticket Ticket
+	if err := json.Unmarshal(entry.Value(), &ticket); err != nil {
+		log.Printf("Error unmarshaling ticket: %v", err)
+		return nil, false
+	}
+
+	return &ticket, true
 }
 
-func (s *InMemoryStorage) DeleteTicket(tenant, id string) (*Ticket, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		if ticket, found := tenantTickets[id]; found {
-			delete(tenantTickets, id)
-			return ticket, true
-		}
+func (s *NATSStorage) UpdateTicket(tenant string, ticket *Ticket) bool {
+	kv, err := s.getTenantKV(tenant)
+	if err != nil {
+		log.Printf("Error getting tenant KV: %v", err)
+		return false
 	}
-	return nil, false
+
+	key := s.getTicketKey(ticket.Id)
+
+	if _, exists := s.GetTicket(tenant, ticket.Id); !exists {
+		return false
+	}
+
+	data, err := json.Marshal(ticket)
+	if err != nil {
+		log.Printf("Error marshaling ticket for update: %v", err)
+		return false
+	}
+
+	_, err = kv.Put(context.Background(), key, data)
+	if err != nil {
+		log.Printf("Error updating ticket in KV: %v", err)
+		return false
+	}
+	return true
 }
 
-func (s *InMemoryStorage) ListTickets(tenant string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *NATSStorage) DeleteTicket(tenant, id string) (*Ticket, bool) {
+	ticket, found := s.GetTicket(tenant, id)
+	if !found {
+		return nil, false
+	}
+
+	kv, err := s.getTenantKV(tenant)
+	if err != nil {
+		log.Printf("Error getting tenant KV: %v", err)
+		return nil, false
+	}
+
+	key := s.getTicketKey(id)
+	err = kv.Delete(context.Background(), key)
+	if err != nil {
+		log.Printf("Error deleting ticket from KV: %v", err)
+		return nil, false
+	}
+
+	return ticket, true
+}
+
+func (s *NATSStorage) ListTickets(tenant string) map[string]interface{} {
 	var tickets []*Ticket
 	response := make(map[string]interface{})
-	if tenantTickets, exists := s.tenants[tenant]; exists {
-		for _, ticket := range tenantTickets {
-			tickets = append(tickets, ticket)
-		}
-	} else {
+
+	kv, err := s.getTenantKV(tenant)
+	if err != nil {
+		log.Printf("Error getting tenant KV: %v", err)
 		tickets = []*Ticket{}
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		watcher, err := kv.WatchAll(ctx)
+		if err != nil {
+			log.Printf("Error creating watcher for KV: %v", err)
+			tickets = []*Ticket{}
+		} else {
+			for entry := range watcher.Updates() {
+				if entry == nil {
+					break
+				}
+
+				if entry.Operation() == jetstream.KeyValueDelete {
+					continue
+				}
+
+				var ticket Ticket
+				if err := json.Unmarshal(entry.Value(), &ticket); err != nil {
+					log.Printf("Error unmarshaling ticket %s: %v", entry.Key(), err)
+					continue
+				}
+
+				tickets = append(tickets, &ticket)
+			}
+		}
 	}
 
 	response["tickets"] = tickets
@@ -182,6 +299,8 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 		response, err = ts.handleUpdateTicket(req)
 	case "delete":
 		response, err = ts.handleDeleteTicket(req)
+	case "search":
+		response, err = ts.handleSearchTickets(req)
 	default:
 		response = ErrorResponse{Error: "unknown_action", Message: "Unknown action: " + req.Action}
 	}
@@ -244,7 +363,13 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 		UpdatedAt:   now,
 	}
 
-	ts.storage.CreateTicket(req.Tenant, ticket)
+	if err := ts.storage.CreateTicket(req.Tenant, ticket); err != nil {
+		return nil, fmt.Errorf("failed to create ticket: %w", err)
+	}
+
+	if err := ts.indexTicket(ticket); err != nil {
+		log.Printf("ERROR: Failed to index ticket for tenant=%s ticket_id=%s: %v", req.Tenant, ticket.Id, err)
+	}
 
 	if err := ts.publishTicketCreated(context.Background(), req.Tenant, ticket); err != nil {
 		log.Printf("ERROR: Failed to publish ticket created event for tenant=%s ticket_id=%s: %v", req.Tenant, ticket.Id, err)
@@ -320,6 +445,10 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 		ticket.UpdatedAt = time.Now().Format(time.RFC3339)
 		ts.storage.UpdateTicket(req.Tenant, ticket)
 
+		if err := ts.indexTicket(ticket); err != nil {
+			log.Printf("ERROR: Failed to index updated ticket for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
+		}
+
 		if err := ts.publishTicketUpdated(context.Background(), req.Tenant, ticket); err != nil {
 			log.Printf("ERROR: Failed to publish ticket updated event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 		}
@@ -340,11 +469,29 @@ func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, er
 		return ErrorResponse{Error: "ticket_not_found"}, nil
 	}
 
+	if err := ts.deleteFromIndex(req.Tenant, req.TicketID); err != nil {
+		log.Printf("ERROR: Failed to delete ticket from index for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
+	}
+
 	if err := ts.publishTicketDeleted(context.Background(), req.Tenant, ticket); err != nil {
 		log.Printf("ERROR: Failed to publish ticket deleted event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 	}
 
 	return map[string]string{"status": "deleted"}, nil
+}
+
+func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, error) {
+	dataBytes, err := json.Marshal(req.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	var searchReq SearchRequest
+	if err := json.Unmarshal(dataBytes, &searchReq); err != nil {
+		return nil, err
+	}
+
+	return ts.searchTickets(req.Tenant, searchReq)
 }
 
 func connectNATS(urls string) (*NATSManager, error) {
@@ -379,7 +526,11 @@ func connectNATS(urls string) (*NATSManager, error) {
 	}
 
 	log.Printf("Successfully connected to NATS cluster: %v (active: %s)", serverList, conn.ConnectedUrl())
-	return &NATSManager{conn: conn, js: js}, nil
+	return &NATSManager{
+		conn:      conn,
+		js:        js,
+		kvBuckets: make(map[string]jetstream.KeyValue),
+	}, nil
 }
 
 func (nm *NATSManager) PublishEvent(ctx context.Context, subject string, payload []byte, headers map[string]string) error {
@@ -532,6 +683,458 @@ func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenan
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
+func (nm *NATSManager) createTenantKV(tenantID string) error {
+	ctx := context.Background()
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if _, exists := nm.kvBuckets[tenantID]; exists {
+		return nil // Already exists
+	}
+
+	bucketName := fmt.Sprintf("tickets-%s", tenantID)
+	kv, err := nm.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:      bucketName,
+		Description: fmt.Sprintf("Ticket storage bucket for tenant %s", tenantID),
+		TTL:         0,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create KV bucket for tenant %s: %w", tenantID, err)
+	}
+
+	nm.kvBuckets[tenantID] = kv
+	log.Printf("Created KV bucket for tenant: %s", tenantID)
+	return nil
+}
+
+func (nm *NATSManager) deleteTenantKV(tenantID string) error {
+	ctx := context.Background()
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if _, exists := nm.kvBuckets[tenantID]; !exists {
+		return nil // Already deleted
+	}
+
+	bucketName := fmt.Sprintf("tickets-%s", tenantID)
+	err := nm.js.DeleteKeyValue(ctx, bucketName)
+	if err != nil {
+		log.Printf("Failed to delete KV bucket for tenant %s: %v", tenantID, err)
+		// Continue with cleanup even if deletion fails
+	}
+
+	delete(nm.kvBuckets, tenantID)
+	log.Printf("Deleted KV bucket for tenant: %s", tenantID)
+	return nil
+}
+
+func (ts *TicketService) createTenantStream(tenantID string) error {
+	ctx := context.Background()
+	streamName := fmt.Sprintf("TICKETS-%s", strings.ToUpper(tenantID))
+
+	_, err := ts.natsManager.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{fmt.Sprintf("ticket.%s.>", tenantID)},
+		Storage:  jetstream.FileStorage,
+		MaxMsgs:  1000000,
+		MaxAge:   30 * 24 * time.Hour, // 30 days
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create stream for tenant %s: %w", tenantID, err)
+	}
+
+	log.Printf("Created stream for tenant: %s", tenantID)
+	return nil
+}
+
+func (ts *TicketService) deleteTenantStream(tenantID string) error {
+	ctx := context.Background()
+	streamName := fmt.Sprintf("TICKETS-%s", strings.ToUpper(tenantID))
+
+	err := ts.natsManager.js.DeleteStream(ctx, streamName)
+	if err != nil {
+		log.Printf("Failed to delete stream for tenant %s: %v", tenantID, err)
+	}
+
+	log.Printf("Deleted stream for tenant: %s", tenantID)
+	return nil
+}
+
+func (ts *TicketService) createTenantOpenSearchIndex(tenantID string) error {
+	ctx := context.Background()
+	indexName := fmt.Sprintf("%s-%s", ts.config.OpenSearchIndex, tenantID)
+
+	indexMapping := `{
+		"mappings": {
+			"properties": {
+				"id": {"type": "keyword"},
+				"tenant": {"type": "keyword"},
+				"title": {"type": "text"},
+				"description": {"type": "text"},
+				"created_by": {"type": "keyword"},
+				"created_at": {"type": "date"},
+				"updated_at": {"type": "date"}
+			}
+		}
+	}`
+
+	createReq := opensearchapi.IndicesCreateRequest{
+		Index: indexName,
+		Body:  strings.NewReader(indexMapping),
+	}
+
+	createRes, err := createReq.Do(ctx, ts.opensearchClient)
+	if err != nil {
+		return fmt.Errorf("failed to create index for tenant %s: %w", tenantID, err)
+	}
+	defer createRes.Body.Close()
+
+	if createRes.IsError() && createRes.StatusCode != 400 { // 400 = index already exists
+		return fmt.Errorf("failed to create index for tenant %s, status: %s", tenantID, createRes.Status())
+	}
+
+	log.Printf("Created/ensured OpenSearch index for tenant: %s", tenantID)
+	return nil
+}
+
+func (ts *TicketService) deleteTenantOpenSearchIndex(tenantID string) error {
+	ctx := context.Background()
+	indexName := fmt.Sprintf("%s-%s", ts.config.OpenSearchIndex, tenantID)
+
+	deleteReq := opensearchapi.IndicesDeleteRequest{
+		Index: []string{indexName},
+	}
+
+	deleteRes, err := deleteReq.Do(ctx, ts.opensearchClient)
+	if err != nil {
+		log.Printf("Failed to delete index for tenant %s: %v", tenantID, err)
+		return nil // Continue even if deletion fails
+	}
+	defer deleteRes.Body.Close()
+
+	log.Printf("Deleted OpenSearch index for tenant: %s", tenantID)
+	return nil
+}
+
+func createOpenSearchClient(config *Config) (*opensearch.Client, error) {
+	cfg := opensearch.Config{
+		Addresses: []string{config.OpenSearchURL},
+	}
+
+	if config.OpenSearchUsername != "" && config.OpenSearchPassword != "" {
+		cfg.Username = config.OpenSearchUsername
+		cfg.Password = config.OpenSearchPassword
+	}
+
+	client, err := opensearch.NewClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OpenSearch client: %w", err)
+	}
+
+	log.Printf("Successfully connected to OpenSearch: %s", config.OpenSearchURL)
+	return client, nil
+}
+
+func (ts *TicketService) ensureOpenSearchIndex() error {
+	ctx := context.Background()
+
+	indexMapping := `{
+		"mappings": {
+			"properties": {
+				"id": {"type": "keyword"},
+				"tenant": {"type": "keyword"},
+				"title": {"type": "text"},
+				"description": {"type": "text"},
+				"created_by": {"type": "keyword"},
+				"created_at": {"type": "date"},
+				"updated_at": {"type": "date"}
+			}
+		}
+	}`
+
+	req := opensearchapi.IndicesExistsRequest{
+		Index: []string{ts.config.OpenSearchIndex},
+	}
+
+	res, err := req.Do(ctx, ts.opensearchClient)
+	if err != nil {
+		return fmt.Errorf("failed to check if index exists: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == 404 {
+		createReq := opensearchapi.IndicesCreateRequest{
+			Index: ts.config.OpenSearchIndex,
+			Body:  strings.NewReader(indexMapping),
+		}
+
+		createRes, err := createReq.Do(ctx, ts.opensearchClient)
+		if err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
+		defer createRes.Body.Close()
+
+		if createRes.IsError() {
+			return fmt.Errorf("failed to create index, status: %s", createRes.Status())
+		}
+
+		log.Printf("Successfully created OpenSearch index: %s", ts.config.OpenSearchIndex)
+	} else if res.IsError() {
+		return fmt.Errorf("error checking index existence, status: %s", res.Status())
+	}
+
+	return nil
+}
+
+func (ts *TicketService) indexTicket(ticket *Ticket) error {
+	ctx := context.Background()
+	indexName := fmt.Sprintf("%s-%s", ts.config.OpenSearchIndex, ticket.Tenant)
+
+	documentBody, err := json.Marshal(ticket)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ticket for indexing: %w", err)
+	}
+
+	req := opensearchapi.IndexRequest{
+		Index:      indexName,
+		DocumentID: ticket.Id,
+		Body:       strings.NewReader(string(documentBody)),
+		Refresh:    "wait_for",
+	}
+
+	res, err := req.Do(ctx, ts.opensearchClient)
+	if err != nil {
+		return fmt.Errorf("failed to index ticket: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return fmt.Errorf("failed to index ticket, status: %s", res.Status())
+	}
+
+	return nil
+}
+
+func (ts *TicketService) deleteFromIndex(tenant, ticketID string) error {
+	ctx := context.Background()
+	indexName := fmt.Sprintf("%s-%s", ts.config.OpenSearchIndex, tenant)
+
+	req := opensearchapi.DeleteRequest{
+		Index:      indexName,
+		DocumentID: ticketID,
+		Refresh:    "wait_for",
+	}
+
+	res, err := req.Do(ctx, ts.opensearchClient)
+	if err != nil {
+		return fmt.Errorf("failed to delete ticket from index: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() && res.StatusCode != 404 {
+		return fmt.Errorf("failed to delete ticket from index, status: %s", res.Status())
+	}
+
+	return nil
+}
+
+func (ts *TicketService) searchTickets(tenant string, req SearchRequest) (*SearchResponse, error) {
+	ctx := context.Background()
+	indexName := fmt.Sprintf("%s-%s", ts.config.OpenSearchIndex, tenant)
+
+	if req.Limit == 0 {
+		req.Limit = 10
+	}
+
+	query := map[string]interface{}{
+		"size": req.Limit,
+		"from": req.Offset,
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must":   []interface{}{},
+				"filter": []interface{}{},
+			},
+		},
+	}
+
+	boolQuery := query["query"].(map[string]interface{})["bool"].(map[string]interface{})
+	mustQueries := boolQuery["must"].([]interface{})
+	filterQueries := boolQuery["filter"].([]interface{})
+
+	if req.Query != "" {
+		mustQueries = append(mustQueries, map[string]interface{}{
+			"multi_match": map[string]interface{}{
+				"query":  req.Query,
+				"fields": []string{"title^2", "description", "created_by"},
+				"type":   "best_fields",
+			},
+		})
+	} else {
+		mustQueries = append(mustQueries, map[string]interface{}{
+			"match_all": map[string]interface{}{},
+		})
+	}
+
+	for key, value := range req.Filters {
+		filterQueries = append(filterQueries, map[string]interface{}{
+			"term": map[string]interface{}{
+				key: value,
+			},
+		})
+	}
+
+	boolQuery["must"] = mustQueries
+	boolQuery["filter"] = filterQueries
+
+	queryBody, err := json.Marshal(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal search query: %w", err)
+	}
+
+	searchReq := opensearchapi.SearchRequest{
+		Index: []string{indexName},
+		Body:  strings.NewReader(string(queryBody)),
+	}
+
+	res, err := searchReq.Do(ctx, ts.opensearchClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute search: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return nil, fmt.Errorf("search request failed, status: %s", res.Status())
+	}
+
+	var searchResult map[string]interface{}
+	if err := json.NewDecoder(res.Body).Decode(&searchResult); err != nil {
+		return nil, fmt.Errorf("failed to decode search response: %w", err)
+	}
+
+	hits := searchResult["hits"].(map[string]interface{})
+	total := int64(hits["total"].(map[string]interface{})["value"].(float64))
+	took := int64(searchResult["took"].(float64))
+
+	var ticketIDs []string
+	for _, hit := range hits["hits"].([]interface{}) {
+		hitMap := hit.(map[string]interface{})
+		docID := hitMap["_id"].(string)
+		ticketIDs = append(ticketIDs, docID)
+	}
+
+	var tickets []*Ticket
+	for _, ticketID := range ticketIDs {
+		ticket, found := ts.storage.GetTicket(tenant, ticketID)
+		if found {
+			tickets = append(tickets, ticket)
+		}
+	}
+
+	return &SearchResponse{
+		Tickets: tickets,
+		Total:   total,
+		TookMs:  took,
+	}, nil
+}
+
+func (ts *TicketService) startTenantManagementConsumer() {
+	ctx := context.Background()
+
+	// Ensure TENANT_EVENTS stream exists
+	_, err := ts.natsManager.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     "TENANT_EVENTS",
+		Subjects: []string{"tenant.created", "tenant.deleted"},
+		Storage:  jetstream.FileStorage,
+		MaxMsgs:  1000000,
+		MaxAge:   7 * 24 * time.Hour, // 7 days
+	})
+	if err != nil {
+		log.Printf("Failed to create tenant events stream: %v", err)
+		return
+	}
+
+	// Create consumer for tenant events
+	consumer, err := ts.natsManager.js.CreateOrUpdateConsumer(ctx, "TENANT_EVENTS", jetstream.ConsumerConfig{
+		Name:          "ticket-service-tenant-events",
+		FilterSubject: "tenant.>",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		log.Printf("Failed to create tenant events consumer: %v", err)
+		return
+	}
+
+	iter, err := consumer.Messages()
+	if err != nil {
+		log.Printf("Failed to get messages from tenant events consumer: %v", err)
+		return
+	}
+
+	log.Printf("Started tenant management consumer")
+
+	for {
+		select {
+		case <-ts.shutdownCh:
+			iter.Stop()
+			return
+		default:
+			msg, err := iter.Next()
+			if err != nil {
+				log.Printf("Error getting next tenant event message: %v", err)
+				continue
+			}
+			ts.handleTenantEvent(msg)
+		}
+	}
+}
+
+func (ts *TicketService) handleTenantEvent(msg jetstream.Msg) {
+	var event TenantEvent
+	if err := json.Unmarshal(msg.Data(), &event); err != nil {
+		log.Printf("Failed to unmarshal tenant event: %v", err)
+		msg.Ack()
+		return
+	}
+
+	log.Printf("Processing tenant event: type=%s, tenant=%s", event.EventType, event.TenantID)
+
+	switch event.EventType {
+	case "tenant.created":
+		// Create KV bucket for tenant
+		if err := ts.natsManager.createTenantKV(event.TenantID); err != nil {
+			log.Printf("Failed to create KV bucket for tenant %s: %v", event.TenantID, err)
+		}
+
+		// Create stream for tenant
+		if err := ts.createTenantStream(event.TenantID); err != nil {
+			log.Printf("Failed to create stream for tenant %s: %v", event.TenantID, err)
+		}
+
+		// Create OpenSearch index for tenant
+		if err := ts.createTenantOpenSearchIndex(event.TenantID); err != nil {
+			log.Printf("Failed to create OpenSearch index for tenant %s: %v", event.TenantID, err)
+		}
+
+	case "tenant.deleted":
+		// Delete KV bucket for tenant
+		if err := ts.natsManager.deleteTenantKV(event.TenantID); err != nil {
+			log.Printf("Failed to delete KV bucket for tenant %s: %v", event.TenantID, err)
+		}
+
+		// Delete stream for tenant
+		if err := ts.deleteTenantStream(event.TenantID); err != nil {
+			log.Printf("Failed to delete stream for tenant %s: %v", event.TenantID, err)
+		}
+
+		// Delete OpenSearch index for tenant
+		if err := ts.deleteTenantOpenSearchIndex(event.TenantID); err != nil {
+			log.Printf("Failed to delete OpenSearch index for tenant %s: %v", event.TenantID, err)
+		}
+	}
+
+	msg.Ack()
+}
+
 func containsSeverity(description string) bool {
 	lower := strings.ToLower(description)
 	return strings.Contains(lower, "critical") || strings.Contains(lower, "major")
@@ -539,9 +1142,13 @@ func containsSeverity(description string) bool {
 
 func loadConfig() *Config {
 	return &Config{
-		NATSUrl:     getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
-		ServiceName: getEnv("SERVICE_NAME", "ticket-service"),
-		LogLevel:    getEnv("LOG_LEVEL", "info"),
+		NATSUrl:            getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
+		ServiceName:        getEnv("SERVICE_NAME", "ticket-service"),
+		LogLevel:           getEnv("LOG_LEVEL", "info"),
+		OpenSearchURL:      getEnv("OPENSEARCH_URL", "http://localhost:9200"),
+		OpenSearchUsername: getEnv("OPENSEARCH_USERNAME", ""),
+		OpenSearchPassword: getEnv("OPENSEARCH_PASSWORD", ""),
+		OpenSearchIndex:    getEnv("OPENSEARCH_INDEX", "tickets"),
 	}
 }
 
@@ -561,12 +1168,24 @@ func main() {
 		log.Fatalf("Failed to connect to NATS: %v", err)
 	}
 
-	storage := NewInMemoryStorage()
+	opensearchClient, err := createOpenSearchClient(config)
+	if err != nil {
+		log.Fatalf("Failed to connect to OpenSearch: %v", err)
+	}
+
+	storage := NewNATSStorage(natsManager)
 
 	service := &TicketService{
-		natsManager: natsManager,
-		storage:     storage,
+		natsManager:      natsManager,
+		storage:          storage,
+		opensearchClient: opensearchClient,
+		config:           config,
+		tenantConsumers:  make(map[string]jetstream.Consumer),
+		shutdownCh:       make(chan struct{}),
 	}
+
+	// Start tenant management consumer
+	go service.startTenantManagementConsumer()
 
 	sub, err := natsManager.conn.Subscribe("ticket.service", service.handleServiceRequest)
 	if err != nil {
@@ -581,6 +1200,9 @@ func main() {
 	<-c
 
 	log.Println("Shutting down service...")
+
+	// Signal shutdown to goroutines
+	close(service.shutdownCh)
 
 	if natsManager != nil && natsManager.conn != nil {
 		natsManager.conn.Close()
