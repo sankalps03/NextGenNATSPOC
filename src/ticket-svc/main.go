@@ -450,10 +450,8 @@ func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, er
 }
 
 func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, error) {
-	// Parse search conditions from request data
-	var searchRequest struct {
-		Conditions []storage2.SearchCondition `json:"conditions"`
-	}
+	// Parse search request from request data (supports both old and new format)
+	var searchRequest storage2.SearchRequest
 
 	// Convert req.Data to search request
 	dataBytes, err := json.Marshal(req.Data)
@@ -462,12 +460,22 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	}
 
 	if err := json.Unmarshal(dataBytes, &searchRequest); err != nil {
-		return nil, fmt.Errorf("failed to parse search conditions: %w", err)
+		return nil, fmt.Errorf("failed to parse search request: %w", err)
 	}
 
 	// Measure database latency
 	dbStart := time.Now()
-	tickets, err := ts.storage.SearchTickets(req.Tenant, searchRequest.Conditions)
+	var tickets []*ticketpb.TicketData
+
+	// Use projection-aware search if projected fields are specified
+	if len(searchRequest.ProjectedFields) > 0 {
+		tickets, err = ts.storage.SearchTicketsWithProjection(req.Tenant, searchRequest)
+		log.Printf("Using projection-aware search with %d projected fields", len(searchRequest.ProjectedFields))
+	} else {
+		// Fallback to original search for backward compatibility
+		tickets, err = ts.storage.SearchTickets(req.Tenant, searchRequest.Conditions)
+		log.Printf("Using standard search (no projection)")
+	}
 	dbLatency := time.Since(dbStart)
 
 	if err != nil {

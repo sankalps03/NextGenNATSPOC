@@ -201,6 +201,70 @@ func dynamoDBItemToProtobuf(item map[string]types.AttributeValue) *ticketpb.Tick
 	return ticketData
 }
 
+// dynamoDBItemToProtobufWithProjection converts a DynamoDB item to TicketData with field projection
+func (d *DynamoDBStorage) dynamoDBItemToProtobufWithProjection(item map[string]types.AttributeValue, projectedFields []string) *ticketpb.TicketData {
+	// If no projection specified, use the standard conversion
+	if len(projectedFields) == 0 {
+		return dynamoDBItemToProtobuf(item)
+	}
+
+	ticketData := &ticketpb.TicketData{
+		Fields: make(map[string]*ticketpb.FieldValue),
+	}
+
+	// Create a set of projected fields for quick lookup
+	projectedFieldsSet := make(map[string]bool)
+	// Always include essential core fields by default
+	projectedFieldsSet["id"] = true
+	projectedFieldsSet["tenant"] = true
+	projectedFieldsSet["created_at"] = true
+	projectedFieldsSet["updated_at"] = true
+
+	for _, field := range projectedFields {
+		projectedFieldsSet[field] = true
+	}
+
+	// Always extract core fields (required for record identification and metadata)
+	if pkAttr, ok := item["pk"]; ok {
+		if pkVal, ok := pkAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.Id = pkVal.Value
+		}
+	}
+
+	if tenantAttr, ok := item["tenant"]; ok {
+		if tenantVal, ok := tenantAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.Tenant = tenantVal.Value
+		}
+	}
+
+	if createdAttr, ok := item["created_at"]; ok {
+		if createdVal, ok := createdAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.CreatedAt = createdVal.Value
+		}
+	}
+
+	if updatedAttr, ok := item["updated_at"]; ok {
+		if updatedVal, ok := updatedAttr.(*types.AttributeValueMemberS); ok {
+			ticketData.UpdatedAt = updatedVal.Value
+		}
+	}
+
+	// Extract dynamic fields only if they are in the projection
+	for attributeName, attributeValue := range item {
+		if strings.HasPrefix(attributeName, "field_") {
+			fieldName := strings.TrimPrefix(attributeName, "field_")
+			if projectedFieldsSet[fieldName] {
+				fieldValue := dynamoDBAttributeToFieldValue(attributeValue)
+				if fieldValue != nil {
+					ticketData.Fields[fieldName] = fieldValue
+				}
+			}
+		}
+	}
+
+	return ticketData
+}
+
 // initializeDefaultGSIConfig sets up the default GSI configuration mapping with enhanced metadata
 func initializeDefaultGSIConfig() map[string]GSIConfig {
 	now := time.Now()
@@ -473,6 +537,60 @@ func NewDynamoDBStorage(ctx context.Context, baseTableName, region, dbURL, dbAdd
 		log.Printf("Successfully initialized tenant-aware DynamoDB storage with base table: %s in region: %s", baseTableName, region)
 	}
 	return storage, nil
+}
+
+// mapAPIFieldToDynamoDBAttribute maps API field names to DynamoDB attribute names
+func (d *DynamoDBStorage) mapAPIFieldToDynamoDBAttribute(field string) string {
+	// Core fields mapping
+	switch field {
+	case "id":
+		return "pk"
+	case "tenant":
+		return "tenant"
+	case "created_at":
+		return "created_at"
+	case "updated_at":
+		return "updated_at"
+	default:
+		// Dynamic fields are prefixed with "field_"
+		return "field_" + field
+	}
+}
+
+// buildProjectionExpression builds DynamoDB ProjectionExpression and ExpressionAttributeNames
+func (d *DynamoDBStorage) buildProjectionExpression(projectedFields []string) (string, map[string]string) {
+	if len(projectedFields) == 0 {
+		return "", nil // No projection, return all fields
+	}
+
+	// Always include essential core fields by default
+	fieldsToProject := make(map[string]bool)
+	fieldsToProject["id"] = true         // Always include ID for record identification
+	fieldsToProject["tenant"] = true     // Always include tenant for multi-tenancy
+	fieldsToProject["created_at"] = true // Always include created timestamp
+	fieldsToProject["updated_at"] = true // Always include updated timestamp
+
+	// Add user-specified fields
+	for _, field := range projectedFields {
+		fieldsToProject[field] = true
+	}
+
+	var projectionParts []string
+	expressionAttributeNames := make(map[string]string)
+	i := 0
+
+	for field := range fieldsToProject {
+		attributeName := d.mapAPIFieldToDynamoDBAttribute(field)
+		nameKey := fmt.Sprintf("#proj%d", i)
+
+		expressionAttributeNames[nameKey] = attributeName
+		projectionParts = append(projectionParts, nameKey)
+		i++
+	}
+
+	projectionExpression := strings.Join(projectionParts, ", ")
+	log.Printf("Built projection expression with %d fields (including core fields: id, tenant, created_at, updated_at): %s", len(fieldsToProject), projectionExpression)
+	return projectionExpression, expressionAttributeNames
 }
 
 // sanitizeTenantID converts tenant ID to a valid DynamoDB table name component
@@ -937,6 +1055,40 @@ func (d *DynamoDBStorage) ListTickets(tenant string) ([]*ticketpb.TicketData, er
 	return tickets, nil
 }
 
+// listTicketsWithProjection retrieves all tickets for a tenant with field projection
+func (d *DynamoDBStorage) listTicketsWithProjection(ctx context.Context, tableName string, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	// Build projection expression
+	projectionExpression, expressionAttributeNames := d.buildProjectionExpression(projectedFields)
+
+	// Prepare scan input
+	scanInput := &dynamodb.ScanInput{
+		TableName: aws.String(tableName),
+	}
+
+	// Add projection if specified
+	if projectionExpression != "" {
+		scanInput.ProjectionExpression = aws.String(projectionExpression)
+		scanInput.ExpressionAttributeNames = expressionAttributeNames
+	}
+
+	// Scan the entire tenant table
+	result, err := d.client.Scan(ctx, scanInput)
+	if err != nil {
+		log.Printf("ERROR: Failed to list tickets with projection from table %s: %v", tableName, err)
+		return nil, err
+	}
+
+	// Convert DynamoDB items to tickets with projection awareness
+	var tickets []*ticketpb.TicketData
+	for _, item := range result.Items {
+		ticketData := d.dynamoDBItemToProtobufWithProjection(item, projectedFields)
+		tickets = append(tickets, ticketData)
+	}
+
+	log.Printf("Listed %d tickets with %d projected fields from table %s", len(tickets), len(projectedFields), tableName)
+	return tickets, nil
+}
+
 // SearchTickets searches for tickets based on conditions with operand, operator, and value
 // Uses GSI optimization when available, falls back to scan when necessary
 func (d *DynamoDBStorage) SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
@@ -954,6 +1106,25 @@ func (d *DynamoDBStorage) SearchTickets(tenant string, conditions []SearchCondit
 
 	// Analyze conditions to determine optimal search strategy
 	return d.executeOptimizedSearch(ctx, tableName, tenant, conditions)
+}
+
+// SearchTicketsWithProjection searches for tickets with optional field projection
+// Uses GSI optimization when available, falls back to scan when necessary
+func (d *DynamoDBStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := d.ensureTenantTable(ctx, tenant); err != nil {
+		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	// Get tenant-specific table name
+	tableName := d.getTenantTableName(tenant)
+
+	// Analyze conditions to determine optimal search strategy with projection
+	return d.executeOptimizedSearchWithProjection(ctx, tableName, tenant, request.Conditions, request.ProjectedFields)
 }
 
 // executeOptimizedSearch determines the best search strategy and executes it
@@ -989,6 +1160,42 @@ func (d *DynamoDBStorage) executeOptimizedSearch(ctx context.Context, tableName,
 
 	// Strategy 3: No GSI support, fallback to scan
 	return d.executeScanSearch(ctx, tableName, conditions)
+}
+
+// executeOptimizedSearchWithProjection determines the best search strategy with field projection
+func (d *DynamoDBStorage) executeOptimizedSearchWithProjection(ctx context.Context, tableName, tenant string, conditions []SearchCondition, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	if len(conditions) == 0 {
+		// No conditions, return all tickets with projection
+		return d.listTicketsWithProjection(ctx, tableName, projectedFields)
+	}
+
+	// Separate conditions into GSI-supported and non-GSI-supported
+	var gsiConditions []SearchCondition
+	var scanConditions []SearchCondition
+
+	for _, condition := range conditions {
+		if d.canUseGSIForCondition(tenant, condition) {
+			gsiConditions = append(gsiConditions, condition)
+		} else {
+			scanConditions = append(scanConditions, condition)
+		}
+	}
+
+	log.Printf("Search strategy with projection: %d GSI conditions, %d scan conditions, %d projected fields",
+		len(gsiConditions), len(scanConditions), len(projectedFields))
+
+	// Strategy 1: All conditions can use GSI
+	if len(gsiConditions) == len(conditions) {
+		return d.executeGSIOnlySearchWithProjection(ctx, tableName, tenant, gsiConditions, projectedFields)
+	}
+
+	// Strategy 2: Some conditions can use GSI, others need scan
+	if len(gsiConditions) > 0 {
+		return d.executeHybridSearchWithProjection(ctx, tableName, tenant, gsiConditions, scanConditions, projectedFields)
+	}
+
+	// Strategy 3: No GSI support, fallback to scan
+	return d.executeScanSearchWithProjection(ctx, tableName, conditions, projectedFields)
 }
 
 // executeGSIOnlySearch handles cases where all conditions can use GSI
@@ -1030,6 +1237,61 @@ func (d *DynamoDBStorage) executeGSIOnlySearch(ctx context.Context, tableName, t
 		len(commonTicketIDs), len(gsiResults))
 
 	return d.getTicketsByIDs(ctx, tableName, commonTicketIDs)
+}
+
+// executeGSIOnlySearchWithProjection handles GSI-only search with field projection
+func (d *DynamoDBStorage) executeGSIOnlySearchWithProjection(ctx context.Context, tableName, tenant string, conditions []SearchCondition, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	if len(conditions) == 1 {
+		// Single condition - use single GSI query with projection
+		condition := conditions[0]
+		gsiConfig, _ := d.getGSIForField(tenant, condition.Operand)
+
+		log.Printf("Executing single GSI query with projection for field '%s' using index '%s'",
+			condition.Operand, gsiConfig.IndexName)
+
+		result, err := d.executeGSIQueryWithProjection(ctx, tableName, *gsiConfig, condition, projectedFields)
+		if err != nil {
+			log.Printf("GSI query with projection failed, falling back to scan: %v", err)
+			return d.executeScanSearchWithProjection(ctx, tableName, conditions, projectedFields)
+		}
+
+		// Log single query metrics
+		d.logGSIQueryMetrics([]GSIQueryResult{*result})
+
+		return d.getTicketsByIDsWithProjection(ctx, tableName, result.TicketIDs, projectedFields)
+	}
+
+	// Multiple conditions - execute multiple GSI queries concurrently and intersect
+	log.Printf("Executing %d GSI queries concurrently with projection for multiple field search", len(conditions))
+	gsiResults, err := d.executeGSIQueriesConcurrentlyWithProjection(ctx, tableName, tenant, conditions, projectedFields)
+	if err != nil {
+		log.Printf("Concurrent GSI queries with projection failed, falling back to scan: %v", err)
+		return d.executeScanSearchWithProjection(ctx, tableName, conditions, projectedFields)
+	}
+
+	// Log GSI query metrics
+	d.logGSIQueryMetrics(gsiResults)
+
+	// Find intersection of all results
+	commonTicketIDs := d.intersectTicketIDs(gsiResults)
+	log.Printf("Found %d common ticket IDs from intersection of %d GSI query results with projection",
+		len(commonTicketIDs), len(gsiResults))
+
+	return d.getTicketsByIDsWithProjection(ctx, tableName, commonTicketIDs, projectedFields)
+}
+
+// executeHybridSearchWithProjection handles mixed GSI and scan conditions with projection
+func (d *DynamoDBStorage) executeHybridSearchWithProjection(ctx context.Context, tableName, tenant string, gsiConditions, scanConditions []SearchCondition, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	// First, get results from GSI conditions with projection
+	gsiTickets, err := d.executeGSIOnlySearchWithProjection(ctx, tableName, tenant, gsiConditions, projectedFields)
+	if err != nil {
+		log.Printf("GSI search with projection failed in hybrid mode, falling back to full scan: %v", err)
+		allConditions := append(gsiConditions, scanConditions...)
+		return d.executeScanSearchWithProjection(ctx, tableName, allConditions, projectedFields)
+	}
+
+	// Then filter GSI results with scan conditions
+	return d.filterTicketsWithConditions(gsiTickets, scanConditions), nil
 }
 
 // executeHybridSearch handles cases with mixed GSI and scan conditions
@@ -1083,6 +1345,67 @@ func (d *DynamoDBStorage) executeScanSearch(ctx context.Context, tableName strin
 	}
 
 	log.Printf("Scan search found %d tickets matching conditions", len(tickets))
+	return tickets, nil
+}
+
+// executeScanSearchWithProjection performs scan-based search with field projection
+func (d *DynamoDBStorage) executeScanSearchWithProjection(ctx context.Context, tableName string, conditions []SearchCondition, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	log.Printf("Using scan-based search for %d conditions with %d projected fields", len(conditions), len(projectedFields))
+
+	// Build filter expression from conditions
+	filterExpression, filterAttributeNames, expressionAttributeValues, err := d.buildFilterExpression(conditions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build filter expression: %w", err)
+	}
+
+	// Build projection expression
+	projectionExpression, projectionAttributeNames := d.buildProjectionExpression(projectedFields)
+
+	// Merge expression attribute names from filter and projection
+	expressionAttributeNames := make(map[string]string)
+	for k, v := range filterAttributeNames {
+		expressionAttributeNames[k] = v
+	}
+	for k, v := range projectionAttributeNames {
+		expressionAttributeNames[k] = v
+	}
+
+	// Prepare scan input
+	scanInput := &dynamodb.ScanInput{
+		TableName: aws.String(tableName),
+	}
+
+	// Add filter expression if conditions exist
+	if filterExpression != "" {
+		scanInput.FilterExpression = aws.String(filterExpression)
+		scanInput.ExpressionAttributeValues = expressionAttributeValues
+	}
+
+	// Add projection expression if specified
+	if projectionExpression != "" {
+		scanInput.ProjectionExpression = aws.String(projectionExpression)
+	}
+
+	// Add expression attribute names if any exist
+	if len(expressionAttributeNames) > 0 {
+		scanInput.ExpressionAttributeNames = expressionAttributeNames
+	}
+
+	// Execute scan
+	result, err := d.client.Scan(ctx, scanInput)
+	if err != nil {
+		log.Printf("ERROR: Failed to search tickets with projection from table %s: %v", tableName, err)
+		return nil, fmt.Errorf("failed to search tickets with projection: %w", err)
+	}
+
+	// Convert DynamoDB items to tickets with projection awareness
+	var tickets []*ticketpb.TicketData
+	for _, item := range result.Items {
+		ticketData := d.dynamoDBItemToProtobufWithProjection(item, projectedFields)
+		tickets = append(tickets, ticketData)
+	}
+
+	log.Printf("Scan search with projection found %d tickets matching conditions", len(tickets))
 	return tickets, nil
 }
 
@@ -1397,6 +1720,96 @@ func (d *DynamoDBStorage) executeGSIQuery(ctx context.Context, tableName string,
 	}, nil
 }
 
+// executeGSIQueryWithProjection executes a GSI query with field projection
+func (d *DynamoDBStorage) executeGSIQueryWithProjection(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition, projectedFields []string) (*GSIQueryResult, error) {
+	// Convert value to appropriate DynamoDB attribute value
+	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert value for GSI query with projection: %w", err)
+	}
+
+	expressionAttributeNames := map[string]string{
+		"#hashkey": gsiConfig.HashKey,
+	}
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":hashval": attributeValue,
+	}
+
+	var keyConditionExpression string
+
+	// Handle different operators
+	switch strings.ToLower(condition.Operator) {
+	case "eq", "=":
+		keyConditionExpression = "#hashkey = :hashval"
+	case "ne", "!=":
+		return d.executeGSIScanWithFilterAndProjection(ctx, tableName, gsiConfig, condition, projectedFields)
+	case "gt", ">", "lt", "<", "gte", ">=", "lte", "<=":
+		return d.executeGSIScanWithFilterAndProjection(ctx, tableName, gsiConfig, condition, projectedFields)
+	case "begins_with":
+		keyConditionExpression = "begins_with(#hashkey, :hashval)"
+	default:
+		return nil, fmt.Errorf("unsupported operator for GSI query: %s", condition.Operator)
+	}
+
+	// Build projection expression
+	projectionExpression, projectionAttributeNames := d.buildProjectionExpression(projectedFields)
+
+	// Merge expression attribute names
+	for k, v := range projectionAttributeNames {
+		expressionAttributeNames[k] = v
+	}
+
+	// Build query input
+	queryInput := &dynamodb.QueryInput{
+		TableName:                 aws.String(tableName),
+		IndexName:                 aws.String(gsiConfig.IndexName),
+		KeyConditionExpression:    aws.String(keyConditionExpression),
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+	}
+
+	// Add projection if specified
+	if projectionExpression != "" {
+		queryInput.ProjectionExpression = aws.String(projectionExpression)
+	}
+
+	log.Printf("Executing GSI query with projection on index %s with condition: %s %s %v",
+		gsiConfig.IndexName, condition.Operand, condition.Operator, condition.Value)
+
+	result, err := d.client.Query(ctx, queryInput)
+	if err != nil {
+		log.Printf("GSI query with projection failed on index %s: %v", gsiConfig.IndexName, err)
+		return nil, fmt.Errorf("GSI query with projection failed on index %s: %w", gsiConfig.IndexName, err)
+	}
+
+	// Extract ticket IDs from the results
+	var ticketIDs []string
+	for _, item := range result.Items {
+		if pkAttr, exists := item["pk"]; exists {
+			if pkVal, ok := pkAttr.(*types.AttributeValueMemberS); ok {
+				ticketIDs = append(ticketIDs, pkVal.Value)
+			}
+		}
+	}
+
+	log.Printf("GSI query with projection on %s returned %d results for condition %s %s %v",
+		gsiConfig.IndexName, len(ticketIDs), condition.Operand, condition.Operator, condition.Value)
+
+	// Create metrics for this query
+	metrics := GSIQueryMetrics{
+		IndexName:     gsiConfig.IndexName,
+		ResultCount:   len(ticketIDs),
+		ConditionUsed: condition,
+		Success:       true,
+	}
+
+	return &GSIQueryResult{
+		TicketIDs: ticketIDs,
+		Items:     result.Items,
+		Metrics:   metrics,
+	}, nil
+}
+
 // verifyAndCreateMissingGSI checks if a GSI exists and creates it if missing
 func (d *DynamoDBStorage) verifyAndCreateMissingGSI(ctx context.Context, tableName string, gsiConfig GSIConfig, fieldName string) error {
 	// First, check if the GSI actually exists in the table
@@ -1519,6 +1932,93 @@ func (d *DynamoDBStorage) executeGSIScanWithFilter(ctx context.Context, tableNam
 	}, nil
 }
 
+// executeGSIScanWithFilterAndProjection executes a GSI scan with filter and projection
+func (d *DynamoDBStorage) executeGSIScanWithFilterAndProjection(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition, projectedFields []string) (*GSIQueryResult, error) {
+	// Convert value to appropriate DynamoDB attribute value
+	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert value for GSI scan with projection: %w", err)
+	}
+
+	expressionAttributeNames := map[string]string{
+		"#filterkey": gsiConfig.HashKey,
+	}
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":filterval": attributeValue,
+	}
+
+	// Build filter expression based on operator
+	var filterExpression string
+	switch strings.ToLower(condition.Operator) {
+	case "ne", "!=":
+		filterExpression = "#filterkey <> :filterval"
+	case "gt", ">":
+		filterExpression = "#filterkey > :filterval"
+	case "lt", "<":
+		filterExpression = "#filterkey < :filterval"
+	case "gte", ">=":
+		filterExpression = "#filterkey >= :filterval"
+	case "lte", "<=":
+		filterExpression = "#filterkey <= :filterval"
+	default:
+		return nil, fmt.Errorf("unsupported operator for GSI scan: %s", condition.Operator)
+	}
+
+	// Build projection expression
+	projectionExpression, projectionAttributeNames := d.buildProjectionExpression(projectedFields)
+
+	// Merge expression attribute names
+	for k, v := range projectionAttributeNames {
+		expressionAttributeNames[k] = v
+	}
+
+	// Execute the GSI scan with filter and projection
+	scanInput := &dynamodb.ScanInput{
+		TableName:                 aws.String(tableName),
+		IndexName:                 aws.String(gsiConfig.IndexName),
+		FilterExpression:          aws.String(filterExpression),
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+	}
+
+	// Add projection if specified
+	if projectionExpression != "" {
+		scanInput.ProjectionExpression = aws.String(projectionExpression)
+	}
+
+	result, err := d.client.Scan(ctx, scanInput)
+	if err != nil {
+		return nil, fmt.Errorf("GSI scan with projection failed on index %s: %w", gsiConfig.IndexName, err)
+	}
+
+	// Extract ticket IDs from the results
+	var ticketIDs []string
+	for _, item := range result.Items {
+		if pkAttr, exists := item["pk"]; exists {
+			if pkVal, ok := pkAttr.(*types.AttributeValueMemberS); ok {
+				ticketIDs = append(ticketIDs, pkVal.Value)
+			}
+		}
+	}
+
+	log.Printf("GSI scan with projection on %s returned %d results for condition %s %s %v",
+		gsiConfig.IndexName, len(ticketIDs), condition.Operand, condition.Operator, condition.Value)
+
+	// Create metrics for this scan
+	metrics := GSIQueryMetrics{
+		IndexName:     gsiConfig.IndexName,
+		ResultCount:   len(ticketIDs),
+		ConditionUsed: condition,
+		Success:       true,
+	}
+
+	return &GSIQueryResult{
+		TicketIDs: ticketIDs,
+		Items:     result.Items,
+		Metrics:   metrics,
+	}, nil
+}
+
 // intersectTicketIDs finds common ticket IDs across multiple GSI query results
 func (d *DynamoDBStorage) intersectTicketIDs(results []GSIQueryResult) []string {
 	if len(results) == 0 {
@@ -1611,6 +2111,86 @@ func (d *DynamoDBStorage) getBatchTickets(ctx context.Context, tableName string,
 	if items, exists := result.Responses[tableName]; exists {
 		for _, item := range items {
 			ticketData := dynamoDBItemToProtobuf(item)
+			tickets = append(tickets, ticketData)
+		}
+	}
+
+	return tickets, nil
+}
+
+// getTicketsByIDsWithProjection retrieves tickets by IDs with field projection
+func (d *DynamoDBStorage) getTicketsByIDsWithProjection(ctx context.Context, tableName string, ticketIDs []string, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	if len(ticketIDs) == 0 {
+		return []*ticketpb.TicketData{}, nil
+	}
+
+	var tickets []*ticketpb.TicketData
+
+	// DynamoDB BatchGetItem has a limit of 100 items per request
+	batchSize := 100
+	for i := 0; i < len(ticketIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(ticketIDs) {
+			end = len(ticketIDs)
+		}
+
+		batch := ticketIDs[i:end]
+		batchTickets, err := d.getBatchTicketsWithProjection(ctx, tableName, batch, projectedFields)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get batch tickets with projection: %w", err)
+		}
+
+		tickets = append(tickets, batchTickets...)
+	}
+
+	return tickets, nil
+}
+
+// getBatchTicketsWithProjection retrieves a batch of tickets with field projection
+func (d *DynamoDBStorage) getBatchTicketsWithProjection(ctx context.Context, tableName string, ticketIDs []string, projectedFields []string) ([]*ticketpb.TicketData, error) {
+	if len(ticketIDs) == 0 {
+		return []*ticketpb.TicketData{}, nil
+	}
+
+	// Build request keys
+	var keys []map[string]types.AttributeValue
+	for _, ticketID := range ticketIDs {
+		keys = append(keys, map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: ticketID},
+		})
+	}
+
+	// Build projection expression
+	projectionExpression, expressionAttributeNames := d.buildProjectionExpression(projectedFields)
+
+	// Prepare batch get input
+	keysAndAttributes := types.KeysAndAttributes{
+		Keys: keys,
+	}
+
+	// Add projection if specified
+	if projectionExpression != "" {
+		keysAndAttributes.ProjectionExpression = aws.String(projectionExpression)
+		keysAndAttributes.ExpressionAttributeNames = expressionAttributeNames
+	}
+
+	// Execute batch get
+	batchInput := &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			tableName: keysAndAttributes,
+		},
+	}
+
+	result, err := d.client.BatchGetItem(ctx, batchInput)
+	if err != nil {
+		return nil, fmt.Errorf("batch get item with projection failed: %w", err)
+	}
+
+	// Convert results to tickets with projection awareness
+	var tickets []*ticketpb.TicketData
+	if items, exists := result.Responses[tableName]; exists {
+		for _, item := range items {
+			ticketData := d.dynamoDBItemToProtobufWithProjection(item, projectedFields)
 			tickets = append(tickets, ticketData)
 		}
 	}
@@ -1719,6 +2299,100 @@ func (d *DynamoDBStorage) executeGSIQueriesConcurrently(ctx context.Context, tab
 	}
 
 	log.Printf("Successfully completed %d concurrent GSI queries", len(results))
+	return results, nil
+}
+
+// executeGSIQueriesConcurrentlyWithProjection executes multiple GSI queries with projection in parallel
+func (d *DynamoDBStorage) executeGSIQueriesConcurrentlyWithProjection(ctx context.Context, tableName, tenant string, conditions []SearchCondition, projectedFields []string) ([]GSIQueryResult, error) {
+	type gsiQueryJob struct {
+		condition SearchCondition
+		gsiConfig GSIConfig
+		index     int
+	}
+
+	type gsiQueryResponse struct {
+		result *GSIQueryResult
+		err    error
+		index  int
+	}
+
+	// Prepare jobs for each GSI query
+	var jobs []gsiQueryJob
+	for i, condition := range conditions {
+		gsiConfig, exists := d.getGSIForField(tenant, condition.Operand)
+		if !exists {
+			return nil, fmt.Errorf("no GSI configuration found for field: %s in tenant: %s", condition.Operand, tenant)
+		}
+		jobs = append(jobs, gsiQueryJob{
+			condition: condition,
+			gsiConfig: *gsiConfig,
+			index:     i,
+		})
+	}
+
+	// Create channels for job distribution and result collection
+	jobChan := make(chan gsiQueryJob, len(jobs))
+	resultChan := make(chan gsiQueryResponse, len(jobs))
+
+	// Start worker goroutines (limit to reasonable number)
+	numWorkers := len(jobs)
+	if numWorkers > 5 { // Limit concurrent queries to avoid overwhelming DynamoDB
+		numWorkers = 5
+	}
+
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			for job := range jobChan {
+				queryStart := time.Now()
+				result, err := d.executeGSIQueryWithProjection(ctx, tableName, job.gsiConfig, job.condition, projectedFields)
+				queryTime := time.Since(queryStart)
+
+				resultChan <- gsiQueryResponse{
+					result: result,
+					err:    err,
+					index:  job.index,
+				}
+
+				if err != nil {
+					log.Printf("Worker %d failed GSI query with projection for field '%s' in %v: %v",
+						workerID, job.condition.Operand, queryTime, err)
+				} else {
+					log.Printf("Worker %d completed GSI query with projection for field '%s' in %v (success: %t)",
+						workerID, job.condition.Operand, queryTime, err == nil)
+				}
+			}
+		}(w)
+	}
+
+	// Send jobs to workers
+	for _, job := range jobs {
+		jobChan <- job
+	}
+	close(jobChan)
+
+	// Collect results
+	results := make([]GSIQueryResult, len(jobs))
+	var firstError error
+
+	for i := 0; i < len(jobs); i++ {
+		response := <-resultChan
+		if response.err != nil {
+			if firstError == nil {
+				firstError = response.err
+			}
+			log.Printf("GSI query with projection failed for job index %d: %v", response.index, response.err)
+			continue
+		}
+		if response.result != nil {
+			results[response.index] = *response.result
+		}
+	}
+
+	if firstError != nil {
+		return nil, fmt.Errorf("one or more GSI queries with projection failed: %w", firstError)
+	}
+
+	log.Printf("Successfully completed %d concurrent GSI queries with projection", len(results))
 	return results, nil
 }
 

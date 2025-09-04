@@ -295,9 +295,10 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 
-	// Parse search conditions from request body
+	// Parse search request from request body (supports field projection)
 	var searchRequest struct {
-		Conditions []map[string]interface{} `json:"conditions"`
+		Conditions      []map[string]interface{} `json:"conditions"`
+		ProjectedFields []string                 `json:"projected_fields,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&searchRequest); err != nil {
@@ -307,11 +308,28 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for fields parameter in query string (alternative to JSON body)
+	fieldsParam := r.URL.Query().Get("fields")
+	if fieldsParam != "" && len(searchRequest.ProjectedFields) == 0 {
+		// Parse comma-separated fields from query parameter
+		searchRequest.ProjectedFields = strings.Split(fieldsParam, ",")
+		// Trim whitespace from each field
+		for i, field := range searchRequest.ProjectedFields {
+			searchRequest.ProjectedFields[i] = strings.TrimSpace(field)
+		}
+	}
+
+	// Log field projection for debugging
+	if len(searchRequest.ProjectedFields) > 0 {
+		log.Printf("Search request with %d projected fields: %v (core fields id, tenant, created_at, updated_at will be included automatically)", len(searchRequest.ProjectedFields), searchRequest.ProjectedFields)
+	}
+
 	requestData := map[string]interface{}{
 		"action": "search",
 		"tenant": tenant,
 		"data": map[string]interface{}{
-			"conditions": searchRequest.Conditions,
+			"conditions":       searchRequest.Conditions,
+			"projected_fields": searchRequest.ProjectedFields,
 		},
 	}
 
