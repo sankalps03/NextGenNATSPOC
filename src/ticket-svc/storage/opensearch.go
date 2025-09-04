@@ -450,13 +450,13 @@ func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []S
 		}
 
 		switch cond.Operator {
-		case "eq":
+		case "eq", "=":
 			must = append(must, map[string]interface{}{
 				"term": map[string]interface{}{
 					fieldPath: cond.Value,
 				},
 			})
-		case "ne":
+		case "ne", "!=", "<>":
 			must = append(must, map[string]interface{}{
 				"bool": map[string]interface{}{
 					"must_not": map[string]interface{}{
@@ -466,7 +466,7 @@ func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []S
 					},
 				},
 			})
-		case "gt":
+		case "gt", ">":
 			must = append(must, map[string]interface{}{
 				"range": map[string]interface{}{
 					fieldPath: map[string]interface{}{
@@ -474,7 +474,7 @@ func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []S
 					},
 				},
 			})
-		case "lt":
+		case "lt", "<":
 			must = append(must, map[string]interface{}{
 				"range": map[string]interface{}{
 					fieldPath: map[string]interface{}{
@@ -482,7 +482,7 @@ func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []S
 					},
 				},
 			})
-		case "gte":
+		case "gte", ">=":
 			must = append(must, map[string]interface{}{
 				"range": map[string]interface{}{
 					fieldPath: map[string]interface{}{
@@ -490,7 +490,7 @@ func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []S
 					},
 				},
 			})
-		case "lte":
+		case "lte", "<=":
 			must = append(must, map[string]interface{}{
 				"range": map[string]interface{}{
 					fieldPath: map[string]interface{}{
