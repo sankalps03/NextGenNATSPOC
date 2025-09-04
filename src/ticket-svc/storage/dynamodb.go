@@ -153,10 +153,72 @@ func protobufToDynamoDBItem(ticketData *ticketpb.TicketData) map[string]types.At
 	// Store dynamic fields with "field_" prefix to avoid naming conflicts
 	for fieldName, fieldValue := range ticketData.Fields {
 		attributeName := "field_" + fieldName
-		item[attributeName] = fieldValueToDynamoDBAttribute(fieldValue)
+
+		// For GSI key fields, force string type to match GSI attribute definitions
+		if isGSIKeyField(fieldName) {
+			item[attributeName] = forceStringAttribute(fieldValue)
+		} else {
+			item[attributeName] = fieldValueToDynamoDBAttribute(fieldValue)
+		}
 	}
 
 	return item
+}
+
+// isGSIKeyField checks if a field is used as a GSI key and should be stored as string
+func isGSIKeyField(fieldName string) bool {
+	// Define the 19 business-critical fields that have GSI indexes (must match generateBusinessGSIDefinitions)
+	gsiKeyFields := map[string]bool{
+		"requesterid":       true, // High - Many unique users → frequent search filter
+		"technicianid":      true, // High - For assignment filtering and reporting
+		"groupid":           true, // High - Workgroup-based queries
+		"statusid":          true, // Medium - Filter tickets by status efficiently
+		"priorityid":        true, // Medium - Common SLA-related queries
+		"urgencyid":         true, // Medium - Helps with SLA escalation checks
+		"categoryid":        true, // High - Frequent search filter for service categorization
+		"companyid":         true, // High - Multi-tenant isolation and reporting
+		"departmentid":      true, // High - Department-based filtering
+		"locationid":        true, // High - Filter tickets by location
+		"createdtime":       true, // High - Sorting and time-based range queries
+		"updatedtime":       true, // High - Recent activity queries
+		"lastresolvedtime":  true, // High - SLA performance tracking
+		"lastclosedtime":    true, // High - Closure analytics
+		"dueby":             true, // High - SLA calculations and escalation jobs
+		"oladueby":          true, // High - OLA tracking for internal teams
+		"ucdueby":           true, // High - UC SLA tracking
+		"lastviolationtime": true, // High - SLA/OLA violation tracking and reporting
+		"violatedslaid":     true, // Medium - Specific violated SLA record lookup
+	}
+	return gsiKeyFields[fieldName]
+}
+
+// forceStringAttribute converts any field value to a string attribute for GSI compatibility
+func forceStringAttribute(fieldValue *ticketpb.FieldValue) types.AttributeValue {
+	if fieldValue == nil {
+		return &types.AttributeValueMemberS{Value: ""}
+	}
+
+	switch v := fieldValue.Value.(type) {
+	case *ticketpb.FieldValue_StringValue:
+		return &types.AttributeValueMemberS{Value: v.StringValue}
+	case *ticketpb.FieldValue_IntValue:
+		return &types.AttributeValueMemberS{Value: strconv.FormatInt(v.IntValue, 10)}
+	case *ticketpb.FieldValue_DoubleValue:
+		return &types.AttributeValueMemberS{Value: strconv.FormatFloat(v.DoubleValue, 'f', -1, 64)}
+	case *ticketpb.FieldValue_BoolValue:
+		return &types.AttributeValueMemberS{Value: strconv.FormatBool(v.BoolValue)}
+	case *ticketpb.FieldValue_BytesValue:
+		return &types.AttributeValueMemberS{Value: string(v.BytesValue)}
+	case *ticketpb.FieldValue_StringArray:
+		// Convert array to comma-separated string for GSI compatibility
+		var values []string
+		for _, str := range v.StringArray.Values {
+			values = append(values, str)
+		}
+		return &types.AttributeValueMemberS{Value: strings.Join(values, ",")}
+	default:
+		return &types.AttributeValueMemberS{Value: ""}
+	}
 }
 
 // dynamoDBItemToProtobuf converts a DynamoDB item back to a TicketData protobuf
@@ -268,27 +330,183 @@ func (d *DynamoDBStorage) dynamoDBItemToProtobufWithProjection(item map[string]t
 // initializeDefaultGSIConfig sets up the default GSI configuration mapping with enhanced metadata
 func initializeDefaultGSIConfig() map[string]GSIConfig {
 	now := time.Now()
-	return map[string]GSIConfig{
-		"status": {
-			IndexName:           "status-index",
-			HashKey:             "field_status",
+	gsiConfig := map[string]GSIConfig{
+		"statusid": {
+			IndexName:           "statusid-index",
+			HashKey:             "field_statusid",
 			RangeKey:            "pk",
 			Priority:            1, // High priority for status queries
 			EstimatedCost:       1.0,
-			SupportedOps:        []string{"eq", "=", "ne", "!="},
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
 			Status:              "ACTIVE",
 			ProjectionType:      "ALL",
 			ProjectedAttributes: []string{},
 			CreatedAt:           now,
 			ExistsInDynamoDB:    false, // Will be updated when fetching actual indexes
 		},
-		"priority": {
-			IndexName:           "priority-index",
-			HashKey:             "field_priority",
+		"priorityid": {
+			IndexName:           "priorityid-index",
+			HashKey:             "field_priorityid",
 			RangeKey:            "pk",
-			Priority:            2, // Medium priority for priority queries
-			EstimatedCost:       1.2,
+			Priority:            2,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"urgencyid": {
+			IndexName:           "urgencyid-index",
+			HashKey:             "field_urgencyid",
+			RangeKey:            "pk",
+			Priority:            3,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"categoryid": {
+			IndexName:           "categoryid-index",
+			HashKey:             "field_categoryid",
+			RangeKey:            "pk",
+			Priority:            4,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"departmentid": {
+			IndexName:           "departmentid-index",
+			HashKey:             "field_departmentid",
+			RangeKey:            "pk",
+			Priority:            5,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"groupid": {
+			IndexName:           "groupid-index",
+			HashKey:             "field_groupid",
+			RangeKey:            "pk",
+			Priority:            6,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"technicianid": {
+			IndexName:           "technicianid-index",
+			HashKey:             "field_technicianid",
+			RangeKey:            "pk",
+			Priority:            7,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"createdbyid": {
+			IndexName:           "createdbyid-index",
+			HashKey:             "field_createdbyid",
+			RangeKey:            "pk",
+			Priority:            8,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"impactid": {
+			IndexName:           "impactid-index",
+			HashKey:             "field_impactid",
+			RangeKey:            "pk",
+			Priority:            9,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"locationid": {
+			IndexName:           "locationid-index",
+			HashKey:             "field_locationid",
+			RangeKey:            "pk",
+			Priority:            10,
+			EstimatedCost:       1.0,
 			SupportedOps:        []string{"eq", "=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"requesttype": {
+			IndexName:           "requesttype-index",
+			HashKey:             "field_requesttype",
+			RangeKey:            "pk",
+			Priority:            11,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"sourceid": {
+			IndexName:           "sourceid-index",
+			HashKey:             "field_sourceid",
+			RangeKey:            "pk",
+			Priority:            12,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"subject": {
+			IndexName:           "subject-index",
+			HashKey:             "field_subject",
+			RangeKey:            "pk",
+			Priority:            13,
+			EstimatedCost:       1.5,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "begins_with", "contains"},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"name": {
+			IndexName:           "name-index",
+			HashKey:             "field_name",
+			RangeKey:            "pk",
+			Priority:            14,
+			EstimatedCost:       1.5,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "begins_with", "contains"},
 			Status:              "ACTIVE",
 			ProjectionType:      "ALL",
 			ProjectedAttributes: []string{},
@@ -308,11 +526,89 @@ func initializeDefaultGSIConfig() map[string]GSIConfig {
 			CreatedAt:           now,
 			ExistsInDynamoDB:    false,
 		},
+		"removed": {
+			IndexName:           "removed-index",
+			HashKey:             "field_removed",
+			RangeKey:            "pk",
+			Priority:            15,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"spam": {
+			IndexName:           "spam-index",
+			HashKey:             "field_spam",
+			RangeKey:            "pk",
+			Priority:            16,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"viprequest": {
+			IndexName:           "viprequest-index",
+			HashKey:             "field_viprequest",
+			RangeKey:            "pk",
+			Priority:            17,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"reopened": {
+			IndexName:           "reopened-index",
+			HashKey:             "field_reopened",
+			RangeKey:            "pk",
+			Priority:            18,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"approvalstatus": {
+			IndexName:           "approvalstatus-index",
+			HashKey:             "field_approvalstatus",
+			RangeKey:            "pk",
+			Priority:            19,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"approvaltype": {
+			IndexName:           "approvaltype-index",
+			HashKey:             "field_approvaltype",
+			RangeKey:            "pk",
+			Priority:            20,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
 		"created_at": {
 			IndexName:           "created-at-index",
 			HashKey:             "created_at",
 			RangeKey:            "pk",
-			Priority:            3, // Lower priority for time-based queries
+			Priority:            21, // Lower priority for time-based queries
 			EstimatedCost:       1.5,
 			SupportedOps:        []string{"eq", "=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">=", "begins_with"},
 			Status:              "ACTIVE",
@@ -347,6 +643,208 @@ func initializeDefaultGSIConfig() map[string]GSIConfig {
 			CreatedAt:           now,
 			ExistsInDynamoDB:    false,
 		},
+	}
+
+	// Add additional searchable fields
+	addAdditionalSearchableFields(gsiConfig)
+
+	// Create GSI configurations for all remaining searchable fields
+	createGSIForAllSearchableFields(gsiConfig)
+
+	return gsiConfig
+}
+
+// addAdditionalSearchableFields adds GSI configurations for all remaining searchable fields
+func addAdditionalSearchableFields(gsiConfig map[string]GSIConfig) {
+	now := time.Now()
+
+	// Additional searchable fields with their GSI configurations
+	additionalFields := map[string]GSIConfig{
+		"requesterid": {
+			IndexName:           "requesterid-index",
+			HashKey:             "field_requesterid",
+			RangeKey:            "pk",
+			Priority:            22,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"templateid": {
+			IndexName:           "templateid-index",
+			HashKey:             "field_templateid",
+			RangeKey:            "pk",
+			Priority:            23,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"supportlevel": {
+			IndexName:           "supportlevel-index",
+			HashKey:             "field_supportlevel",
+			RangeKey:            "pk",
+			Priority:            24,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"servicecatalogid": {
+			IndexName:           "servicecatalogid-index",
+			HashKey:             "field_servicecatalogid",
+			RangeKey:            "pk",
+			Priority:            25,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"companyid": {
+			IndexName:           "companyid-index",
+			HashKey:             "field_companyid",
+			RangeKey:            "pk",
+			Priority:            26,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"closedby": {
+			IndexName:           "closedby-index",
+			HashKey:             "field_closedby",
+			RangeKey:            "pk",
+			Priority:            27,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"resolvedby": {
+			IndexName:           "resolvedby-index",
+			HashKey:             "field_resolvedby",
+			RangeKey:            "pk",
+			Priority:            28,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+		"vendorid": {
+			IndexName:           "vendorid-index",
+			HashKey:             "field_vendorid",
+			RangeKey:            "pk",
+			Priority:            29,
+			EstimatedCost:       1.0,
+			SupportedOps:        []string{"eq", "=", "ne", "!=", "lt", "<", "lte", "<=", "gt", ">", "gte", ">="},
+			Status:              "ACTIVE",
+			ProjectionType:      "ALL",
+			ProjectedAttributes: []string{},
+			CreatedAt:           now,
+			ExistsInDynamoDB:    false,
+		},
+	}
+
+	// Add all additional fields to the main config
+	for fieldName, config := range additionalFields {
+		if _, exists := gsiConfig[fieldName]; !exists {
+			gsiConfig[fieldName] = config
+		}
+	}
+}
+
+// createGSIForAllSearchableFields creates GSI configurations for all searchable fields
+func createGSIForAllSearchableFields(gsiConfig map[string]GSIConfig) {
+	now := time.Now()
+
+	// All searchable fields from the user's requirements
+	allSearchableFields := []string{
+		"id", "createdbyid", "name", "oobtype", "removed", "removedbyid",
+		"approvalstatus", "approvaltype", "categoryid", "departmentid",
+		"dueby", "duetimemanuallyupdated", "firstresponsetime", "groupid",
+		"impactid", "lastclosedtime", "lastopenedtime", "lastresolvedtime",
+		"lastviolationtime", "locationid", "olddueby", "oldresponsedue",
+		"priorityid", "reopened", "requesterid", "resolutionduelevel",
+		"resolutionescalationtime", "responsedue", "responseduelevel",
+		"responsedueviolated", "responseescalationtime", "slaviolated",
+		"statuschangedtime", "statusid", "subject", "supportlevel",
+		"technicianid", "templateid", "totalonholdduration",
+		"totalresolutiontime", "totalslapausetime", "totalworkingtime",
+		"urgencyid", "violatedslaid", "callfrom", "emailreadconfigemail",
+		"emailreadconfigid", "purchaserequest", "requesttype",
+		"servicecatalogid", "sourceid", "spam", "viprequest",
+		"groupchangedtime", "lastolaviolationtime", "oladueby",
+		"olaviolated", "oldoladueby", "askfeedbackdate", "firstfeedbackdate",
+		"oladuelevel", "olaescalationtime", "suggestedcategoryid",
+		"suggestedgroupid", "companyid", "closedby", "resolvedby",
+		"vendorid", "lastucviolationtime", "olducdueby", "totaluconholdduration",
+		"totalucpausetime", "totalucworkingtime", "ucdueby", "ucduelevel",
+		"ucescalationtime", "ucviolated", "violateducid",
+		"totalucresolutiontime", "transitionmodelid", "migrated",
+		"mergedrequest", "messengerconfigid", "lastapproveddate",
+	}
+
+	// Create GSI config for any missing fields
+	priority := 30 // Start from priority 30 for auto-generated indexes
+	for _, fieldName := range allSearchableFields {
+		if _, exists := gsiConfig[fieldName]; !exists {
+			// Determine supported operations based on field name patterns
+			supportedOps := []string{"eq", "=", "ne", "!="}
+
+			// Add comparison operators for numeric-looking fields
+			if strings.HasSuffix(fieldName, "id") ||
+				strings.HasSuffix(fieldName, "time") ||
+				strings.HasSuffix(fieldName, "level") ||
+				strings.HasSuffix(fieldName, "duration") ||
+				strings.Contains(fieldName, "due") ||
+				strings.Contains(fieldName, "escalation") {
+				supportedOps = append(supportedOps, "lt", "<", "lte", "<=", "gt", ">", "gte", ">=")
+			}
+
+			// Add string operations for text fields
+			if strings.Contains(fieldName, "name") ||
+				strings.Contains(fieldName, "subject") ||
+				strings.Contains(fieldName, "email") ||
+				strings.Contains(fieldName, "config") {
+				supportedOps = append(supportedOps, "begins_with", "contains")
+			}
+
+			gsiConfig[fieldName] = GSIConfig{
+				IndexName:           fieldName + "-index",
+				HashKey:             "field_" + fieldName,
+				RangeKey:            "pk",
+				Priority:            priority,
+				EstimatedCost:       1.0,
+				SupportedOps:        supportedOps,
+				Status:              "ACTIVE",
+				ProjectionType:      "ALL",
+				ProjectedAttributes: []string{},
+				CreatedAt:           now,
+				ExistsInDynamoDB:    false,
+			}
+			priority++
+		}
 	}
 }
 
@@ -517,7 +1015,7 @@ func NewDynamoDBStorage(ctx context.Context, baseTableName, region, dbURL, dbAdd
 
 	// Test the connection by listing tables
 	log.Printf("Testing DynamoDB connection...")
-	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	testCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	_, err = client.ListTables(testCtx, &dynamodb.ListTablesInput{})
@@ -656,19 +1154,227 @@ func (d *DynamoDBStorage) ensureTenantTable(ctx context.Context, tenantID string
 	// Store in map to avoid future checks
 	d.tenantTables.Store(tenantID, tableName)
 
-	// Initialize GSI configuration and create default indexes for this tenant
-	if err := d.initializeTenantGSI(ctx, tenantID); err != nil {
-		log.Printf("Warning: Failed to initialize GSI configuration for tenant %s: %v", tenantID, err)
-		// Don't return error as table creation was successful
+	// Initialize GSI configuration for this tenant (all indexes are already created with the table)
+	d.initializeTenantGSIConfig(tenantID)
+
+	return nil
+}
+
+// validateSearchFields validates that all search conditions use only supported business-critical fields
+func (d *DynamoDBStorage) validateSearchFields(conditions []SearchCondition) error {
+	// Define exactly the same 19 business-critical fields that have GSI indexes
+	supportedFields := map[string]bool{
+		"requesterid":       true, // High - Many unique users → frequent search filter
+		"technicianid":      true, // High - For assignment filtering and reporting
+		"groupid":           true, // High - Workgroup-based queries
+		"statusid":          true, // Medium - Filter tickets by status efficiently
+		"priorityid":        true, // Medium - Common SLA-related queries
+		"urgencyid":         true, // Medium - Helps with SLA escalation checks
+		"categoryid":        true, // High - Frequent search filter for service categorization
+		"companyid":         true, // High - Multi-tenant isolation and reporting
+		"departmentid":      true, // High - Department-based filtering
+		"locationid":        true, // High - Filter tickets by location
+		"createdtime":       true, // High - Sorting and time-based range queries
+		"updatedtime":       true, // High - Recent activity queries
+		"lastresolvedtime":  true, // High - SLA performance tracking
+		"lastclosedtime":    true, // High - Closure analytics
+		"dueby":             true, // High - SLA calculations and escalation jobs
+		"oladueby":          true, // High - OLA tracking for internal teams
+		"ucdueby":           true, // High - UC SLA tracking
+		"lastviolationtime": true, // High - SLA/OLA violation tracking and reporting
+		"violatedslaid":     true, // Medium - Specific violated SLA record lookup
+	}
+
+	// Check each condition
+	for _, condition := range conditions {
+		if !supportedFields[condition.Operand] {
+			return fmt.Errorf("field '%s' is not supported for searching. Supported fields: %v",
+				condition.Operand, d.getSupportedFieldsList())
+		}
 	}
 
 	return nil
 }
 
+// getSupportedFieldsList returns a sorted list of supported business-critical search fields
+func (d *DynamoDBStorage) getSupportedFieldsList() []string {
+	return []string{
+		"categoryid", "companyid", "createdtime", "departmentid", "dueby",
+		"groupid", "lastclosedtime", "lastresolvedtime", "lastviolationtime", "locationid",
+		"oladueby", "priorityid", "requesterid", "statusid", "technicianid",
+		"ucdueby", "updatedtime", "urgencyid", "violatedslaid",
+	}
+}
+
+// initializeTenantGSIConfig initializes the GSI configuration for a tenant (business-critical fields only)
+func (d *DynamoDBStorage) initializeTenantGSIConfig(tenantID string) {
+	d.gsiMutex.Lock()
+	defer d.gsiMutex.Unlock()
+
+	// Initialize tenant GSI config if not exists
+	if d.gsiConfig[tenantID] == nil {
+		d.gsiConfig[tenantID] = make(map[string]GSIConfig)
+	}
+
+	// Define exactly the same 19 business-critical fields that are created with the table
+	businessFields := map[string]bool{
+		"requesterid":       true, // High - Many unique users → frequent search filter
+		"technicianid":      true, // High - For assignment filtering and reporting
+		"groupid":           true, // High - Workgroup-based queries
+		"statusid":          true, // Medium - Filter tickets by status efficiently
+		"priorityid":        true, // Medium - Common SLA-related queries
+		"urgencyid":         true, // Medium - Helps with SLA escalation checks
+		"categoryid":        true, // High - Frequent search filter for service categorization
+		"companyid":         true, // High - Multi-tenant isolation and reporting
+		"departmentid":      true, // High - Department-based filtering
+		"locationid":        true, // High - Filter tickets by location
+		"createdtime":       true, // High - Sorting and time-based range queries
+		"updatedtime":       true, // High - Recent activity queries
+		"lastresolvedtime":  true, // High - SLA performance tracking
+		"lastclosedtime":    true, // High - Closure analytics
+		"dueby":             true, // High - SLA calculations and escalation jobs
+		"oladueby":          true, // High - OLA tracking for internal teams
+		"ucdueby":           true, // High - UC SLA tracking
+		"lastviolationtime": true, // High - SLA/OLA violation tracking and reporting
+		"violatedslaid":     true, // Medium - Specific violated SLA record lookup
+	}
+
+	// Load the default GSI configuration but only configure the business-critical fields
+	defaultGSIConfig := initializeDefaultGSIConfig()
+	configuredCount := 0
+
+	for fieldName, config := range defaultGSIConfig {
+		if businessFields[fieldName] {
+			// Mark as existing (created with table)
+			config.ExistsInDynamoDB = true
+			config.Status = "ACTIVE"
+			d.gsiConfig[tenantID][fieldName] = config
+			configuredCount++
+		}
+		// Skip all other fields - they are not supported for searching
+	}
+
+	log.Printf("Initialized GSI configuration for tenant %s: %d indexes configured (business-critical fields only)",
+		tenantID, configuredCount)
+}
+
+// generateBusinessGSIDefinitions creates attribute definitions and GSI indexes for business-critical searchable fields
+func (d *DynamoDBStorage) generateBusinessGSIDefinitions() ([]types.AttributeDefinition, []types.GlobalSecondaryIndex) {
+	// Define exactly 19 business-critical fields for GSI creation based on actual usage patterns
+	// These are the ONLY fields that will support efficient searching
+	businessFields := []string{
+		"requesterid",       // High - Many unique users → frequent search filter
+		"technicianid",      // High - For assignment filtering and reporting
+		"groupid",           // High - Workgroup-based queries
+		"statusid",          // Medium - Filter tickets by status efficiently
+		"priorityid",        // Medium - Common SLA-related queries
+		"urgencyid",         // Medium - Helps with SLA escalation checks
+		"categoryid",        // High - Frequent search filter for service categorization
+		"companyid",         // High - Multi-tenant isolation and reporting
+		"departmentid",      // High - Department-based filtering
+		"locationid",        // High - Filter tickets by location
+		"createdtime",       // High - Sorting and time-based range queries
+		"updatedtime",       // High - Recent activity queries
+		"lastresolvedtime",  // High - SLA performance tracking
+		"lastclosedtime",    // High - Closure analytics
+		"dueby",             // High - SLA calculations and escalation jobs
+		"oladueby",          // High - OLA tracking for internal teams
+		"ucdueby",           // High - UC SLA tracking
+		"lastviolationtime", // High - SLA/OLA violation tracking and reporting
+		"violatedslaid",     // Medium - Specific violated SLA record lookup
+	}
+
+	// Get the default GSI configuration
+	defaultGSIConfig := initializeDefaultGSIConfig()
+
+	// Track unique attributes to avoid duplicates
+	attributeMap := make(map[string]types.ScalarAttributeType)
+	var globalSecondaryIndexes []types.GlobalSecondaryIndex
+
+	// Process exactly 19 business-critical fields
+	for _, fieldName := range businessFields {
+		gsiConfig, exists := defaultGSIConfig[fieldName]
+		if !exists {
+			log.Printf("Warning: Business field %s not found in GSI config", fieldName)
+			continue
+		}
+
+		// Determine the attribute type based on the actual hash key field name
+		attributeType := d.determineAttributeType(gsiConfig.HashKey)
+
+		// Add to attribute map (will deduplicate automatically)
+		attributeMap[gsiConfig.HashKey] = attributeType
+
+		// Create the GSI definition
+		gsi := types.GlobalSecondaryIndex{
+			IndexName: aws.String(gsiConfig.IndexName),
+			KeySchema: []types.KeySchemaElement{
+				{
+					AttributeName: aws.String(gsiConfig.HashKey),
+					KeyType:       types.KeyTypeHash,
+				},
+				{
+					AttributeName: aws.String(gsiConfig.RangeKey),
+					KeyType:       types.KeyTypeRange,
+				},
+			},
+			Projection: &types.Projection{
+				ProjectionType: types.ProjectionTypeAll,
+			},
+			ProvisionedThroughput: &types.ProvisionedThroughput{
+				ReadCapacityUnits:  aws.Int64(5),
+				WriteCapacityUnits: aws.Int64(5),
+			},
+		}
+
+		globalSecondaryIndexes = append(globalSecondaryIndexes, gsi)
+	}
+
+	// Convert attribute map to slice
+	var attributeDefinitions []types.AttributeDefinition
+	for attrName, attrType := range attributeMap {
+		attributeDefinitions = append(attributeDefinitions, types.AttributeDefinition{
+			AttributeName: aws.String(attrName),
+			AttributeType: attrType,
+		})
+	}
+
+	log.Printf("Generated %d attribute definitions and exactly %d business-critical GSI indexes (DynamoDB limit: 20)",
+		len(attributeDefinitions), len(globalSecondaryIndexes))
+
+	return attributeDefinitions, globalSecondaryIndexes
+}
+
+// determineAttributeType determines the DynamoDB attribute type based on field name patterns
+func (d *DynamoDBStorage) determineAttributeType(fieldName string) types.ScalarAttributeType {
+	// Most fields are strings by default to match CSV data
+	// Only use Number type for fields that are guaranteed to be numeric
+
+	// Remove "field_" prefix if present for pattern matching
+	cleanFieldName := fieldName
+	if strings.HasPrefix(fieldName, "field_") {
+		cleanFieldName = strings.TrimPrefix(fieldName, "field_")
+	}
+
+	// Fields that should be Number type (rare, only if we're sure they're always numeric)
+	numericFields := map[string]bool{
+		// Add specific fields here if they're guaranteed to be numeric
+		// "numeric_score": true,
+	}
+
+	if numericFields[cleanFieldName] {
+		return types.ScalarAttributeTypeN
+	}
+
+	// Default to String type for maximum compatibility with CSV data
+	// This includes all ID fields (statusid, priorityid, etc.) since CSV data contains them as strings
+	return types.ScalarAttributeTypeS
+}
+
 // createTableIfNotExists creates a new DynamoDB table with the standard schema
 func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName string) error {
-	// Create table with timeout
-	createCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// Create table with fresh timeout (don't inherit parent context limitations)
+	createCtx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
 	// Base attribute definitions
@@ -682,158 +1388,11 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 	// Add GSI attribute definitions if GSI is enabled
 	var globalSecondaryIndexes []types.GlobalSecondaryIndex
 	if d.enableGSI {
-		// Add attribute definitions for GSI keys
-		gsiAttributes := []types.AttributeDefinition{
-			{
-				AttributeName: aws.String("field_status"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-			{
-				AttributeName: aws.String("field_priority"),
-				AttributeType: types.ScalarAttributeTypeN,
-			},
-			{
-				AttributeName: aws.String("field_assignee"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-			{
-				AttributeName: aws.String("created_at"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-			{
-				AttributeName: aws.String("updated_at"),
-				AttributeType: types.ScalarAttributeTypeS,
-			}, {
-				AttributeName: aws.String("field_dummy1"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-		}
+		// Generate exactly 19 business-critical GSI attributes and indexes
+		gsiAttributes, gsiIndexes := d.generateBusinessGSIDefinitions()
 		attributeDefinitions = append(attributeDefinitions, gsiAttributes...)
+		globalSecondaryIndexes = gsiIndexes
 
-		// Define Global Secondary Indexes
-		globalSecondaryIndexes = []types.GlobalSecondaryIndex{
-			{
-				IndexName: aws.String("status-index"),
-				KeySchema: []types.KeySchemaElement{
-					{
-						AttributeName: aws.String("field_status"),
-						KeyType:       types.KeyTypeHash,
-					},
-					{
-						AttributeName: aws.String("pk"),
-						KeyType:       types.KeyTypeRange,
-					},
-				},
-				Projection: &types.Projection{
-					ProjectionType: types.ProjectionTypeAll,
-				},
-				ProvisionedThroughput: &types.ProvisionedThroughput{
-					ReadCapacityUnits:  aws.Int64(5),
-					WriteCapacityUnits: aws.Int64(5),
-				},
-			},
-			{
-				IndexName: aws.String("priority-index"),
-				KeySchema: []types.KeySchemaElement{
-					{
-						AttributeName: aws.String("field_priority"),
-						KeyType:       types.KeyTypeHash,
-					},
-					{
-						AttributeName: aws.String("pk"),
-						KeyType:       types.KeyTypeRange,
-					},
-				},
-				Projection: &types.Projection{
-					ProjectionType: types.ProjectionTypeAll,
-				},
-				ProvisionedThroughput: &types.ProvisionedThroughput{
-					ReadCapacityUnits:  aws.Int64(5),
-					WriteCapacityUnits: aws.Int64(5),
-				},
-			},
-			{
-				IndexName: aws.String("assignee-index"),
-				KeySchema: []types.KeySchemaElement{
-					{
-						AttributeName: aws.String("field_assignee"),
-						KeyType:       types.KeyTypeHash,
-					},
-					{
-						AttributeName: aws.String("pk"),
-						KeyType:       types.KeyTypeRange,
-					},
-				},
-				Projection: &types.Projection{
-					ProjectionType: types.ProjectionTypeAll,
-				},
-				ProvisionedThroughput: &types.ProvisionedThroughput{
-					ReadCapacityUnits:  aws.Int64(5),
-					WriteCapacityUnits: aws.Int64(5),
-				},
-			},
-			{
-				IndexName: aws.String("created-at-index"),
-				KeySchema: []types.KeySchemaElement{
-					{
-						AttributeName: aws.String("created_at"),
-						KeyType:       types.KeyTypeHash,
-					},
-					{
-						AttributeName: aws.String("pk"),
-						KeyType:       types.KeyTypeRange,
-					},
-				},
-				Projection: &types.Projection{
-					ProjectionType: types.ProjectionTypeAll,
-				},
-				ProvisionedThroughput: &types.ProvisionedThroughput{
-					ReadCapacityUnits:  aws.Int64(5),
-					WriteCapacityUnits: aws.Int64(5),
-				},
-			},
-			{
-				IndexName: aws.String("updated-at-index"),
-				KeySchema: []types.KeySchemaElement{
-					{
-						AttributeName: aws.String("updated_at"),
-						KeyType:       types.KeyTypeHash,
-					},
-					{
-						AttributeName: aws.String("pk"),
-						KeyType:       types.KeyTypeRange,
-					},
-				},
-				Projection: &types.Projection{
-					ProjectionType: types.ProjectionTypeAll,
-				},
-				ProvisionedThroughput: &types.ProvisionedThroughput{
-					ReadCapacityUnits:  aws.Int64(5),
-					WriteCapacityUnits: aws.Int64(5),
-				},
-			},
-
-			{
-				IndexName: aws.String("dummy1-index"),
-				KeySchema: []types.KeySchemaElement{
-					{
-						AttributeName: aws.String("field_dummy1"),
-						KeyType:       types.KeyTypeHash,
-					},
-					{
-						AttributeName: aws.String("pk"),
-						KeyType:       types.KeyTypeRange,
-					},
-				},
-				Projection: &types.Projection{
-					ProjectionType: types.ProjectionTypeAll,
-				},
-				ProvisionedThroughput: &types.ProvisionedThroughput{
-					ReadCapacityUnits:  aws.Int64(5),
-					WriteCapacityUnits: aws.Int64(5),
-				},
-			},
-		}
 		log.Printf("Creating table %s with %d GSI indexes", tableName, len(globalSecondaryIndexes))
 	} else {
 		log.Printf("Creating table %s without GSI indexes (GSI disabled)", tableName)
@@ -871,14 +1430,14 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 		return fmt.Errorf("failed to create table %s: %w", tableName, err)
 	}
 
-	// Wait for table to become active
+	// Wait for table to become active with fresh context
 	waiter := dynamodb.NewTableExistsWaiter(d.client)
-	waitCtx, waitCancel := context.WithTimeout(ctx, 120*time.Second)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer waitCancel()
 
 	err = waiter.Wait(waitCtx, &dynamodb.DescribeTableInput{
 		TableName: aws.String(tableName),
-	}, 120*time.Second)
+	}, 180*time.Second)
 
 	if err != nil {
 		return fmt.Errorf("table %s creation timed out: %w", tableName, err)
@@ -889,13 +1448,18 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 
 // CreateTicket stores a new ticket in the tenant-specific DynamoDB table with separate field attributes
 func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Use longer timeout for table creation scenarios
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
+	// Ensure tenant table exists (this may take time for first-time table creation)
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
 		return fmt.Errorf("failed to ensure tenant table: %w", err)
 	}
+
+	// Create a separate shorter context for the actual PutItem operation
+	putCtx, putCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer putCancel()
 
 	// Convert protobuf to DynamoDB item with separate field attributes
 	item := protobufToDynamoDBItem(ticketData)
@@ -904,7 +1468,7 @@ func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 	tableName := d.getTenantTableName(tenant)
 
 	// Store in tenant-specific DynamoDB table with separate field attributes
-	_, err := d.client.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := d.client.PutItem(putCtx, &dynamodb.PutItemInput{
 		TableName:           aws.String(tableName),
 		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(pk)"),
@@ -920,19 +1484,24 @@ func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 
 // GetTicket retrieves a ticket by tenant and ID from the tenant-specific DynamoDB table
 func (d *DynamoDBStorage) GetTicket(tenant, id string) (*ticketpb.TicketData, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Use longer timeout for table creation scenarios
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
+	// Ensure tenant table exists (this may take time for first-time table creation)
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
 		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
 		return nil, false
 	}
 
+	// Create a separate shorter context for the actual GetItem operation
+	getCtx, getCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer getCancel()
+
 	// Get tenant-specific table name
 	tableName := d.getTenantTableName(tenant)
 
-	result, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
+	result, err := d.client.GetItem(getCtx, &dynamodb.GetItemInput{
 		TableName: aws.String(tableName),
 		Key: map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: id},
@@ -955,14 +1524,19 @@ func (d *DynamoDBStorage) GetTicket(tenant, id string) (*ticketpb.TicketData, bo
 
 // UpdateTicket updates an existing ticket in the tenant-specific DynamoDB table
 func (d *DynamoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Use longer timeout for table creation scenarios
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
+	// Ensure tenant table exists (this may take time for first-time table creation)
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
 		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
 		return false
 	}
+
+	// Create a separate shorter context for the actual PutItem operation
+	putCtx, putCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer putCancel()
 
 	// Convert protobuf to DynamoDB item with separate field attributes
 	item := protobufToDynamoDBItem(ticketData)
@@ -971,7 +1545,7 @@ func (d *DynamoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 	tableName := d.getTenantTableName(tenant)
 
 	// Replace the entire item with condition that it exists
-	_, err := d.client.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := d.client.PutItem(putCtx, &dynamodb.PutItemInput{
 		TableName:           aws.String(tableName),
 		Item:                item,
 		ConditionExpression: aws.String("attribute_exists(pk)"),
@@ -988,7 +1562,7 @@ func (d *DynamoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 
 // DeleteTicket removes a ticket from the tenant-specific DynamoDB table and returns it
 func (d *DynamoDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// First get the ticket to return it
@@ -1091,9 +1665,15 @@ func (d *DynamoDBStorage) listTicketsWithProjection(ctx context.Context, tableNa
 
 // SearchTickets searches for tickets based on conditions with operand, operator, and value
 // Uses GSI optimization when available, falls back to scan when necessary
+// Only supports searching on the top 20 configured fields
 func (d *DynamoDBStorage) SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
+
+	// Validate that all search fields are supported (top 20 only)
+	if err := d.validateSearchFields(conditions); err != nil {
+		return nil, fmt.Errorf("invalid search fields: %w", err)
+	}
 
 	// Ensure tenant table exists
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
@@ -1110,9 +1690,15 @@ func (d *DynamoDBStorage) SearchTickets(tenant string, conditions []SearchCondit
 
 // SearchTicketsWithProjection searches for tickets with optional field projection
 // Uses GSI optimization when available, falls back to scan when necessary
+// Only supports searching on the top 20 configured fields
 func (d *DynamoDBStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
+
+	// Validate that all search fields are supported (top 20 only)
+	if err := d.validateSearchFields(request.Conditions); err != nil {
+		return nil, fmt.Errorf("invalid search fields: %w", err)
+	}
 
 	// Ensure tenant table exists
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
@@ -1677,16 +2263,8 @@ func (d *DynamoDBStorage) executeGSIQuery(ctx context.Context, tableName string,
 
 		// Check if the error is due to missing index
 		if strings.Contains(err.Error(), "ValidationException") && strings.Contains(err.Error(), "key schema element") {
-			log.Printf("ERROR: GSI index %s appears to not exist in DynamoDB table %s", gsiConfig.IndexName, tableName)
-			log.Printf("Attempting to create missing GSI index...")
-
-			// Try to create the missing GSI
-			fieldName := condition.Operand
-			if createErr := d.verifyAndCreateMissingGSI(ctx, tableName, gsiConfig, fieldName); createErr != nil {
-				log.Printf("Failed to create missing GSI: %v", createErr)
-			} else {
-				log.Printf("GSI creation initiated. Please retry the query after the index becomes ACTIVE")
-			}
+			log.Printf("ERROR: GSI index %s does not exist in DynamoDB table %s", gsiConfig.IndexName, tableName)
+			log.Printf("This field should have been created with the table. Check if '%s' is in the top 20 supported fields.", condition.Operand)
 		}
 
 		return nil, fmt.Errorf("GSI query failed on index %s: %w", gsiConfig.IndexName, err)
@@ -1810,53 +2388,7 @@ func (d *DynamoDBStorage) executeGSIQueryWithProjection(ctx context.Context, tab
 	}, nil
 }
 
-// verifyAndCreateMissingGSI checks if a GSI exists and creates it if missing
-func (d *DynamoDBStorage) verifyAndCreateMissingGSI(ctx context.Context, tableName string, gsiConfig GSIConfig, fieldName string) error {
-	// First, check if the GSI actually exists in the table
-	describeOutput, err := d.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(tableName),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to describe table %s: %w", tableName, err)
-	}
-
-	// Check if the GSI exists
-	gsiExists := false
-	for _, gsi := range describeOutput.Table.GlobalSecondaryIndexes {
-		if aws.ToString(gsi.IndexName) == gsiConfig.IndexName {
-			gsiExists = true
-			log.Printf("GSI %s exists in table %s with status: %s",
-				gsiConfig.IndexName, tableName, string(gsi.IndexStatus))
-			break
-		}
-	}
-
-	if !gsiExists {
-		log.Printf("GSI %s does not exist in table %s, creating it...", gsiConfig.IndexName, tableName)
-
-		// Extract tenant ID from table name for CreateGSI call
-		tenantID := strings.TrimPrefix(tableName, d.baseTableName+"_")
-
-		// Create the missing GSI
-		err := d.CreateGSI(
-			ctx,
-			tenantID,
-			fieldName,
-			gsiConfig.IndexName,
-			gsiConfig.HashKey,
-			gsiConfig.RangeKey,
-			gsiConfig.ProjectionType,
-			gsiConfig.ProjectedAttributes,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create missing GSI %s: %w", gsiConfig.IndexName, err)
-		}
-
-		log.Printf("Successfully created missing GSI %s for table %s", gsiConfig.IndexName, tableName)
-	}
-
-	return nil
-}
+// Note: createMissingGSI function removed - only top 20 fields are supported for searching
 
 // executeGSIScanWithFilter executes a scan on GSI with filter expression for range operations
 func (d *DynamoDBStorage) executeGSIScanWithFilter(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition) (*GSIQueryResult, error) {
@@ -2489,89 +3021,7 @@ func (d *DynamoDBStorage) fetchExistingIndexes(ctx context.Context, tenantID str
 	return nil
 }
 
-// createDefaultIndexes creates all default GSI indexes that don't already exist
-func (d *DynamoDBStorage) createDefaultIndexes(ctx context.Context, tenantID string) error {
-	if !d.enableGSI {
-		log.Printf("GSI disabled, skipping default index creation for tenant: %s", tenantID)
-		return nil
-	}
-
-	d.gsiMutex.RLock()
-	tenantConfig, exists := d.gsiConfig[tenantID]
-	if !exists {
-		d.gsiMutex.RUnlock()
-		return fmt.Errorf("no GSI configuration found for tenant: %s", tenantID)
-	}
-
-	// Collect indexes that need to be created
-	var indexesToCreate []string
-	for fieldName, config := range tenantConfig {
-		if !config.ExistsInDynamoDB {
-			indexesToCreate = append(indexesToCreate, fieldName)
-		}
-	}
-	d.gsiMutex.RUnlock()
-
-	if len(indexesToCreate) == 0 {
-		log.Printf("All default indexes already exist for tenant %s", tenantID)
-		return nil
-	}
-
-	log.Printf("Creating %d default GSI indexes for tenant %s: %v",
-		len(indexesToCreate), tenantID, indexesToCreate)
-
-	// Create each missing index
-	for _, fieldName := range indexesToCreate {
-		d.gsiMutex.RLock()
-		config := tenantConfig[fieldName]
-		d.gsiMutex.RUnlock()
-
-		log.Printf("Creating default GSI for tenant %s, field %s: index=%s",
-			tenantID, fieldName, config.IndexName)
-
-		err := d.CreateGSI(
-			ctx,
-			tenantID,
-			fieldName,
-			config.IndexName,
-			config.HashKey,
-			config.RangeKey,
-			config.ProjectionType,
-			config.ProjectedAttributes,
-		)
-
-		if err != nil {
-			// Check if the error is because the index already exists (race condition)
-			if d.isIndexAlreadyExistsError(err) {
-				log.Printf("Index %s already exists for tenant %s (race condition), updating local config",
-					config.IndexName, tenantID)
-
-				// Update local config to mark as existing
-				d.gsiMutex.Lock()
-				if tenantConfig, tenantExists := d.gsiConfig[tenantID]; tenantExists {
-					if fieldConfig, fieldExists := tenantConfig[fieldName]; fieldExists {
-						fieldConfig.ExistsInDynamoDB = true
-						fieldConfig.Status = "ACTIVE"
-						tenantConfig[fieldName] = fieldConfig
-					}
-				}
-				d.gsiMutex.Unlock()
-				continue
-			}
-
-			log.Printf("Failed to create default index %s for tenant %s, field %s: %v",
-				config.IndexName, tenantID, fieldName, err)
-			// Continue with other indexes even if one fails
-			continue
-		}
-
-		log.Printf("Successfully created default GSI %s for tenant %s, field %s",
-			config.IndexName, tenantID, fieldName)
-	}
-
-	log.Printf("Completed creating default indexes for tenant %s", tenantID)
-	return nil
-}
+// Note: createDefaultIndexes function removed - all indexes are now created upfront with the table
 
 // isIndexAlreadyExistsError checks if the error indicates the index already exists
 func (d *DynamoDBStorage) isIndexAlreadyExistsError(err error) bool {
@@ -2726,31 +3176,7 @@ func (d *DynamoDBStorage) updateLocalGSIConfig(tenantID, fieldName, indexName, p
 		tenantID, fieldName, indexName, status)
 }
 
-// initializeTenantGSI initializes GSI configuration for a new tenant and creates default indexes
-func (d *DynamoDBStorage) initializeTenantGSI(ctx context.Context, tenantID string) error {
-	if !d.enableGSI {
-		return nil
-	}
-
-	d.gsiMutex.Lock()
-	// Check if already initialized
-	if d.gsiConfig[tenantID] != nil {
-		d.gsiMutex.Unlock()
-		return nil
-	}
-
-	// Initialize with default configuration
-	d.gsiConfig[tenantID] = initializeDefaultGSIConfig()
-	d.gsiMutex.Unlock()
-
-	// First, fetch existing indexes from DynamoDB to see what's already there
-	if err := d.fetchExistingIndexes(ctx, tenantID); err != nil {
-		log.Printf("Warning: Failed to fetch existing indexes for tenant %s: %v", tenantID, err)
-	}
-
-	// Create all default indexes that don't already exist
-	return d.createDefaultIndexes(ctx, tenantID)
-}
+// Note: initializeTenantGSI function removed - all indexes are now created upfront with the table
 
 // Close gracefully closes the DynamoDB connection and clears tenant table cache
 func (d *DynamoDBStorage) Close() error {

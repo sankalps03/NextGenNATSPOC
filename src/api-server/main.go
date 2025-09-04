@@ -146,7 +146,7 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 		"data":   ticketData,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -168,7 +168,7 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 		"tenant": tenant,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -192,7 +192,7 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 		"ticket_id": ticketID,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -236,7 +236,7 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 		"data":      updateData,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -270,7 +270,7 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 		"ticket_id": ticketID,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -333,7 +333,7 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 10*time.Second)
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -365,7 +365,7 @@ func (h *APIHandler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	response, err := h.sendNATSRequest("notification.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("notification.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with notification service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -389,7 +389,7 @@ func (h *APIHandler) GetNotification(w http.ResponseWriter, r *http.Request) {
 		"notification_id": notificationID,
 	}
 
-	response, err := h.sendNATSRequest("notification.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest("notification.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with notification service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -533,8 +533,8 @@ func main() {
 	srv := &http.Server{
 		Addr:         ":" + config.Port,
 		Handler:      router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -550,7 +550,7 @@ func main() {
 	<-c
 
 	log.Println("Shutting down server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
