@@ -512,14 +512,37 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 
 			if err == nil && entries != nil {
 
-				json.Unmarshal(entries.Value(), &ticketMap)
+				if searchRequest.ProjectedFields == nil {
 
-				for key, value := range ticketMap {
+					json.Unmarshal(entries.Value(), &ticketMap)
 
-					ticketMap[key] = value
+				} else {
+
+					var docs map[string]interface{}
+
+					json.Unmarshal(entries.Value(), &docs)
+
+					counters := map[string]struct{}{}
+
+					for _, c := range searchRequest.ProjectedFields {
+
+						counters[c] = struct{}{}
+					}
+
+					for key, value := range docs {
+
+						if _, ok := counters[key]; ok {
+
+							ticketMap[key] = value
+						}
+
+					}
 				}
 			}
 		}
+
+		delete(ticketMap, "fields")
+
 		responseTickets = append(responseTickets, ticketMap)
 	}
 
