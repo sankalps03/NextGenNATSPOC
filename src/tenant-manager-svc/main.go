@@ -166,12 +166,6 @@ func (tm *TenantManager) createTenantStream(tenantID string) error {
 	// Define all subjects that this tenant's stream will handle
 	subjects := []string{
 		fmt.Sprintf("tenant.%s.>", tenantID),
-		fmt.Sprintf("tickets.%s.>", tenantID),
-		fmt.Sprintf("comments.%s.>", tenantID),
-		fmt.Sprintf("activities.%s.>", tenantID),
-		fmt.Sprintf("notifications.%s.>", tenantID),
-		fmt.Sprintf("logs.%s.>", tenantID),
-		fmt.Sprintf("events.%s.>", tenantID),
 	}
 
 	streamConfig := jetstream.StreamConfig{

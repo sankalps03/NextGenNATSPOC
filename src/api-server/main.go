@@ -216,7 +216,7 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 		"data":   req,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "tickets.create", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -247,7 +247,7 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 		"tenant": tenant,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "tickets.getAll", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -271,7 +271,7 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 		"ticket_id": ticketID,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "tickets.get", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -334,7 +334,7 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 		"data":      req,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "tickets.update", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -368,7 +368,7 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 		"ticket_id": ticketID,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "tickets.delete", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -409,7 +409,7 @@ func (h *APIHandler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	response, err := h.sendNATSRequest("notification.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "notification.service", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with notification service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -433,7 +433,7 @@ func (h *APIHandler) GetNotification(w http.ResponseWriter, r *http.Request) {
 		"notification_id": notificationID,
 	}
 
-	response, err := h.sendNATSRequest("notification.service", requestData, 5*time.Second)
+	response, err := h.sendNATSRequest(tenant, "notification.service", requestData, 5*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with notification service: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -476,33 +476,43 @@ func (h *APIHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := uuid.New().String()
-	now := time.Now().UTC().Format(time.RFC3339)
 
-	tenant := Tenant{
-		ID:        tenantID,
-		Name:      req.Name,
-		Email:     req.Email,
-		Status:    "active",
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
+	var tenant Tenant
 
-	tenantData, err := json.Marshal(tenant)
-	if err != nil {
-		log.Printf("ERROR: Failed to marshal tenant: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
-		return
-	}
+	// Check if tenant already exists with same name and email combination
+	if existingTenant, exists := h.findExistingTenant(r.Context(), req.Name, req.Email); exists {
+		log.Printf("Tenant with name '%s' and email '%s' already exists, returning existing tenant with ID: %s", req.Name, req.Email, existingTenant.ID)
+		tenantID = existingTenant.ID
+		tenant = *existingTenant
+	} else {
+		now := time.Now().UTC().Format(time.RFC3339)
 
-	_, err = h.tenantKV.Put(r.Context(), tenantID, tenantData)
-	if err != nil {
-		log.Printf("ERROR: Failed to store tenant in KV: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
-		return
+		tenant = Tenant{
+			ID:        tenantID,
+			Name:      req.Name,
+			Email:     req.Email,
+			Status:    "active",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+
+		tenantData, err := json.Marshal(tenant)
+		if err != nil {
+			log.Printf("ERROR: Failed to marshal tenant: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "internal_error"})
+			return
+		}
+
+		_, err = h.tenantKV.Put(r.Context(), tenantID, tenantData)
+		if err != nil {
+			log.Printf("ERROR: Failed to store tenant in KV: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "storage_error"})
+			return
+		}
 	}
 
 	// Create tenant through tenant manager service
@@ -518,9 +528,6 @@ func (h *APIHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "tenant_creation_failed", Message: "Failed to create tenant resources"})
 		return
 	}
-
-	// Note: Event publishing is now handled by the tenant manager service
-	// No need to publish duplicate events here
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -548,6 +555,38 @@ func (h *APIHandler) GetTenant(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(entry.Value())
+}
+
+func (h *APIHandler) findExistingTenant(ctx context.Context, name, email string) (*Tenant, bool) {
+	// Get all keys from the tenant KV store
+	keys, err := h.tenantKV.Keys(ctx)
+	if err != nil {
+		log.Printf("ERROR: Failed to get keys from tenant KV: %v", err)
+		return nil, false
+	}
+
+	// Iterate through all tenants to find matching name and email
+	for _, key := range keys {
+		entry, err := h.tenantKV.Get(ctx, key)
+		if err != nil {
+			log.Printf("ERROR: Failed to get tenant %s from KV: %v", key, err)
+			continue
+		}
+
+		var tenant Tenant
+		if err := json.Unmarshal(entry.Value(), &tenant); err != nil {
+			log.Printf("ERROR: Failed to unmarshal tenant %s: %v", key, err)
+			continue
+		}
+
+		// Check if name and email match (case-insensitive comparison)
+		if strings.EqualFold(strings.TrimSpace(tenant.Name), strings.TrimSpace(name)) &&
+			strings.EqualFold(strings.TrimSpace(tenant.Email), strings.TrimSpace(email)) {
+			return &tenant, true
+		}
+	}
+
+	return nil, false
 }
 
 func (h *APIHandler) UpdateTenant(w http.ResponseWriter, r *http.Request) {
@@ -711,13 +750,13 @@ func (h *APIHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
-func (h *APIHandler) sendNATSRequest(subject string, requestData interface{}, timeout time.Duration) ([]byte, error) {
+func (h *APIHandler) sendNATSRequest(tenant, subject string, requestData interface{}, timeout time.Duration) ([]byte, error) {
 	requestPayload, err := json.Marshal(requestData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	msg, err := h.natsManager.conn.Request(subject, requestPayload, timeout)
+	msg, err := h.natsManager.conn.Request(fmt.Sprintf("tenant.%s.%s", tenant, subject), requestPayload, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("NATS request failed: %w", err)
 	}

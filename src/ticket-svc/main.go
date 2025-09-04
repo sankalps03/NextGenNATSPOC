@@ -639,8 +639,8 @@ func connectNATS(urls string) (*NATSManager, error) {
 
 	opts := []nats.Option{
 		nats.Name("ticket-service"),
-		nats.ReconnectWait(time.Second),
-		nats.MaxReconnects(10),
+		nats.MaxReconnects(-1), // Retry forever
+		nats.ReconnectWait(2 * time.Second),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			log.Printf("NATS disconnected: %v", err)
 		}),
@@ -1671,6 +1671,13 @@ func (ts *TicketService) handleTenantRegistration(msg jetstream.Msg) {
 
 	switch req.Action {
 	case "register":
+		// Create KV bucket for this tenant
+		if err := ts.natsManager.createTenantKV(req.TenantID); err != nil {
+			log.Printf("Failed to create KV bucket for tenant %s: %v", req.TenantID, err)
+		} else {
+			log.Printf("Successfully created KV bucket for tenant %s", req.TenantID)
+		}
+
 		// Create consumer for this tenant's stream to process ticket events
 		if err := ts.createTenantConsumer(req.TenantID, req.StreamName); err != nil {
 			log.Printf("Failed to create consumer for tenant %s: %v", req.TenantID, err)
@@ -1684,6 +1691,13 @@ func (ts *TicketService) handleTenantRegistration(msg jetstream.Msg) {
 		} else {
 			log.Printf("Successfully removed consumer for tenant %s", req.TenantID)
 		}
+
+		// Delete KV bucket for this tenant
+		if err := ts.natsManager.deleteTenantKV(req.TenantID); err != nil {
+			log.Printf("Failed to delete KV bucket for tenant %s: %v", req.TenantID, err)
+		} else {
+			log.Printf("Successfully deleted KV bucket for tenant %s", req.TenantID)
+		}
 	default:
 		log.Printf("Unknown tenant registration action: %s", req.Action)
 	}
@@ -1696,7 +1710,7 @@ func (ts *TicketService) createTenantConsumer(tenantID, streamName string) error
 
 	// Create consumer for tenant-specific ticket events
 	consumerName := fmt.Sprintf("ticket-service-%s", tenantID)
-	filterSubject := fmt.Sprintf("tickets.%s.>", tenantID)
+	filterSubject := fmt.Sprintf("tenant.%s.tickets.>", tenantID)
 
 	consumer, err := ts.natsManager.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
 		Name:          consumerName,
@@ -1770,14 +1784,14 @@ func (ts *TicketService) processTenantMessages(tenantID string, consumer jetstre
 			// Validate message is for the correct tenant
 			if !ts.validateMessageTenant(msg, tenantID) {
 				log.Printf("Message tenant validation failed for %s", tenantID)
-				msg.Nak()
+				msg.Term()
 				continue
 			}
 
 			// Process the message (implement your business logic here)
 			if err := ts.processTicketMessage(tenantID, msg); err != nil {
 				log.Printf("Failed to process message for tenant %s: %v", tenantID, err)
-				msg.Nak()
+				msg.Term()
 			} else {
 				msg.Ack()
 			}
@@ -1793,7 +1807,7 @@ func (ts *TicketService) validateMessageTenant(msg jetstream.Msg, expectedTenant
 
 	// Check tenant ID in subject
 	subject := msg.Subject()
-	if strings.HasPrefix(subject, fmt.Sprintf("tickets.%s.", expectedTenantID)) {
+	if strings.HasPrefix(subject, fmt.Sprintf("tenant.%s", expectedTenantID)) {
 		return true
 	}
 
@@ -1801,11 +1815,164 @@ func (ts *TicketService) validateMessageTenant(msg jetstream.Msg, expectedTenant
 }
 
 func (ts *TicketService) processTicketMessage(tenantID string, msg jetstream.Msg) error {
-	// Implement your ticket message processing logic here
-	log.Printf("Processing ticket message for tenant %s: %s", tenantID, msg.Subject())
+	subject := msg.Subject()
+	log.Printf("Processing ticket message for tenant %s: %s", tenantID, subject)
 
-	// For now, just log the message
-	// In a real implementation, you would parse the message and handle it appropriately
+	// Parse the subject to determine the event type
+	// Expected format: tickets.{tenantID}.{action} (e.g., tickets.tenant1.created)
+	subjectParts := strings.Split(subject, ".")
+	if len(subjectParts) < 3 {
+		return fmt.Errorf("invalid subject format: %s", subject)
+	}
+
+	eventType := subjectParts[3] // created, updated, deleted, etc.
+
+	// Get tenant KV bucket
+	kv, err := ts.getTenantKV(tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to get tenant KV bucket: %w", err)
+	}
+
+	switch eventType {
+	case "create", "update":
+		return ts.handleTicketCreateOrUpdate(tenantID, kv, msg)
+	case "delete":
+		return ts.handleTicketDelete(tenantID, kv, msg)
+	case "get":
+		return ts.handleTicketGet(tenantID, kv, msg)
+	case "getAll":
+		return ts.handleTicketGetAll(tenantID, kv, msg)
+	default:
+		log.Printf("Unknown ticket event type: %s", eventType)
+		return nil // Don't fail for unknown event types
+	}
+}
+
+func (ts *TicketService) getTenantKV(tenantID string) (jetstream.KeyValue, error) {
+	ts.natsManager.mu.RLock()
+	kv, exists := ts.natsManager.kvBuckets[tenantID]
+	ts.natsManager.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("KV bucket not found for tenant: %s", tenantID)
+	}
+
+	return kv, nil
+}
+
+func (ts *TicketService) handleTicketCreateOrUpdate(tenantID string, kv jetstream.KeyValue, msg jetstream.Msg) error {
+	// Parse the ticket event
+	var ticketEvent TicketEvent
+	if err := json.Unmarshal(msg.Data(), &ticketEvent); err != nil {
+		return fmt.Errorf("failed to unmarshal ticket event: %w", err)
+	}
+
+	if ticketEvent.Data == nil {
+		return fmt.Errorf("ticket event data is nil")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ticket := ticketEvent.Data
+
+	if len(ticket.Id) == 0 {
+
+		ticket.Id = uuid.New().String()
+	}
+
+	// Store the ticket in the KV bucket
+	ticketKey := ticket.Id
+	ticketData, err := json.Marshal(ticket)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ticket for storage: %w", err)
+	}
+
+	_, err = kv.Put(ctx, ticketKey, ticketData)
+	if err != nil {
+		return fmt.Errorf("failed to store ticket in KV: %w", err)
+	}
+
+	log.Printf("Successfully stored ticket %s for tenant %s in KV store", ticket.Id, tenantID)
 
 	return nil
+}
+
+func (ts *TicketService) handleTicketDelete(tenantID string, kv jetstream.KeyValue, msg jetstream.Msg) error {
+	// Parse the ticket event
+	var ticketEvent TicketEvent
+	if err := json.Unmarshal(msg.Data(), &ticketEvent); err != nil {
+		return fmt.Errorf("failed to unmarshal ticket event: %w", err)
+	}
+
+	if ticketEvent.Data == nil {
+		return fmt.Errorf("ticket event data is nil")
+	}
+
+	ticket := ticketEvent.Data
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Delete the main ticket entry
+	ticketKey := ticket.Id
+	err := kv.Delete(ctx, ticketKey)
+	if err != nil && err != jetstream.ErrKeyNotFound {
+		return fmt.Errorf("failed to delete ticket from KV: %w", err)
+	}
+
+	log.Printf("Successfully deleted ticket %s for tenant %s from KV store", ticket.Id, tenantID)
+	return nil
+}
+func (ts *TicketService) handleTicketGet(tenantID string, kv jetstream.KeyValue, msg jetstream.Msg) error {
+	// Parse the ticket event
+	var ticketEvent TicketEvent
+	if err := json.Unmarshal(msg.Data(), &ticketEvent); err != nil {
+		return fmt.Errorf("failed to unmarshal ticket event: %w", err)
+	}
+
+	if ticketEvent.Data == nil {
+		return fmt.Errorf("ticket event data is nil")
+	}
+
+	ticket := ticketEvent.Data
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Delete the main ticket entry
+	ticketKey := ticket.Id
+	err := kv.Delete(ctx, ticketKey)
+	if err != nil && err != jetstream.ErrKeyNotFound {
+		return fmt.Errorf("failed to delete ticket from KV: %w", err)
+	}
+
+	log.Printf("Successfully deleted ticket %s for tenant %s from KV store", ticket.Id, tenantID)
+	return nil
+}
+func (ts *TicketService) handleTicketGetAll(tenantID string, kv jetstream.KeyValue, msg jetstream.Msg) error {
+	// Parse the ticket event
+	var ticketEvent TicketEvent
+	if err := json.Unmarshal(msg.Data(), &ticketEvent); err != nil {
+		return fmt.Errorf("failed to unmarshal ticket event: %w", err)
+	}
+
+	if ticketEvent.Data == nil {
+		return fmt.Errorf("ticket event data is nil")
+	}
+
+	ticket := ticketEvent.Data
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Delete the main ticket entry
+	ticketKey := ticket.Id
+	value, err := kv.Get(ctx, ticketKey)
+	if err != nil && err != jetstream.ErrKeyNotFound {
+		return fmt.Errorf("failed to delete ticket from KV: %w", err)
+	}
+
+	log.Printf("Successfully deleted ticket %s for tenant %s from KV store", ticket.Id, tenantID)
+	return value.Value()
 }
