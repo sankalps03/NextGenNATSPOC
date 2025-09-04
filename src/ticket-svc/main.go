@@ -770,6 +770,23 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+func createKVBucket(natsManager *NATSManager, bucketName string) error {
+	kv, err := natsManager.js.CreateKeyValue(context.Background(), jetstream.KeyValueConfig{
+		Bucket: bucketName,
+	})
+	if err != nil {
+		// If bucket already exists, try to get it
+		kv, err = natsManager.js.KeyValue(context.Background(), bucketName)
+		if err != nil {
+			return fmt.Errorf("failed to create or get KV bucket '%s': %w", bucketName, err)
+		}
+	}
+
+	log.Printf("NATS KV bucket '%s' ready", bucketName)
+	_ = kv // Use the kv store if needed later
+	return nil
+}
+
 func promptForStorageType() string {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -828,13 +845,26 @@ func main() {
 		opensearchStorage, err := storage2.NewOpenSearchStorage(context.Background(), config.OpenSearchURL, config.OpenSearchIndex)
 		if err != nil {
 			log.Fatalf("Failed to initialize OpenSearch storage: %v", err)
+
+			return
 		}
 		storage = opensearchStorage
+
+		// Create KV store bucket for OpenSearch storage only
+		if err = createKVBucket(natsManager, "ticket.kv"); err != nil {
+			log.Fatalf("Failed to create KV bucket for OpenSearch storage: %v", err)
+
+			return
+		}
+
 		log.Printf("Using OpenSearch storage with endpoint: %s and index: %s", config.OpenSearchURL, config.OpenSearchIndex)
+		log.Printf("Created NATS KV bucket: ticket.kv")
 	case "dynamodb":
 		dynamoStorage, err := storage2.NewDynamoDBStorage(context.Background(), config.DynamoDBTable, config.AWSRegion, config.DynamoDBURL, config.DynamoDBAddress)
 		if err != nil {
 			log.Fatalf("Failed to initialize DynamoDB storage: %v", err)
+
+			return
 		}
 		storage = dynamoStorage
 		log.Printf("Using DynamoDB dynamic storage (protobuf) with table: %s in region: %s", config.DynamoDBTable, config.AWSRegion)
