@@ -391,8 +391,20 @@ func (storage *OpenSearchStorage) SearchTicketsWithProjection(tenant string, req
 
 	// Add field projection if specified
 	if len(request.ProjectedFields) > 0 {
-		// Add system fields to projection
-		projectedFields := append([]string{"id", "tenant", "created_at", "updated_at"}, request.ProjectedFields...)
+		// Start with system fields
+		projectedFields := []string{"id", "tenant", "created_at", "updated_at"}
+
+		// Add custom fields with proper prefixing
+		for _, field := range request.ProjectedFields {
+			if field == "id" || field == "tenant" || field == "created_at" || field == "updated_at" {
+				// System field, already included
+				continue
+			} else {
+				// Custom field, add with fields prefix
+				projectedFields = append(projectedFields, "fields."+field)
+			}
+		}
+
 		query["_source"] = projectedFields
 	}
 

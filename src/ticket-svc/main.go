@@ -169,18 +169,6 @@ func convertFieldValueToInterface(fieldValue *ticketpb.FieldValue) interface{} {
 	}
 }
 
-// checkForSeverityInFields checks if any field contains severity keywords
-func (ts *TicketService) checkForSeverityInFields(fields map[string]*ticketpb.FieldValue) bool {
-	for _, fieldValue := range fields {
-		if stringVal := fieldValue.GetStringValue(); stringVal != "" {
-			if containsSeverity(stringVal) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // fieldsEqual compares two FieldValue instances for equality
 func fieldsEqual(a, b *ticketpb.FieldValue) bool {
 	if a == nil && b == nil {
@@ -327,17 +315,6 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 		}
 	}
 
-	if err := ts.publishTicketCreated(context.Background(), req.Tenant, ticketData); err != nil {
-		log.Printf("ERROR: Failed to publish ticket created event for tenant=%s ticket_id=%s: %v", req.Tenant, ticketData.Id, err)
-	}
-
-	// Check for severity in any description-like field for notification
-	if ts.checkForSeverityInFields(fields) {
-		if err := ts.publishNotificationRequested(context.Background(), req.Tenant, ticketData); err != nil {
-			log.Printf("ERROR: Failed to publish notification requested event for tenant=%s ticket_id=%s: %v", req.Tenant, ticketData.Id, err)
-		}
-	}
-
 	return ResponseWithLatency{
 		Data:            ticketData,
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
@@ -371,10 +348,6 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
-	}
-
-	if err := ts.publishTicketRead(context.Background(), req.Tenant, ticketData); err != nil {
-		log.Printf("ERROR: Failed to publish ticket read event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 	}
 
 	return ResponseWithLatency{
@@ -431,16 +404,6 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 		updateStart := time.Now()
 		ts.storage.UpdateTicket(req.Tenant, ticketData)
 		updateLatency = time.Since(updateStart)
-
-		if err := ts.publishTicketUpdated(context.Background(), req.Tenant, ticketData); err != nil {
-			log.Printf("ERROR: Failed to publish ticket updated event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
-		}
-
-		if ts.checkForSeverityInFields(ticketData.Fields) {
-			if err := ts.publishNotificationRequested(context.Background(), req.Tenant, ticketData); err != nil {
-				log.Printf("ERROR: Failed to publish notification requested event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
-			}
-		}
 	}
 
 	// Total database latency includes both get and update operations
@@ -455,15 +418,11 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, error) {
 	// Measure database latency
 	dbStart := time.Now()
-	ticketData, found := ts.storage.DeleteTicket(req.Tenant, req.TicketID)
+	_, found := ts.storage.DeleteTicket(req.Tenant, req.TicketID)
 	dbLatency := time.Since(dbStart)
 
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
-	}
-
-	if err := ts.publishTicketDeleted(context.Background(), req.Tenant, ticketData); err != nil {
-		log.Printf("ERROR: Failed to publish ticket deleted event for tenant=%s ticket_id=%s: %v", req.Tenant, req.TicketID, err)
 	}
 
 	return ResponseWithLatency{
@@ -520,11 +479,6 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 		}
 
 		responseTickets = append(responseTickets, ticketMap)
-	}
-
-	// Publish search event for auditing
-	if err := ts.publishTicketSearched(context.Background(), req.Tenant, len(tickets), searchRequest.Conditions); err != nil {
-		log.Printf("ERROR: Failed to publish ticket searched event for tenant=%s: %v", req.Tenant, err)
 	}
 
 	return ResponseWithLatency{
@@ -757,11 +711,6 @@ func (ts *TicketService) publishTicketSearched(ctx context.Context, tenant strin
 	}
 
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
-}
-
-func containsSeverity(description string) bool {
-	lower := strings.ToLower(description)
-	return strings.Contains(lower, "critical") || strings.Contains(lower, "major")
 }
 
 func loadConfig() *Config {
