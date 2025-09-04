@@ -6,7 +6,7 @@ import (
 
 // SearchCondition represents a search condition with operand, operator, and value
 type SearchCondition struct {
-	Operand  string      `json:"operand"`  // field name (e.g., "title", "priority", "created_at")
+	Operand  string      `json:"field"`    // field name (e.g., "title", "priority", "created_at") - JSON uses "field" to match simulator
 	Operator string      `json:"operator"` // operator (e.g., "eq", "ne", "gt", "lt", "gte", "lte", "contains", "begins_with")
 	Value    interface{} `json:"value"`    // value to compare against
 }
