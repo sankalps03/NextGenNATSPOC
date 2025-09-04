@@ -813,21 +813,24 @@ func (g *Generator) generateConditionForField(field string) *httpclient.SearchCo
 }
 
 // selectOperatorForValue selects an appropriate operator based on the value type
+// Only uses operators supported by the 19 GSI fields: eq, ne, lt, lte, gt, gte
 func (g *Generator) selectOperatorForValue(value interface{}) string {
 	switch v := value.(type) {
 	case string:
 		if v == "" {
 			return "eq"
 		}
-		// For strings, use contains or eq
-		operators := []string{"eq", "contains"}
+		// For strings, only use operators supported by GSI fields (no "contains" or "begins_with")
+		operators := []string{"eq", "ne"}
 		return operators[g.rand.Intn(len(operators))]
 	case int64, int, float64:
-		// For numbers, use various comparison operators
-		operators := []string{"eq", "gt", "lt", "gte", "lte"}
+		// For numbers, use comparison operators supported by GSI fields
+		operators := []string{"eq", "ne", "gt", "lt", "gte", "lte"}
 		return operators[g.rand.Intn(len(operators))]
 	case bool:
-		return "eq"
+		// For booleans, only use equality operators
+		operators := []string{"eq", "ne"}
+		return operators[g.rand.Intn(len(operators))]
 	default:
 		return "eq"
 	}
