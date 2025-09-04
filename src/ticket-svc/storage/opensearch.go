@@ -314,6 +314,15 @@ func (storage *OpenSearchStorage) ListTickets(tenant string) ([]*ticketpb.Ticket
 func (storage *OpenSearchStorage) SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
 	query := storage.buildSearchQuery(tenant, conditions)
 
+	// Default sort by created_at desc for regular search
+	query["sort"] = []map[string]interface{}{
+		{
+			"created_at": map[string]interface{}{
+				"order": "desc",
+			},
+		},
+	}
+
 	body, err := json.Marshal(query)
 	if err != nil {
 		return nil, err
@@ -376,6 +385,11 @@ func (storage *OpenSearchStorage) SearchTicketsWithProjection(tenant string, req
 		// Add system fields to projection
 		projectedFields := append([]string{"id", "tenant", "created_at", "updated_at"}, request.ProjectedFields...)
 		query["_source"] = projectedFields
+	}
+
+	// Add sorting if specified
+	if len(request.SortFields) > 0 {
+		query["sort"] = storage.buildSortQuery(request.SortFields)
 	}
 
 	body, err := json.Marshal(query)
@@ -523,6 +537,32 @@ func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []S
 		},
 		"size": 10000,
 	}
+}
+
+func (storage *OpenSearchStorage) buildSortQuery(sortFields []SortField) []map[string]interface{} {
+	var sort []map[string]interface{}
+
+	for _, sortField := range sortFields {
+		fieldPath := sortField.Field
+		// Handle nested fields
+		if !strings.HasPrefix(fieldPath, "fields.") && fieldPath != "id" && fieldPath != "tenant" &&
+			fieldPath != "created_at" && fieldPath != "updated_at" {
+			fieldPath = "fields." + fieldPath
+		}
+
+		order := "asc"
+		if sortField.Order == "desc" || sortField.Order == "descending" || sortField.Order == "DESC" {
+			order = "desc"
+		}
+
+		sort = append(sort, map[string]interface{}{
+			fieldPath: map[string]interface{}{
+				"order": order,
+			},
+		})
+	}
+
+	return sort
 }
 
 func (storage *OpenSearchStorage) ticketToDocument(ticket *ticketpb.TicketData) map[string]interface{} {

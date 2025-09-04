@@ -11,10 +11,17 @@ type SearchCondition struct {
 	Value    interface{} `json:"value"`    // value to compare against
 }
 
+// SortField represents a field to sort by with direction
+type SortField struct {
+	Field string `json:"field"` // field name to sort by
+	Order string `json:"order"` // "asc" or "desc"
+}
+
 // SearchRequest represents a search request with conditions and optional field projection
 type SearchRequest struct {
 	Conditions      []SearchCondition `json:"conditions"`                 // search conditions to apply
 	ProjectedFields []string          `json:"projected_fields,omitempty"` // fields to include in results (empty = all fields)
+	SortFields      []SortField       `json:"sort_fields,omitempty"`      // fields to sort by
 }
 
 // TicketStorage defines the interface for ticket storage operations
