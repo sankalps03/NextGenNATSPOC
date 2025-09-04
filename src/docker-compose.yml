@@ -1,0 +1,99 @@
+version: '3.9'
+
+services:
+  dynamodb-local:
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /data"
+    image: "amazon/dynamodb-local:latest"
+    container_name: dynamodb-local
+    ports:
+      - "8000:8000"
+    volumes:
+      - "./dynamodb-data:/data"
+    user: "1000:1000"
+
+  nats-server-1:
+    image: nats:2.9-alpine
+    container_name: nats-server-1
+    hostname: nats-server-1
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: >
+      -server_name n1
+      -cluster_name nats-cluster
+      -cluster nats://0.0.0.0:6222
+      -routes nats://nats-server-2:6222,nats://nats-server-3:6222
+      -js
+      -sd /data
+    volumes:
+      - "./nats-data-1:/data"
+
+  nats-server-2:
+    image: nats:2.9-alpine
+    container_name: nats-server-2
+    hostname: nats-server-2
+    ports:
+      - "4223:4222"
+      - "8223:8222"
+    command: >
+      -server_name n2
+      -cluster_name nats-cluster
+      -cluster nats://0.0.0.0:6222
+      -routes nats://nats-server-1:6222,nats://nats-server-3:6222
+      -js
+      -sd /data
+    volumes:
+      - "./nats-data-2:/data"
+
+  nats-server-3:
+    image: nats:2.9-alpine
+    container_name: nats-server-3
+    hostname: nats-server-3
+    ports:
+      - "4224:4222"
+      - "8224:8222"
+    command: >
+      -server_name n3
+      -cluster_name nats-cluster
+      -cluster nats://0.0.0.0:6222
+      -routes nats://nats-server-1:6222,nats://nats-server-2:6222
+      -js
+      -sd /data
+    volumes:
+      - "./nats-data-3:/data"
+
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: opensearch
+    environment:
+      - cluster.name=opensearch-cluster
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Mind@#$123
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - plugins.security.disabled=true        # disable security for local POC
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - opensearch-data1:/usr/share/opensearch/data
+    ports:
+      - 9200:9200
+      - 9600:9600
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: opensearch-dashboards
+    ports:
+      - 5601:5601
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch:9200
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    depends_on:
+      - opensearch
+
+# Volume definitions must be at the root level
+volumes:
+  opensearch-data1:

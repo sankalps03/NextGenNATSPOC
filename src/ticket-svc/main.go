@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	storage2 "github.com/platform/ticket-svc/storage"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	storage2 "github.com/platform/ticket-svc/storage"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
@@ -31,15 +33,18 @@ type TicketEvent struct {
 }
 
 type Config struct {
-	NATSUrl         string
-	ServiceName     string
-	LogLevel        string
-	DynamoDBTable   string
-	DynamoDBURL     string // DynamoDB endpoint URL (for local development)
-	DynamoDBAddress string // DynamoDB address (alternative to URL)
-	AWSRegion       string
-	StorageType     string // "dynamodb" or "dynamodb-dynamic"
-	StorageMode     string // "fixed" or "dynamic" (for DynamoDB schema)
+	NATSUrl           string
+	ServiceName       string
+	LogLevel          string
+	DynamoDBTable     string
+	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
+	DynamoDBAddress   string // DynamoDB address (alternative to URL)
+	AWSRegion         string
+	StorageType       string // "dynamodb" or "opensearch"
+	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
+	OpenSearchURL     string // OpenSearch endpoint URL
+	OpenSearchIndex   string // OpenSearch index name
+	InteractivePrompt bool   // Enable interactive storage selection
 }
 
 type NATSManager struct {
@@ -743,15 +748,18 @@ func containsSeverity(description string) bool {
 
 func loadConfig() *Config {
 	return &Config{
-		NATSUrl:         getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
-		ServiceName:     getEnv("SERVICE_NAME", "ticket-service"),
-		LogLevel:        getEnv("LOG_LEVEL", "info"),
-		DynamoDBTable:   getEnv("DYNAMODB_TABLE", "tickets"),
-		DynamoDBURL:     getEnv("DYNAMODB_URL", ""),
-		DynamoDBAddress: getEnv("DYNAMODB_ADDRESS", ""),
-		AWSRegion:       getEnv("AWS_REGION", "us-east-1"),
-		StorageType:     getEnv("STORAGE_TYPE", "dynamodb-dynamic"),
-		StorageMode:     getEnv("STORAGE_MODE", "dynamic"),
+		NATSUrl:           getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
+		ServiceName:       getEnv("SERVICE_NAME", "ticket-service"),
+		LogLevel:          getEnv("LOG_LEVEL", "info"),
+		DynamoDBTable:     getEnv("DYNAMODB_TABLE", "tickets"),
+		DynamoDBURL:       getEnv("DYNAMODB_URL", ""),
+		DynamoDBAddress:   getEnv("DYNAMODB_ADDRESS", ""),
+		AWSRegion:         getEnv("AWS_REGION", "us-east-1"),
+		StorageType:       getEnv("STORAGE_TYPE", ""),
+		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
+		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
+		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
+		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "true") == "true",
 	}
 }
 
@@ -760,6 +768,34 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func promptForStorageType() string {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Println("\nSelect storage backend:")
+		fmt.Println("1. DynamoDB")
+		fmt.Println("2. OpenSearch")
+		fmt.Print("Enter your choice (1 or 2): ")
+
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Error reading input: %v", err)
+			continue
+		}
+
+		choice := strings.TrimSpace(input)
+		switch choice {
+		case "1":
+			fmt.Println("Selected: DynamoDB")
+			return "dynamodb"
+		case "2":
+			fmt.Println("Selected: OpenSearch")
+			return "opensearch"
+		default:
+			fmt.Println("Invalid choice. Please enter 1 or 2.")
+		}
+	}
 }
 
 func main() {
@@ -773,13 +809,38 @@ func main() {
 
 	// Initialize storage based on configuration
 	var storage storage2.TicketStorage
+	var storageType string
 
-	dynamoStorage, err := storage2.NewDynamoDBStorage(context.Background(), config.DynamoDBTable, config.AWSRegion, config.DynamoDBURL, config.DynamoDBAddress)
-	if err != nil {
-		log.Fatalf("Failed to initialize DynamoDB dynamic storage: %v", err)
+	// Determine storage type
+	if config.StorageType == "" && config.InteractivePrompt {
+		// Interactive prompt for storage selection
+		storageType = promptForStorageType()
+	} else if config.StorageType != "" {
+		storageType = config.StorageType
+	} else {
+		// Default to DynamoDB if no selection
+		storageType = "dynamodb"
 	}
-	storage = dynamoStorage
-	log.Printf("Using DynamoDB dynamic storage (protobuf) with table: %s in region: %s", config.DynamoDBTable, config.AWSRegion)
+
+	// Initialize selected storage
+	switch storageType {
+	case "opensearch":
+		opensearchStorage, err := storage2.NewOpenSearchStorage(context.Background(), config.OpenSearchURL, config.OpenSearchIndex)
+		if err != nil {
+			log.Fatalf("Failed to initialize OpenSearch storage: %v", err)
+		}
+		storage = opensearchStorage
+		log.Printf("Using OpenSearch storage with endpoint: %s and index: %s", config.OpenSearchURL, config.OpenSearchIndex)
+	case "dynamodb":
+		dynamoStorage, err := storage2.NewDynamoDBStorage(context.Background(), config.DynamoDBTable, config.AWSRegion, config.DynamoDBURL, config.DynamoDBAddress)
+		if err != nil {
+			log.Fatalf("Failed to initialize DynamoDB storage: %v", err)
+		}
+		storage = dynamoStorage
+		log.Printf("Using DynamoDB dynamic storage (protobuf) with table: %s in region: %s", config.DynamoDBTable, config.AWSRegion)
+	default:
+		log.Fatalf("Unknown storage type: %s", storageType)
+	}
 
 	service := &TicketService{
 		natsManager: natsManager,
