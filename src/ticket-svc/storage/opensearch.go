@@ -62,7 +62,7 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 		return nil
 	}
 
-	// Create index with dynamic mapping
+	// Create index with static mapping for predefined fields and dynamic mapping for others
 	indexMapping := map[string]interface{}{
 		"mappings": map[string]interface{}{
 			"properties": map[string]interface{}{
@@ -79,8 +79,68 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 					"type": "date",
 				},
 				"fields": map[string]interface{}{
-					"type":    "object",
-					"dynamic": true,
+					"type": "object",
+					"properties": map[string]interface{}{
+						// 20 predefined static fields
+						"requesterid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"technicianid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"groupid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"statusid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"priorityid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"urgencyid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"categoryid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"companyid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"departmentid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"locationid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"createdtime": map[string]interface{}{
+							"type": "date",
+						},
+						"updatedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"lastresolvedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"lastclosedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"dueby": map[string]interface{}{
+							"type": "date",
+						},
+						"oladueby": map[string]interface{}{
+							"type": "date",
+						},
+						"ucdueby": map[string]interface{}{
+							"type": "date",
+						},
+						"lastviolationtime": map[string]interface{}{
+							"type": "date",
+						},
+						"violatedslaid": map[string]interface{}{
+							"type": "keyword",
+						},
+					},
+					"dynamic": true, // Allow dynamic fields for the remaining 100-200 fields
 				},
 			},
 		},

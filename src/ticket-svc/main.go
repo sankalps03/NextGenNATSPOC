@@ -300,7 +300,7 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 
 	// Store ticket document in KV store if using OpenSearch storage
 	if ts.kvStore != nil {
-		kvKey := fmt.Sprintf("%s:%s", req.Tenant, ticketData.Id)
+		kvKey := fmt.Sprintf("%s-%s", req.Tenant, ticketData.Id)
 
 		// Serialize the entire ticket document as JSON
 		ticketDoc, err := json.Marshal(ticketData)
