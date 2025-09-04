@@ -1454,14 +1454,14 @@ func (d *DynamoDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 }
 
 // CreateTicket stores a new ticket in the tenant-specific DynamoDB table with separate field attributes
-func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) error {
+func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	// Use longer timeout for table creation scenarios
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
 	// Ensure tenant table exists (this may take time for first-time table creation)
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
-		return fmt.Errorf("failed to ensure tenant table: %w", err)
+		return fmt.Errorf("failed to ensure tenant table: %w", err), nil
 	}
 
 	// Create a separate shorter context for the actual PutItem operation
@@ -1482,11 +1482,11 @@ func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to create ticket in tenant table %s: %w", tableName, err)
+		return fmt.Errorf("failed to create ticket in tenant table %s: %w", tableName, err), nil
 	}
 
 	log.Printf("Created ticket %s for tenant %s in table %s with separate field attributes", ticketData.Id, tenant, tableName)
-	return nil
+	return nil, nil
 }
 
 // GetTicket retrieves a ticket by tenant and ID from the tenant-specific DynamoDB table

@@ -20,6 +20,28 @@ type OpenSearchStorage struct {
 	indexName string
 }
 
+var staticFields = map[string]struct{}{
+	"requesterid":       {},
+	"technicianid":      {},
+	"groupid":           {},
+	"statusid":          {},
+	"priorityid":        {},
+	"urgencyid":         {},
+	"categoryid":        {},
+	"companyid":         {},
+	"departmentid":      {},
+	"locationid":        {},
+	"createdtime":       {},
+	"updatedtime":       {},
+	"lastresolvedtime":  {},
+	"lastclosedtime":    {},
+	"dueby":             {},
+	"oladueby":          {},
+	"ucdueby":           {},
+	"lastviolationtime": {},
+	"violatedslaid":     {},
+}
+
 func NewOpenSearchStorage(ctx context.Context, endpoint, indexName string) (*OpenSearchStorage, error) {
 	if endpoint == "" {
 		endpoint = "http://localhost:9200"
@@ -172,33 +194,33 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 	return nil
 }
 
-func (storage *OpenSearchStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) error {
-	doc := storage.ticketToDocument(ticketData)
+func (storage *OpenSearchStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
+	doc, kvDocs := storage.ticketToDocument(ticketData)
 
 	body, err := json.Marshal(doc)
 	if err != nil {
-		return err
+		return err, kvDocs
 	}
 
 	url := fmt.Sprintf("%s/%s/_doc/%s", storage.endpoint, storage.indexName, ticketData.Id)
 	req, err := http.NewRequest("PUT", url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return err, kvDocs
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := storage.client.Do(req)
 	if err != nil {
-		return err
+		return err, kvDocs
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to create ticket: %s", string(body))
+		return fmt.Errorf("failed to create ticket: %s", string(body)), kvDocs
 	}
 
-	return nil
+	return nil, kvDocs
 }
 
 func (storage *OpenSearchStorage) GetTicket(tenant, id string) (*ticketpb.TicketData, bool) {
@@ -253,7 +275,7 @@ func (storage *OpenSearchStorage) UpdateTicket(tenant string, ticketData *ticket
 		return false
 	}
 
-	doc := storage.ticketToDocument(ticketData)
+	doc, _ := storage.ticketToDocument(ticketData)
 
 	body, err := json.Marshal(doc)
 	if err != nil {
@@ -656,8 +678,8 @@ func (storage *OpenSearchStorage) buildSortQuery(sortFields []SortField) []map[s
 	return sort
 }
 
-func (storage *OpenSearchStorage) ticketToDocument(ticket *ticketpb.TicketData) map[string]interface{} {
-	doc := map[string]interface{}{
+func (storage *OpenSearchStorage) ticketToDocument(ticket *ticketpb.TicketData) (map[string]interface{}, map[string]interface{}) {
+	result := map[string]interface{}{
 		"id":         ticket.Id,
 		"tenant":     ticket.Tenant,
 		"created_at": ticket.CreatedAt,
@@ -666,12 +688,22 @@ func (storage *OpenSearchStorage) ticketToDocument(ticket *ticketpb.TicketData) 
 
 	// Convert protobuf fields to simple map
 	fields := make(map[string]interface{})
-	for key, value := range ticket.Fields {
-		fields[key] = convertFieldValueToInterface(value)
-	}
-	doc["fields"] = fields
 
-	return doc
+	kvValues := make(map[string]interface{})
+
+	for key, value := range ticket.Fields {
+
+		if _, ok := staticFields[key]; ok {
+
+			fields[key] = convertFieldValueToInterface(value)
+		} else {
+
+			kvValues[key] = convertFieldValueToInterface(value)
+		}
+	}
+	result["fields"] = fields
+
+	return result, kvValues
 }
 
 func (storage *OpenSearchStorage) documentToTicket(doc map[string]interface{}) *ticketpb.TicketData {

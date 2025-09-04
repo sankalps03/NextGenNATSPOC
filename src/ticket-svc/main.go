@@ -293,7 +293,10 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 
 	// Measure database latency
 	dbStart := time.Now()
-	if err := ts.storage.CreateTicket(req.Tenant, ticketData); err != nil {
+
+	var kvDocs map[string]interface{}
+
+	if err, kvDocs = ts.storage.CreateTicket(req.Tenant, ticketData); err != nil {
 		return nil, fmt.Errorf("failed to create ticket: %w", err)
 	}
 	dbLatency := time.Since(dbStart)
@@ -303,7 +306,7 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 		kvKey := fmt.Sprintf("%s-%s", req.Tenant, ticketData.Id)
 
 		// Serialize the entire ticket document as JSON
-		ticketDoc, err := json.Marshal(ticketData)
+		ticketDoc, err := json.Marshal(kvDocs)
 		if err != nil {
 			log.Printf("WARNING: Failed to marshal ticket for KV store: %v", err)
 		} else {
