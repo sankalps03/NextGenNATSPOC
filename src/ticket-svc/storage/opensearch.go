@@ -266,13 +266,20 @@ func (storage *OpenSearchStorage) GetTicket(tenant, id string, store jetstream.K
 		return nil, false
 	}
 
-	entires, err := store.Get(context.Background(), fmt.Sprintf("%s-%s", docTenant, id))
+	var entries jetstream.KeyValueEntry
 
-	if err == nil {
+	err = nil
+
+	if store != nil {
+
+		entries, err = store.Get(context.Background(), fmt.Sprintf("%s-%s", docTenant, id))
+	}
+
+	if err == nil && entries != nil {
 
 		var docs map[string]interface{}
 
-		json.Unmarshal(entires.Value(), &docs)
+		json.Unmarshal(entries.Value(), &docs)
 
 		for key, value := range docs {
 
@@ -403,9 +410,16 @@ func (storage *OpenSearchStorage) ListTickets(tenant string, store jetstream.Key
 			continue
 		}
 
-		entries, err := store.Get(context.Background(), fmt.Sprintf("%s-%s", source["tenant"], source["id"]))
+		var entries jetstream.KeyValueEntry
 
-		if err == nil {
+		err = nil
+
+		if store != nil {
+
+			entries, err = store.Get(context.Background(), fmt.Sprintf("%s-%s", source["tenant"], source["id"]))
+		}
+
+		if err == nil && entries != nil {
 
 			json.Unmarshal(entries.Value(), &source)
 		}

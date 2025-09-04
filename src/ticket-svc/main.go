@@ -510,7 +510,7 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 
 			entries, err := ts.kvStore.Get(context.Background(), fmt.Sprintf("%s-%s", ticket.Tenant, ticket.Id))
 
-			if err == nil {
+			if err == nil && entries != nil {
 
 				json.Unmarshal(entries.Value(), &ticketMap)
 
