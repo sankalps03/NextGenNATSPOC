@@ -3,14 +3,17 @@ package metrics
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"sync"
 	"time"
+
+	"simulator/logger"
 )
 
 // Metrics collects and reports performance metrics for the simulator
 type Metrics struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
+	logger logger.Logger
 
 	// Request counters
 	createRequests int64
@@ -100,6 +103,7 @@ type MetricsSnapshot struct {
 func New() *Metrics {
 	now := time.Now()
 	return &Metrics{
+		logger:         logger.NewLogger("metrics", "simulator"),
 		startTime:      now,
 		lastReportTime: now,
 	}
@@ -246,12 +250,12 @@ func (m *Metrics) StartReporting(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Println("Metrics reporting started")
+	m.logger.Info("Metrics reporting started")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Metrics reporting stopped")
+			m.logger.Info("Metrics reporting stopped")
 			return
 		case <-ticker.C:
 			snapshot := m.GetSnapshot()
@@ -263,17 +267,16 @@ func (m *Metrics) StartReporting(ctx context.Context, interval time.Duration) {
 // logMetrics logs the current metrics snapshot
 func (m *Metrics) logMetrics(snapshot MetricsSnapshot) {
 	// Create a summary log entry
-	log.Printf("METRICS SUMMARY - Total: %d req (%.1f/s), Success: %.1f%%, Errors: %d, Uptime: %.1fs",
+	m.logger.Info(fmt.Sprintf("METRICS SUMMARY - Total: %d req (%.1f/s), Success: %.1f%%, Errors: %d, Uptime: %.1fs",
 		snapshot.TotalRequests,
 		snapshot.TotalRate,
 		snapshot.OverallSuccessRate,
 		snapshot.TotalErrors,
-		snapshot.UptimeSeconds,
-	)
+		snapshot.UptimeSeconds))
 
 	// Log detailed metrics as JSON for structured logging
 	if jsonData, err := json.Marshal(snapshot); err == nil {
-		log.Printf("METRICS_DETAIL: %s", string(jsonData))
+		m.logger.Debug(fmt.Sprintf("METRICS_DETAIL: %s", string(jsonData)))
 	}
 }
 

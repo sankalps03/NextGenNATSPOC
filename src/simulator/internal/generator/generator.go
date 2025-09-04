@@ -14,6 +14,7 @@ import (
 	"simulator/internal/csvreader"
 	"simulator/internal/httpclient"
 	"simulator/internal/metrics"
+	"simulator/logger"
 )
 
 // Generator manages the EPS-based ticket generation and API testing
@@ -22,6 +23,7 @@ type Generator struct {
 	csvReader  *csvreader.CSVReader
 	httpClient *httpclient.HTTPClient
 	metrics    *metrics.Metrics
+	logger     logger.Logger
 
 	// Ticket ID tracking for get/update operations with tenant association
 	createdTickets map[string][]string // tenantID -> []ticketID
@@ -46,6 +48,7 @@ func New(cfg *config.Config, csvReader *csvreader.CSVReader, httpClient *httpcli
 		csvReader:        csvReader,
 		httpClient:       httpClient,
 		metrics:          metricsCollector,
+		logger:           logger.NewLogger("simulator", "simulator"),
 		createdTickets:   make(map[string][]string),
 		searchableValues: make(map[string]map[string][]string),
 		rand:             rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -54,7 +57,7 @@ func New(cfg *config.Config, csvReader *csvreader.CSVReader, httpClient *httpcli
 
 // Start begins the EPS-based generation process
 func (g *Generator) Start(ctx context.Context) error {
-	log.Println("Starting ticket generator...")
+	g.logger.Info("Starting ticket generator...")
 
 	var wg sync.WaitGroup
 
@@ -94,17 +97,17 @@ func (g *Generator) Start(ctx context.Context) error {
 		}()
 	}
 
-	log.Printf("Generator started with EPS rates - Create: %.2f, Search: %.2f, Get: %.2f, Update: %.2f",
-		g.config.EPS.Create, g.config.EPS.Search, g.config.EPS.Get, g.config.EPS.Update)
+	g.logger.Info(fmt.Sprintf("Generator started with EPS rates - Create: %.2f, Search: %.2f, Get: %.2f, Update: %.2f",
+		g.config.EPS.Create, g.config.EPS.Search, g.config.EPS.Get, g.config.EPS.Update))
 
 	wg.Wait()
-	log.Println("All generators stopped")
+	g.logger.Info("All generators stopped")
 	return nil
 }
 
 // runCreateGenerator runs the ticket creation generator
 func (g *Generator) runCreateGenerator(ctx context.Context) {
-	log.Printf("Starting create generator with EPS: %.2f", g.config.EPS.Create)
+	g.logger.Info(fmt.Sprintf("Starting create generator with EPS: %.2f", g.config.EPS.Create))
 
 	interval := time.Duration(float64(time.Second) / g.config.EPS.Create)
 	ticker := time.NewTicker(interval)
@@ -123,7 +126,7 @@ func (g *Generator) runCreateGenerator(ctx context.Context) {
 
 // runSearchGenerator runs the search generator
 func (g *Generator) runSearchGenerator(ctx context.Context) {
-	log.Printf("Starting search generator with EPS: %.2f", g.config.EPS.Search)
+	g.logger.Info(fmt.Sprintf("Starting search generator with EPS: %.2f", g.config.EPS.Search))
 
 	interval := time.Duration(float64(time.Second) / g.config.EPS.Search)
 	ticker := time.NewTicker(interval)
@@ -142,7 +145,7 @@ func (g *Generator) runSearchGenerator(ctx context.Context) {
 
 // runGetGenerator runs the get ticket generator
 func (g *Generator) runGetGenerator(ctx context.Context) {
-	log.Printf("Starting get generator with EPS: %.2f", g.config.EPS.Get)
+	g.logger.Info(fmt.Sprintf("Starting get generator with EPS: %.2f", g.config.EPS.Get))
 
 	interval := time.Duration(float64(time.Second) / g.config.EPS.Get)
 	ticker := time.NewTicker(interval)
@@ -161,7 +164,7 @@ func (g *Generator) runGetGenerator(ctx context.Context) {
 
 // runUpdateGenerator runs the update ticket generator
 func (g *Generator) runUpdateGenerator(ctx context.Context) {
-	log.Printf("Starting update generator with EPS: %.2f", g.config.EPS.Update)
+	g.logger.Info(fmt.Sprintf("Starting update generator with EPS: %.2f", g.config.EPS.Update))
 
 	interval := time.Duration(float64(time.Second) / g.config.EPS.Update)
 	ticker := time.NewTicker(interval)
@@ -185,7 +188,7 @@ func (g *Generator) createTicket(ctx context.Context) {
 	// Get random ticket data from CSV
 	ticketData, err := g.csvReader.GetRandomTicket()
 	if err != nil {
-		log.Printf("ERROR: Failed to get random ticket data: %v", err)
+		g.logger.Error(fmt.Sprintf("Failed to get random ticket data: %v", err))
 		g.metrics.RecordCreateRequest(time.Since(startTime), false)
 		return
 	}
@@ -201,12 +204,12 @@ func (g *Generator) createTicket(ctx context.Context) {
 	g.metrics.RecordCreateRequest(duration, success)
 
 	if err != nil {
-		log.Printf("ERROR: Create ticket failed: %v", err)
+		g.logger.Error(fmt.Sprintf("Create ticket failed: %v", err))
 		return
 	}
 
 	if !success {
-		log.Printf("ERROR: Create ticket failed with status %d: %s", response.StatusCode, response.Error)
+		g.logger.Error(fmt.Sprintf("Create ticket failed with status %d: %s", response.StatusCode, response.Error))
 		return
 	}
 
@@ -219,12 +222,12 @@ func (g *Generator) createTicket(ctx context.Context) {
 
 		// Extract database latency from response
 		dbLatency := g.extractDatabaseLatency(response.Body)
-		log.Printf("SUCCESS: Created ticket %s for tenant %s (total: %.2fms, db: %.2fms)",
-			ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
+		g.logger.Info(fmt.Sprintf("Created ticket %s for tenant %s (total: %.2fms, db: %.2fms)",
+			ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency))
 	} else {
 		dbLatency := g.extractDatabaseLatency(response.Body)
-		log.Printf("SUCCESS: Created ticket for tenant %s (total: %.2fms, db: %.2fms) - ID not found in response",
-			tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
+		g.logger.Info(fmt.Sprintf("Created ticket for tenant %s (total: %.2fms, db: %.2fms) - ID not found in response",
+			tenantID, float64(duration.Nanoseconds())/1000000, dbLatency))
 	}
 }
 
@@ -252,12 +255,12 @@ func (g *Generator) searchTickets(ctx context.Context) {
 	g.metrics.RecordSearchRequest(duration, success)
 
 	if err != nil {
-		log.Printf("ERROR: Search tickets failed: %v", err)
+		g.logger.Error(fmt.Sprintf("Search tickets failed: %v", err))
 		return
 	}
 
 	if !success {
-		log.Printf("ERROR: Search tickets failed with status %d: %s", response.StatusCode, response.Error)
+		g.logger.Error(fmt.Sprintf("Search tickets failed with status %d: %s", response.StatusCode, response.Error))
 		return
 	}
 
@@ -266,11 +269,11 @@ func (g *Generator) searchTickets(ctx context.Context) {
 	dbLatency := g.extractDatabaseLatency(response.Body)
 
 	if tenantID != "" {
-		log.Printf("SUCCESS: Search completed for tenant %s (total: %.2fms, db: %.2fms) - %d results",
-			tenantID, float64(duration.Nanoseconds())/1000000, dbLatency, resultCount)
+		g.logger.Info(fmt.Sprintf("Search completed for tenant %s (total: %.2fms, db: %.2fms) - %d results",
+			tenantID, float64(duration.Nanoseconds())/1000000, dbLatency, resultCount))
 	} else {
-		log.Printf("SUCCESS: Search completed (total: %.2fms, db: %.2fms) - %d results",
-			float64(duration.Nanoseconds())/1000000, dbLatency, resultCount)
+		g.logger.Info(fmt.Sprintf("Search completed (total: %.2fms, db: %.2fms) - %d results",
+			float64(duration.Nanoseconds())/1000000, dbLatency, resultCount))
 	}
 }
 
@@ -281,7 +284,7 @@ func (g *Generator) getTicket(ctx context.Context) {
 	// Get ticket ID and tenant to retrieve
 	ticketID, tenantID := g.getRandomTicketID()
 	if ticketID == "" {
-		log.Printf("WARNING: No ticket IDs available for get operation")
+		g.logger.Warn("No ticket IDs available for get operation")
 		g.metrics.RecordGetRequest(time.Since(startTime), false)
 		return
 	}
@@ -294,19 +297,19 @@ func (g *Generator) getTicket(ctx context.Context) {
 	g.metrics.RecordGetRequest(duration, success)
 
 	if err != nil {
-		log.Printf("ERROR: Get ticket %s from tenant %s failed: %v", ticketID, tenantID, err)
+		g.logger.Error(fmt.Sprintf("Get ticket %s from tenant %s failed: %v", ticketID, tenantID, err))
 		return
 	}
 
 	if !success {
-		log.Printf("ERROR: Get ticket %s from tenant %s failed with status %d: %s", ticketID, tenantID, response.StatusCode, response.Error)
+		g.logger.Error(fmt.Sprintf("Get ticket %s from tenant %s failed with status %d: %s", ticketID, tenantID, response.StatusCode, response.Error))
 		return
 	}
 
 	// Extract database latency from response
 	dbLatency := g.extractDatabaseLatency(response.Body)
-	log.Printf("SUCCESS: Retrieved ticket %s from tenant %s (total: %.2fms, db: %.2fms)",
-		ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
+	g.logger.Info(fmt.Sprintf("Retrieved ticket %s from tenant %s (total: %.2fms, db: %.2fms)",
+		ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency))
 }
 
 // updateTicket updates a specific ticket
@@ -316,7 +319,7 @@ func (g *Generator) updateTicket(ctx context.Context) {
 	// Get ticket ID and tenant to update
 	ticketID, tenantID := g.getRandomTicketID()
 	if ticketID == "" {
-		log.Printf("WARNING: No ticket IDs available for update operation")
+		g.logger.Warn("No ticket IDs available for update operation")
 		g.metrics.RecordUpdateRequest(time.Since(startTime), false)
 		return
 	}
@@ -332,19 +335,19 @@ func (g *Generator) updateTicket(ctx context.Context) {
 	g.metrics.RecordUpdateRequest(duration, success)
 
 	if err != nil {
-		log.Printf("ERROR: Update ticket %s in tenant %s failed: %v", ticketID, tenantID, err)
+		g.logger.Error(fmt.Sprintf("Update ticket %s in tenant %s failed: %v", ticketID, tenantID, err))
 		return
 	}
 
 	if !success {
-		log.Printf("ERROR: Update ticket %s in tenant %s failed with status %d: %s", ticketID, tenantID, response.StatusCode, response.Error)
+		g.logger.Error(fmt.Sprintf("Update ticket %s in tenant %s failed with status %d: %s", ticketID, tenantID, response.StatusCode, response.Error))
 		return
 	}
 
 	// Extract database latency from response
 	dbLatency := g.extractDatabaseLatency(response.Body)
-	log.Printf("SUCCESS: Updated ticket %s in tenant %s (total: %.2fms, db: %.2fms)",
-		ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
+	g.logger.Info(fmt.Sprintf("Updated ticket %s in tenant %s (total: %.2fms, db: %.2fms)",
+		ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency))
 }
 
 // Helper methods
@@ -495,8 +498,8 @@ func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchConditi
 	availableFields := g.getAvailableSearchableFields(businessCriticalFields)
 
 	if len(availableFields) == 0 {
-		log.Printf("WARNING: No searchable values available for the 19 supported GSI fields. Need to create tickets first.")
-		log.Printf("Supported GSI fields: %v", businessCriticalFields)
+		g.logger.Warn("No searchable values available for the 19 supported GSI fields. Need to create tickets first.")
+		g.logger.Debug(fmt.Sprintf("Supported GSI fields: %v", businessCriticalFields))
 		return []httpclient.SearchCondition{}, ""
 	}
 
@@ -934,11 +937,11 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 	if fieldsWrapper, ok := ticketData["fields"].(map[string]interface{}); ok {
 		// Data is wrapped in "fields" object
 		fields = fieldsWrapper
-		log.Printf("DEBUG: Using wrapped fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields))
+		g.logger.Debug(fmt.Sprintf("Using wrapped fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields)))
 	} else {
 		// Data is directly at top level (CSV format)
 		fields = ticketData
-		log.Printf("DEBUG: Using direct fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields))
+		g.logger.Debug(fmt.Sprintf("Using direct fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields)))
 	}
 
 	// Collect values for each searchable field (only the 19 supported fields)
@@ -992,8 +995,8 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 
 	// Log collection summary
 	if collectedCount > 0 {
-		log.Printf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only 19 GSI fields supported)",
-			tenantID, collectedCount, skippedCount)
+		g.logger.Debug(fmt.Sprintf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only 19 GSI fields supported)",
+			tenantID, collectedCount, skippedCount))
 	}
 }
 
@@ -1102,7 +1105,7 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 	for _, field := range businessFields {
 		// Only consider fields that are in the supported list
 		if !supportedFields[field] {
-			log.Printf("WARNING: Field '%s' is not in the 19 supported GSI fields, skipping", field)
+			g.logger.Warn(fmt.Sprintf("Field '%s' is not in the 19 supported GSI fields, skipping", field))
 			continue
 		}
 
@@ -1121,7 +1124,7 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 		}
 	}
 
-	log.Printf("Available searchable fields: %v (filtered to 19 supported GSI fields)", availableFields)
+	g.logger.Debug(fmt.Sprintf("Available searchable fields: %v (filtered to 19 supported GSI fields)", availableFields))
 	return availableFields
 }
 
@@ -1129,7 +1132,7 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 func (g *Generator) generateConditionFromCollectedValues(field string) (*httpclient.SearchCondition, string) {
 	// Validate that the field is in the 19 supported GSI fields
 	if !g.isSupportedSearchField(field) {
-		log.Printf("WARNING: Attempted to generate condition for unsupported field '%s', skipping", field)
+		g.logger.Warn(fmt.Sprintf("Attempted to generate condition for unsupported field '%s', skipping", field))
 		return nil, ""
 	}
 
@@ -1155,8 +1158,8 @@ func (g *Generator) generateConditionFromCollectedValues(field string) (*httpcli
 	// Determine operator based on field type and value
 	operator := g.selectOperatorForValue(cleanedValue)
 
-	log.Printf("Generated search condition: field=%s, operator=%s, value=%v, tenant=%s",
-		field, operator, cleanedValue, tenantID)
+	g.logger.Debug(fmt.Sprintf("Generated search condition: field=%s, operator=%s, value=%v, tenant=%s",
+		field, operator, cleanedValue, tenantID))
 
 	return &httpclient.SearchCondition{
 		Field:    field,

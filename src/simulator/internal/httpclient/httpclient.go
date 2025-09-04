@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net/http"
+	"simulator/logger"
 	"time"
 
 	"simulator/internal/config"
@@ -21,6 +21,7 @@ type HTTPClient struct {
 	baseURL   string
 	tenantIDs []string
 	rand      *rand.Rand
+	logger    logger.Logger
 }
 
 // APIResponse represents a generic API response
@@ -63,6 +64,7 @@ func New(cfg config.HTTPClientConfig) *HTTPClient {
 		client: client,
 		config: cfg,
 		rand:   rand.New(rand.NewSource(time.Now().UnixNano())),
+		logger: logger.NewLogger("httpclient", "simulator"),
 	}
 }
 
@@ -162,7 +164,7 @@ func (c *HTTPClient) ListTickets(ctx context.Context) (*APIResponse, error) {
 	return c.makeRequest(ctx, "GET", url, nil)
 }
 
-// makeJSONRequest makes an HTTP request with JSON payload
+// makeJSONRequest makes an HTTP request with JSON payloadg.logger.
 func (c *HTTPClient) makeJSONRequest(ctx context.Context, method, url string, payload interface{}) (*APIResponse, error) {
 	var body io.Reader
 
@@ -211,7 +213,7 @@ func (c *HTTPClient) makeRequestWithTenant(ctx context.Context, method, url stri
 		}
 
 		lastErr = err
-		log.Printf("Request attempt %d failed: %v", attempt+1, err)
+		c.logger.Warn(fmt.Sprintf("Request attempt %d failed: %v", attempt+1, err))
 	}
 
 	return nil, lastErr
@@ -291,7 +293,7 @@ func (c *HTTPClient) makeRequest(ctx context.Context, method, url string, body i
 				return nil, ctx.Err()
 			case <-time.After(c.config.RetryDelay):
 			}
-			log.Printf("Retrying request (attempt %d/%d): %s %s", attempt+1, c.config.RetryAttempts+1, method, url)
+			c.logger.Info(fmt.Sprintf("Retrying request (attempt %d/%d): %s %s", attempt+1, c.config.RetryAttempts+1, method, url))
 		}
 
 		response, err := c.doRequest(ctx, method, url, body)
