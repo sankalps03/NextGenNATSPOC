@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -216,9 +217,14 @@ func (g *Generator) createTicket(ctx context.Context) {
 		// Collect searchable field values for future search operations
 		g.collectSearchableValues(tenantID, processedData)
 
-		log.Printf("SUCCESS: Created ticket %s for tenant %s (%.2fms)", ticketID, tenantID, float64(duration.Nanoseconds())/1000000)
+		// Extract database latency from response
+		dbLatency := g.extractDatabaseLatency(response.Body)
+		log.Printf("SUCCESS: Created ticket %s for tenant %s (total: %.2fms, db: %.2fms)",
+			ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
 	} else {
-		log.Printf("SUCCESS: Created ticket for tenant %s (%.2fms) - ID not found in response", tenantID, float64(duration.Nanoseconds())/1000000)
+		dbLatency := g.extractDatabaseLatency(response.Body)
+		log.Printf("SUCCESS: Created ticket for tenant %s (total: %.2fms, db: %.2fms) - ID not found in response",
+			tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
 	}
 }
 
@@ -255,12 +261,16 @@ func (g *Generator) searchTickets(ctx context.Context) {
 		return
 	}
 
-	// Count results
+	// Count results and extract database latency
 	resultCount := g.countSearchResults(response.Body)
+	dbLatency := g.extractDatabaseLatency(response.Body)
+
 	if tenantID != "" {
-		log.Printf("SUCCESS: Search completed for tenant %s (%.2fms) - %d results", tenantID, float64(duration.Nanoseconds())/1000000, resultCount)
+		log.Printf("SUCCESS: Search completed for tenant %s (total: %.2fms, db: %.2fms) - %d results",
+			tenantID, float64(duration.Nanoseconds())/1000000, dbLatency, resultCount)
 	} else {
-		log.Printf("SUCCESS: Search completed (%.2fms) - %d results", float64(duration.Nanoseconds())/1000000, resultCount)
+		log.Printf("SUCCESS: Search completed (total: %.2fms, db: %.2fms) - %d results",
+			float64(duration.Nanoseconds())/1000000, dbLatency, resultCount)
 	}
 }
 
@@ -293,7 +303,10 @@ func (g *Generator) getTicket(ctx context.Context) {
 		return
 	}
 
-	log.Printf("SUCCESS: Retrieved ticket %s from tenant %s (%.2fms)", ticketID, tenantID, float64(duration.Nanoseconds())/1000000)
+	// Extract database latency from response
+	dbLatency := g.extractDatabaseLatency(response.Body)
+	log.Printf("SUCCESS: Retrieved ticket %s from tenant %s (total: %.2fms, db: %.2fms)",
+		ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
 }
 
 // updateTicket updates a specific ticket
@@ -328,7 +341,10 @@ func (g *Generator) updateTicket(ctx context.Context) {
 		return
 	}
 
-	log.Printf("SUCCESS: Updated ticket %s in tenant %s (%.2fms)", ticketID, tenantID, float64(duration.Nanoseconds())/1000000)
+	// Extract database latency from response
+	dbLatency := g.extractDatabaseLatency(response.Body)
+	log.Printf("SUCCESS: Updated ticket %s in tenant %s (total: %.2fms, db: %.2fms)",
+		ticketID, tenantID, float64(duration.Nanoseconds())/1000000, dbLatency)
 }
 
 // Helper methods
@@ -861,6 +877,29 @@ func (g *Generator) generateRandomProjectionFields() []string {
 	}
 
 	return projectedFields
+}
+
+// extractDatabaseLatency extracts the database_latency_ms from API response
+func (g *Generator) extractDatabaseLatency(responseBody map[string]interface{}) float64 {
+	if responseBody == nil {
+		return 0
+	}
+
+	// Try to extract database_latency_ms from response
+	if latency, exists := responseBody["database_latency_ms"]; exists {
+		switch v := latency.(type) {
+		case float64:
+			return v
+		case int:
+			return float64(v)
+		case string:
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				return parsed
+			}
+		}
+	}
+
+	return 0
 }
 
 // getMapKeys returns the keys of a map[string]interface{} as a slice of strings
