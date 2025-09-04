@@ -851,7 +851,7 @@ func main() {
 		storage = opensearchStorage
 
 		// Create KV store bucket for OpenSearch storage only
-		if err = createKVBucket(natsManager, "ticket.kv"); err != nil {
+		if err = createKVBucket(natsManager, "ticket_kv"); err != nil {
 			log.Fatalf("Failed to create KV bucket for OpenSearch storage: %v", err)
 
 			return
