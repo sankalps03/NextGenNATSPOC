@@ -299,6 +299,7 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	var searchRequest struct {
 		Conditions      []map[string]interface{} `json:"conditions"`
 		ProjectedFields []string                 `json:"projected_fields,omitempty"`
+		SortFields      []map[string]interface{} `json:"sort_fields,omitempty"` // fields to sort by
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&searchRequest); err != nil {
@@ -330,6 +331,7 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 		"data": map[string]interface{}{
 			"conditions":       searchRequest.Conditions,
 			"projected_fields": searchRequest.ProjectedFields,
+			"sort_fields":      searchRequest.SortFields,
 		},
 	}
 

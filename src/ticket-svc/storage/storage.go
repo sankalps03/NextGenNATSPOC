@@ -31,7 +31,7 @@ type TicketStorage interface {
 	UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool
 	DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool)
 	ListTickets(tenant string) ([]*ticketpb.TicketData, error)
-	SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error)
+	SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error)
 	SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error)
 	Close() error
 }

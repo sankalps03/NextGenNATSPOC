@@ -1091,10 +1091,11 @@ func (d *DynamoDBStorage) listTicketsWithProjection(ctx context.Context, tableNa
 
 // SearchTickets searches for tickets based on conditions with operand, operator, and value
 // Uses GSI optimization when available, falls back to scan when necessary
-func (d *DynamoDBStorage) SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+func (d *DynamoDBStorage) SearchTickets(tenant string, searchRequest SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	conditions := searchRequest.Conditions
 	// Ensure tenant table exists
 	if err := d.ensureTenantTable(ctx, tenant); err != nil {
 		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)

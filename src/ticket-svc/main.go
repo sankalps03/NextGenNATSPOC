@@ -496,7 +496,7 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 		log.Printf("Using projection-aware search with %d projected fields", len(searchRequest.ProjectedFields))
 	} else {
 		// Fallback to original search for backward compatibility
-		tickets, err = ts.storage.SearchTickets(req.Tenant, searchRequest.Conditions)
+		tickets, err = ts.storage.SearchTickets(req.Tenant, searchRequest)
 		log.Printf("Using standard search (no projection)")
 	}
 	dbLatency := time.Since(dbStart)

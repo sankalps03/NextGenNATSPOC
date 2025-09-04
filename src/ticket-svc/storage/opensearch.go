@@ -311,16 +311,25 @@ func (storage *OpenSearchStorage) ListTickets(tenant string) ([]*ticketpb.Ticket
 	return tickets, nil
 }
 
-func (storage *OpenSearchStorage) SearchTickets(tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
+func (storage *OpenSearchStorage) SearchTickets(tenant string, searchRequest SearchRequest) ([]*ticketpb.TicketData, error) {
+
+	conditions := searchRequest.Conditions
+
 	query := storage.buildSearchQuery(tenant, conditions)
 
-	// Default sort by created_at desc for regular search
-	query["sort"] = []map[string]interface{}{
-		{
-			"created_at": map[string]interface{}{
-				"order": "desc",
+	// Add sorting if specified
+	if len(searchRequest.SortFields) > 0 {
+		query["sort"] = storage.buildSortQuery(searchRequest.SortFields)
+	} else {
+
+		// Default sort by created_at desc for regular search
+		query["sort"] = []map[string]interface{}{
+			{
+				"created_at": map[string]interface{}{
+					"order": "desc",
+				},
 			},
-		},
+		}
 	}
 
 	body, err := json.Marshal(query)
@@ -390,6 +399,16 @@ func (storage *OpenSearchStorage) SearchTicketsWithProjection(tenant string, req
 	// Add sorting if specified
 	if len(request.SortFields) > 0 {
 		query["sort"] = storage.buildSortQuery(request.SortFields)
+	} else {
+
+		// Default sort by created_at desc for regular search
+		query["sort"] = []map[string]interface{}{
+			{
+				"created_at": map[string]interface{}{
+					"order": "desc",
+				},
+			},
+		}
 	}
 
 	body, err := json.Marshal(query)
