@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
 )
 
@@ -223,7 +224,7 @@ func (storage *OpenSearchStorage) CreateTicket(tenant string, ticketData *ticket
 	return nil, kvDocs
 }
 
-func (storage *OpenSearchStorage) GetTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+func (storage *OpenSearchStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	url := fmt.Sprintf("%s/%s/_doc/%s", storage.endpoint, storage.indexName, id)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -265,12 +266,26 @@ func (storage *OpenSearchStorage) GetTicket(tenant, id string) (*ticketpb.Ticket
 		return nil, false
 	}
 
+	entires, err := store.Get(context.Background(), fmt.Sprintf("%s-%s", docTenant, id))
+
+	if err == nil {
+
+		var docs map[string]interface{}
+
+		json.Unmarshal(entires.Value(), &docs)
+
+		for key, value := range docs {
+
+			source[key] = value
+		}
+	}
+
 	return storage.documentToTicket(source), true
 }
 
 func (storage *OpenSearchStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
 	// Verify ticket exists and belongs to tenant
-	existing, found := storage.GetTicket(tenant, ticketData.Id)
+	existing, found := storage.GetTicket(tenant, ticketData.Id, nil)
 	if !found || existing.Tenant != tenant {
 		return false
 	}
@@ -303,7 +318,7 @@ func (storage *OpenSearchStorage) UpdateTicket(tenant string, ticketData *ticket
 
 func (storage *OpenSearchStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
 	// Get ticket first to return it
-	ticket, found := storage.GetTicket(tenant, id)
+	ticket, found := storage.GetTicket(tenant, id, nil)
 	if !found {
 		return nil, false
 	}
@@ -329,7 +344,7 @@ func (storage *OpenSearchStorage) DeleteTicket(tenant, id string) (*ticketpb.Tic
 	return ticket, true
 }
 
-func (storage *OpenSearchStorage) ListTickets(tenant string) ([]*ticketpb.TicketData, error) {
+func (storage *OpenSearchStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	query := map[string]interface{}{
 		"query": map[string]interface{}{
 			"term": map[string]interface{}{
@@ -386,6 +401,13 @@ func (storage *OpenSearchStorage) ListTickets(tenant string) ([]*ticketpb.Ticket
 		source, ok := hitMap["_source"].(map[string]interface{})
 		if !ok {
 			continue
+		}
+
+		entries, err := store.Get(context.Background(), fmt.Sprintf("%s-%s", source["tenant"], source["id"]))
+
+		if err == nil {
+
+			json.Unmarshal(entries.Value(), &source)
 		}
 		tickets = append(tickets, storage.documentToTicket(source))
 	}
@@ -696,10 +718,9 @@ func (storage *OpenSearchStorage) ticketToDocument(ticket *ticketpb.TicketData) 
 		if _, ok := staticFields[key]; ok {
 
 			fields[key] = convertFieldValueToInterface(value)
-		} else {
-
-			kvValues[key] = convertFieldValueToInterface(value)
 		}
+
+		kvValues[key] = convertFieldValueToInterface(value)
 	}
 	result["fields"] = fields
 
@@ -730,6 +751,13 @@ func (storage *OpenSearchStorage) documentToTicket(doc map[string]interface{}) *
 			if fieldValue, err := convertToFieldValue(value); err == nil {
 				ticket.Fields[key] = fieldValue
 			}
+		}
+	}
+
+	for key, value := range doc {
+
+		if fieldValue, err := convertToFieldValue(value); err == nil {
+			ticket.Fields[key] = fieldValue
 		}
 	}
 

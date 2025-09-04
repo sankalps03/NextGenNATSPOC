@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/nats-io/nats.go/jetstream"
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
 )
 
@@ -1490,7 +1491,7 @@ func (d *DynamoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 }
 
 // GetTicket retrieves a ticket by tenant and ID from the tenant-specific DynamoDB table
-func (d *DynamoDBStorage) GetTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+func (d *DynamoDBStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	// Use longer timeout for table creation scenarios
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
@@ -1573,7 +1574,7 @@ func (d *DynamoDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData,
 	defer cancel()
 
 	// First get the ticket to return it
-	ticketData, found := d.GetTicket(tenant, id)
+	ticketData, found := d.GetTicket(tenant, id, nil)
 	if !found {
 		return nil, false
 	}
@@ -1600,7 +1601,7 @@ func (d *DynamoDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData,
 }
 
 // ListTickets retrieves all tickets for a tenant from the tenant-specific DynamoDB table
-func (d *DynamoDBStorage) ListTickets(tenant string) ([]*ticketpb.TicketData, error) {
+func (d *DynamoDBStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -1725,7 +1726,7 @@ func (d *DynamoDBStorage) SearchTicketsWithProjection(tenant string, request Sea
 func (d *DynamoDBStorage) executeOptimizedSearch(ctx context.Context, tableName, tenant string, conditions []SearchCondition) ([]*ticketpb.TicketData, error) {
 	if len(conditions) == 0 {
 		// No conditions, return all tickets
-		return d.ListTickets(tenant)
+		return d.ListTickets(tenant, nil)
 	}
 
 	// Separate conditions into GSI-supported and non-GSI-supported

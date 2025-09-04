@@ -169,6 +169,25 @@ func convertFieldValueToInterface(fieldValue *ticketpb.FieldValue) interface{} {
 	}
 }
 
+// ticketToJSON converts a protobuf TicketData to a JSON-friendly map
+func ticketToJSON(ticket *ticketpb.TicketData) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":         ticket.Id,
+		"tenant":     ticket.Tenant,
+		"created_at": ticket.CreatedAt,
+		"updated_at": ticket.UpdatedAt,
+	}
+
+	// Convert protobuf fields to simple JSON values
+	for fieldName, fieldValue := range ticket.Fields {
+		result[fieldName] = convertFieldValueToInterface(fieldValue)
+	}
+
+	delete(result, "fields")
+
+	return result
+}
+
 // fieldsEqual compares two FieldValue instances for equality
 func fieldsEqual(a, b *ticketpb.FieldValue) bool {
 	if a == nil && b == nil {
@@ -319,7 +338,7 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 	}
 
 	return ResponseWithLatency{
-		Data:            ticketData,
+		Data:            ticketToJSON(ticketData),
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
 	}, nil
 }
@@ -327,16 +346,22 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, error) {
 	// Measure database latency
 	dbStart := time.Now()
-	tickets, err := ts.storage.ListTickets(req.Tenant)
+	tickets, err := ts.storage.ListTickets(req.Tenant, ts.kvStore)
 	dbLatency := time.Since(dbStart)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tickets: %w", err)
 	}
 
+	// Convert protobuf tickets to JSON
+	var jsonTickets []map[string]interface{}
+	for _, ticket := range tickets {
+		jsonTickets = append(jsonTickets, ticketToJSON(ticket))
+	}
+
 	return ResponseWithLatency{
 		Data: map[string]interface{}{
-			"tickets": tickets,
+			"tickets": jsonTickets,
 			"tenant":  req.Tenant,
 		},
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
@@ -346,7 +371,7 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error) {
 	// Measure database latency
 	dbStart := time.Now()
-	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID)
+	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID, ts.kvStore)
 	dbLatency := time.Since(dbStart)
 
 	if !found {
@@ -354,7 +379,7 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 	}
 
 	return ResponseWithLatency{
-		Data:            ticketData,
+		Data:            ticketToJSON(ticketData),
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
 	}, nil
 }
@@ -362,7 +387,7 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, error) {
 	// Measure database latency for get operation
 	dbStart := time.Now()
-	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID)
+	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID, ts.kvStore)
 	getLatency := time.Since(dbStart)
 
 	if !found {
@@ -413,7 +438,7 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 	totalDbLatency := getLatency + updateLatency
 
 	return ResponseWithLatency{
-		Data:            ticketData,
+		Data:            ticketToJSON(ticketData),
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(totalDbLatency.Nanoseconds())/1000000),
 	}, nil
 }
@@ -481,6 +506,17 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 			ticketMap[fieldName] = convertFieldValueToInterface(fieldValue)
 		}
 
+		entries, err := ts.kvStore.Get(context.Background(), fmt.Sprintf("%s-%s", ticket.Tenant, ticket.Id))
+
+		if err == nil {
+
+			json.Unmarshal(entries.Value(), &ticketMap)
+
+			for key, value := range ticketMap {
+
+				ticketMap[key] = value
+			}
+		}
 		responseTickets = append(responseTickets, ticketMap)
 	}
 
