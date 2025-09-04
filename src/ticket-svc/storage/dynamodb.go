@@ -167,7 +167,7 @@ func protobufToDynamoDBItem(ticketData *ticketpb.TicketData) map[string]types.At
 
 // isGSIKeyField checks if a field is used as a GSI key and should be stored as string
 func isGSIKeyField(fieldName string) bool {
-	// Define the 19 business-critical fields that have GSI indexes (must match generateBusinessGSIDefinitions)
+	// Define the 19 business-critical fields that have GSI indexes (must match generateBusinessGSIDefinitions and CSV structure)
 	gsiKeyFields := map[string]bool{
 		"requesterid":       true, // High - Many unique users → frequent search filter
 		"technicianid":      true, // High - For assignment filtering and reporting
@@ -1162,7 +1162,7 @@ func (d *DynamoDBStorage) ensureTenantTable(ctx context.Context, tenantID string
 
 // validateSearchFields validates that all search conditions use only supported business-critical fields
 func (d *DynamoDBStorage) validateSearchFields(conditions []SearchCondition) error {
-	// Define exactly the same 19 business-critical fields that have GSI indexes
+	// Define exactly the same 19 business-critical fields that have GSI indexes (matching CSV structure)
 	supportedFields := map[string]bool{
 		"requesterid":       true, // High - Many unique users → frequent search filter
 		"technicianid":      true, // High - For assignment filtering and reporting
@@ -1186,7 +1186,14 @@ func (d *DynamoDBStorage) validateSearchFields(conditions []SearchCondition) err
 	}
 
 	// Check each condition
-	for _, condition := range conditions {
+	for i, condition := range conditions {
+		// Check for empty field name
+		if condition.Operand == "" {
+			return fmt.Errorf("search condition %d has empty field name. All conditions must specify a valid field name. Supported fields: %v",
+				i+1, d.getSupportedFieldsList())
+		}
+
+		// Check if field is supported
 		if !supportedFields[condition.Operand] {
 			return fmt.Errorf("field '%s' is not supported for searching. Supported fields: %v",
 				condition.Operand, d.getSupportedFieldsList())
@@ -1196,7 +1203,7 @@ func (d *DynamoDBStorage) validateSearchFields(conditions []SearchCondition) err
 	return nil
 }
 
-// getSupportedFieldsList returns a sorted list of supported business-critical search fields
+// getSupportedFieldsList returns a sorted list of supported business-critical search fields (matching CSV structure)
 func (d *DynamoDBStorage) getSupportedFieldsList() []string {
 	return []string{
 		"categoryid", "companyid", "createdtime", "departmentid", "dueby",
@@ -1216,7 +1223,7 @@ func (d *DynamoDBStorage) initializeTenantGSIConfig(tenantID string) {
 		d.gsiConfig[tenantID] = make(map[string]GSIConfig)
 	}
 
-	// Define exactly the same 19 business-critical fields that are created with the table
+	// Define exactly the same 19 business-critical fields that are created with the table (matching CSV structure)
 	businessFields := map[string]bool{
 		"requesterid":       true, // High - Many unique users → frequent search filter
 		"technicianid":      true, // High - For assignment filtering and reporting
@@ -1260,7 +1267,7 @@ func (d *DynamoDBStorage) initializeTenantGSIConfig(tenantID string) {
 
 // generateBusinessGSIDefinitions creates attribute definitions and GSI indexes for business-critical searchable fields
 func (d *DynamoDBStorage) generateBusinessGSIDefinitions() ([]types.AttributeDefinition, []types.GlobalSecondaryIndex) {
-	// Define exactly 19 business-critical fields for GSI creation based on actual usage patterns
+	// Define exactly 19 business-critical fields for GSI creation based on actual CSV data structure
 	// These are the ONLY fields that will support efficient searching
 	businessFields := []string{
 		"requesterid",       // High - Many unique users → frequent search filter
@@ -2140,7 +2147,18 @@ func (d *DynamoDBStorage) buildFilterExpression(conditions []SearchCondition) (s
 		expressionAttributeNames[nameKey] = attributeName
 
 		// Convert value to appropriate DynamoDB attribute value
-		attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+		// For GSI fields, use string conversion to match GSI key types
+		var attributeValue types.AttributeValue
+		var err error
+
+		if isGSIKeyField(condition.Operand) {
+			// GSI fields are stored as strings, so use string conversion
+			attributeValue, err = d.convertValueToGSIAttribute(condition.Value)
+		} else {
+			// Non-GSI fields can use their natural types
+			attributeValue, err = d.convertValueToDynamoDBAttribute(condition.Value)
+		}
+
 		if err != nil {
 			return "", nil, nil, fmt.Errorf("failed to convert value for condition %d: %w", i, err)
 		}
@@ -2199,10 +2217,33 @@ func (d *DynamoDBStorage) convertValueToDynamoDBAttribute(value interface{}) (ty
 	}
 }
 
+// convertValueToGSIAttribute converts a search value to String AttributeValue for GSI queries
+// All GSI keys are defined as String type to handle CSV data consistently
+func (d *DynamoDBStorage) convertValueToGSIAttribute(value interface{}) (types.AttributeValue, error) {
+	// Convert all values to string for GSI compatibility
+	switch v := value.(type) {
+	case string:
+		return &types.AttributeValueMemberS{Value: v}, nil
+	case int:
+		return &types.AttributeValueMemberS{Value: strconv.Itoa(v)}, nil
+	case int64:
+		return &types.AttributeValueMemberS{Value: strconv.FormatInt(v, 10)}, nil
+	case float64:
+		return &types.AttributeValueMemberS{Value: strconv.FormatFloat(v, 'f', -1, 64)}, nil
+	case bool:
+		return &types.AttributeValueMemberS{Value: strconv.FormatBool(v)}, nil
+	case []byte:
+		return &types.AttributeValueMemberS{Value: string(v)}, nil
+	default:
+		// Convert to string
+		return &types.AttributeValueMemberS{Value: fmt.Sprintf("%v", v)}, nil
+	}
+}
+
 // executeGSIQuery executes a query on a specific GSI for a given condition
 func (d *DynamoDBStorage) executeGSIQuery(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition) (*GSIQueryResult, error) {
-	// Convert value to appropriate DynamoDB attribute value
-	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	// Convert value to String attribute value for GSI compatibility (all GSI keys are String type)
+	attributeValue, err := d.convertValueToGSIAttribute(condition.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert value for GSI query: %w", err)
 	}
@@ -2300,8 +2341,8 @@ func (d *DynamoDBStorage) executeGSIQuery(ctx context.Context, tableName string,
 
 // executeGSIQueryWithProjection executes a GSI query with field projection
 func (d *DynamoDBStorage) executeGSIQueryWithProjection(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition, projectedFields []string) (*GSIQueryResult, error) {
-	// Convert value to appropriate DynamoDB attribute value
-	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	// Convert value to String attribute value for GSI compatibility (all GSI keys are String type)
+	attributeValue, err := d.convertValueToGSIAttribute(condition.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert value for GSI query with projection: %w", err)
 	}
@@ -2392,8 +2433,8 @@ func (d *DynamoDBStorage) executeGSIQueryWithProjection(ctx context.Context, tab
 
 // executeGSIScanWithFilter executes a scan on GSI with filter expression for range operations
 func (d *DynamoDBStorage) executeGSIScanWithFilter(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition) (*GSIQueryResult, error) {
-	// Convert value to appropriate DynamoDB attribute value
-	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	// Convert value to String attribute value for GSI compatibility (all GSI keys are String type)
+	attributeValue, err := d.convertValueToGSIAttribute(condition.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert value for GSI scan: %w", err)
 	}
@@ -2466,8 +2507,8 @@ func (d *DynamoDBStorage) executeGSIScanWithFilter(ctx context.Context, tableNam
 
 // executeGSIScanWithFilterAndProjection executes a GSI scan with filter and projection
 func (d *DynamoDBStorage) executeGSIScanWithFilterAndProjection(ctx context.Context, tableName string, gsiConfig GSIConfig, condition SearchCondition, projectedFields []string) (*GSIQueryResult, error) {
-	// Convert value to appropriate DynamoDB attribute value
-	attributeValue, err := d.convertValueToDynamoDBAttribute(condition.Value)
+	// Convert value to String attribute value for GSI compatibility (all GSI keys are String type)
+	attributeValue, err := d.convertValueToGSIAttribute(condition.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert value for GSI scan with projection: %w", err)
 	}

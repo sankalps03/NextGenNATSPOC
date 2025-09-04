@@ -456,9 +456,9 @@ func (g *Generator) generateRandomString(length int) string {
 	return string(result)
 }
 
-// generateSearchRequest generates a random search request with tenant awareness
+// generateSearchRequest generates a random search request using collected values from the 19 GSI fields only
 func (g *Generator) generateSearchRequest() (httpclient.SearchRequest, string) {
-	// Generate random search conditions using collected searchable values
+	// Generate random search conditions using collected values from inserted tickets (19 GSI fields only)
 	conditions, tenantID := g.generateRandomSearchConditions()
 
 	// Generate random projection fields
@@ -470,39 +470,28 @@ func (g *Generator) generateSearchRequest() (httpclient.SearchRequest, string) {
 	}, tenantID
 }
 
-// generateRandomSearchConditions generates 1-3 random search conditions using collected searchable values
+// generateRandomSearchConditions generates 1-3 random search conditions using collected values from the 19 GSI fields only
 func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchCondition, string) {
-	// First try to use collected searchable values
+	// Get the 19 hardcoded GSI fields (these are the ONLY fields we can search on)
 	businessCriticalFields := g.getBusinessCriticalFields()
+
+	// Check which of these 19 fields have collected values from inserted tickets
 	availableFields := g.getAvailableSearchableFields(businessCriticalFields)
 
 	if len(availableFields) == 0 {
-		// Fallback to configured conditions with random tenant
-		conditions := g.config.Operations.Search.SearchConditions
-		if len(conditions) > 0 {
-			selectedCondition := g.selectRandomCondition(conditions)
-			tenantIDs := g.httpClient.GetTenantIDs()
-			randomTenant := "default-tenant"
-			if len(tenantIDs) > 0 {
-				randomTenant = tenantIDs[g.rand.Intn(len(tenantIDs))]
-			}
-			return []httpclient.SearchCondition{{
-				Field:    selectedCondition.Field,
-				Operator: selectedCondition.Operator,
-				Value:    g.randomizeSearchValue(selectedCondition),
-			}}, randomTenant
-		}
+		log.Printf("WARNING: No searchable values available for the 19 supported GSI fields. Need to create tickets first.")
+		log.Printf("Supported GSI fields: %v", businessCriticalFields)
 		return []httpclient.SearchCondition{}, ""
 	}
 
-	// Generate 1-3 random conditions
+	// Generate 1-3 random conditions using collected values from the 19 GSI fields only
 	numConditions := g.rand.Intn(3) + 1
 	var conditions []httpclient.SearchCondition
 	usedFields := make(map[string]bool)
 	var searchTenantID string
 
 	for i := 0; i < numConditions && len(usedFields) < len(availableFields); i++ {
-		// Select random field that hasn't been used
+		// Select random field that hasn't been used (only from the 19 GSI fields that have collected values)
 		var selectedField string
 		attempts := 0
 		for attempts < 10 {
@@ -519,7 +508,7 @@ func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchConditi
 			continue
 		}
 
-		// Generate condition for this field using collected values
+		// Generate condition for this field using actual values collected from inserted tickets
 		condition, tenantID := g.generateConditionFromCollectedValues(selectedField)
 		if condition != nil {
 			conditions = append(conditions, *condition)
@@ -711,12 +700,8 @@ func (g *Generator) getRandomTicketID() (string, string) {
 func (g *Generator) countSearchResults(responseBody map[string]interface{}) int {
 	// Try to find results in different possible locations
 	if data, exists := responseBody["data"]; exists {
-		if dataMap, ok := data.(map[string]interface{}); ok {
-			if tickets, exists := dataMap["tickets"]; exists {
-				if ticketsArray, ok := tickets.([]interface{}); ok {
-					return len(ticketsArray)
-				}
-			}
+		if temp, ok := data.([]interface{}); ok {
+			return len(temp)
 		}
 	}
 
@@ -878,12 +863,23 @@ func (g *Generator) generateRandomProjectionFields() []string {
 	return projectedFields
 }
 
+// getMapKeys returns the keys of a map[string]interface{} as a slice of strings
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // collectSearchableValues collects values from searchable fields during ticket creation
+// Only collects values for the 19 supported GSI fields to prevent unsupported field searches
 func (g *Generator) collectSearchableValues(tenantID string, ticketData map[string]interface{}) {
 	g.searchValuesMu.Lock()
 	defer g.searchValuesMu.Unlock()
 
-	// Define the 19 business-critical searchable fields
+	// Define ONLY the 19 business-critical searchable fields (matching DynamoDB GSI definitions)
+	// These are the ONLY fields that will be collected and available for searching
 	searchableFields := []string{
 		"requesterid", "technicianid", "groupid", "statusid", "priorityid",
 		"urgencyid", "categoryid", "companyid", "departmentid", "locationid",
@@ -891,13 +887,22 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 		"dueby", "oladueby", "ucdueby", "lastviolationtime", "violatedslaid",
 	}
 
-	// Extract fields from ticket data
-	fields, ok := ticketData["fields"].(map[string]interface{})
-	if !ok {
-		return
+	// Extract fields from ticket data - check if wrapped in "fields" or direct
+	var fields map[string]interface{}
+	if fieldsWrapper, ok := ticketData["fields"].(map[string]interface{}); ok {
+		// Data is wrapped in "fields" object
+		fields = fieldsWrapper
+		log.Printf("DEBUG: Using wrapped fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields))
+	} else {
+		// Data is directly at top level (CSV format)
+		fields = ticketData
+		log.Printf("DEBUG: Using direct fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields))
 	}
 
-	// Collect values for each searchable field
+	// Collect values for each searchable field (only the 19 supported fields)
+	collectedCount := 0
+	skippedCount := 0
+
 	for _, fieldName := range searchableFields {
 		if value, exists := fields[fieldName]; exists && value != nil {
 			// Convert value to string for consistent storage
@@ -905,6 +910,7 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 			if valueStr == "" || valueStr == "<nil>" {
 				continue
 			}
+			collectedCount++
 
 			// Initialize field map if it doesn't exist
 			if g.searchableValues[fieldName] == nil {
@@ -934,7 +940,18 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 					g.searchableValues[fieldName][tenantID] = g.searchableValues[fieldName][tenantID][len(g.searchableValues[fieldName][tenantID])-100:]
 				}
 			}
+		} else {
+			// Field exists in CSV but not in our supported list
+			if _, exists := fields[fieldName]; !exists {
+				skippedCount++
+			}
 		}
+	}
+
+	// Log collection summary
+	if collectedCount > 0 {
+		log.Printf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only 19 GSI fields supported)",
+			tenantID, collectedCount, skippedCount)
 	}
 }
 
@@ -974,7 +991,33 @@ func (g *Generator) getRandomSearchableValue(fieldName string) (string, string) 
 	return selected.value, selected.tenantID
 }
 
-// getBusinessCriticalFields returns the 19 business-critical searchable fields
+// isSupportedSearchField checks if a field is in the 19 supported GSI fields
+func (g *Generator) isSupportedSearchField(field string) bool {
+	supportedFields := map[string]bool{
+		"requesterid":       true,
+		"technicianid":      true,
+		"groupid":           true,
+		"statusid":          true,
+		"priorityid":        true,
+		"urgencyid":         true,
+		"categoryid":        true,
+		"companyid":         true,
+		"departmentid":      true,
+		"locationid":        true,
+		"createdtime":       true,
+		"updatedtime":       true,
+		"lastresolvedtime":  true,
+		"lastclosedtime":    true,
+		"dueby":             true,
+		"oladueby":          true,
+		"ucdueby":           true,
+		"lastviolationtime": true,
+		"violatedslaid":     true,
+	}
+	return supportedFields[field]
+}
+
+// getBusinessCriticalFields returns the 19 business-critical searchable fields (matching CSV structure)
 func (g *Generator) getBusinessCriticalFields() []string {
 	return []string{
 		"requesterid", "technicianid", "groupid", "statusid", "priorityid",
@@ -985,12 +1028,42 @@ func (g *Generator) getBusinessCriticalFields() []string {
 }
 
 // getAvailableSearchableFields returns fields that have collected values available for searching
+// Only returns fields that are in the 19 business-critical GSI fields
 func (g *Generator) getAvailableSearchableFields(businessFields []string) []string {
 	g.searchValuesMu.RLock()
 	defer g.searchValuesMu.RUnlock()
 
+	// Define the exact 19 supported fields (must match DynamoDB GSI definitions)
+	supportedFields := map[string]bool{
+		"requesterid":       true,
+		"technicianid":      true,
+		"groupid":           true,
+		"statusid":          true,
+		"priorityid":        true,
+		"urgencyid":         true,
+		"categoryid":        true,
+		"companyid":         true,
+		"departmentid":      true,
+		"locationid":        true,
+		"createdtime":       true,
+		"updatedtime":       true,
+		"lastresolvedtime":  true,
+		"lastclosedtime":    true,
+		"dueby":             true,
+		"oladueby":          true,
+		"ucdueby":           true,
+		"lastviolationtime": true,
+		"violatedslaid":     true,
+	}
+
 	var availableFields []string
 	for _, field := range businessFields {
+		// Only consider fields that are in the supported list
+		if !supportedFields[field] {
+			log.Printf("WARNING: Field '%s' is not in the 19 supported GSI fields, skipping", field)
+			continue
+		}
+
 		if fieldValues, exists := g.searchableValues[field]; exists && len(fieldValues) > 0 {
 			// Check if any tenant has values for this field
 			hasValues := false
@@ -1005,11 +1078,19 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 			}
 		}
 	}
+
+	log.Printf("Available searchable fields: %v (filtered to 19 supported GSI fields)", availableFields)
 	return availableFields
 }
 
 // generateConditionFromCollectedValues generates a search condition using collected values
 func (g *Generator) generateConditionFromCollectedValues(field string) (*httpclient.SearchCondition, string) {
+	// Validate that the field is in the 19 supported GSI fields
+	if !g.isSupportedSearchField(field) {
+		log.Printf("WARNING: Attempted to generate condition for unsupported field '%s', skipping", field)
+		return nil, ""
+	}
+
 	// Get random value from collected data
 	value, tenantID := g.getRandomSearchableValue(field)
 	if value == "" {
