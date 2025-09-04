@@ -55,6 +55,7 @@ type NATSManager struct {
 type TicketService struct {
 	natsManager *NATSManager
 	storage     storage2.TicketStorage
+	kvStore     jetstream.KeyValue
 }
 
 // Removed hardcoded request structs - now using dynamic field handling
@@ -308,6 +309,23 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 		return nil, fmt.Errorf("failed to create ticket: %w", err)
 	}
 	dbLatency := time.Since(dbStart)
+
+	// Store ticket document in KV store if using OpenSearch storage
+	if ts.kvStore != nil {
+		kvKey := fmt.Sprintf("%s:%s", req.Tenant, ticketData.Id)
+
+		// Serialize the entire ticket document as JSON
+		ticketDoc, err := json.Marshal(ticketData)
+		if err != nil {
+			log.Printf("WARNING: Failed to marshal ticket for KV store: %v", err)
+		} else {
+			if _, err := ts.kvStore.Put(context.Background(), kvKey, ticketDoc); err != nil {
+				log.Printf("WARNING: Failed to store ticket document in KV store: %v", err)
+			} else {
+				log.Printf("Stored ticket document in KV store: %s", kvKey)
+			}
+		}
+	}
 
 	if err := ts.publishTicketCreated(context.Background(), req.Tenant, ticketData); err != nil {
 		log.Printf("ERROR: Failed to publish ticket created event for tenant=%s ticket_id=%s: %v", req.Tenant, ticketData.Id, err)
@@ -770,7 +788,7 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-func createKVBucket(natsManager *NATSManager, bucketName string) error {
+func createKVBucket(natsManager *NATSManager, bucketName string) (jetstream.KeyValue, error) {
 	kv, err := natsManager.js.CreateKeyValue(context.Background(), jetstream.KeyValueConfig{
 		Bucket: bucketName,
 	})
@@ -778,13 +796,12 @@ func createKVBucket(natsManager *NATSManager, bucketName string) error {
 		// If bucket already exists, try to get it
 		kv, err = natsManager.js.KeyValue(context.Background(), bucketName)
 		if err != nil {
-			return fmt.Errorf("failed to create or get KV bucket '%s': %w", bucketName, err)
+			return nil, fmt.Errorf("failed to create or get KV bucket '%s': %w", bucketName, err)
 		}
 	}
 
 	log.Printf("NATS KV bucket '%s' ready", bucketName)
-	_ = kv // Use the kv store if needed later
-	return nil
+	return kv, nil
 }
 
 func promptForStorageType() string {
@@ -840,6 +857,7 @@ func main() {
 	}
 
 	// Initialize selected storage
+	var kvStore jetstream.KeyValue
 	switch storageType {
 	case "opensearch":
 		opensearchStorage, err := storage2.NewOpenSearchStorage(context.Background(), config.OpenSearchURL, config.OpenSearchIndex)
@@ -851,14 +869,15 @@ func main() {
 		storage = opensearchStorage
 
 		// Create KV store bucket for OpenSearch storage only
-		if err = createKVBucket(natsManager, "ticket_kv"); err != nil {
+		kvStore, err = createKVBucket(natsManager, "ticket-kv")
+		if err != nil {
 			log.Fatalf("Failed to create KV bucket for OpenSearch storage: %v", err)
 
 			return
 		}
 
 		log.Printf("Using OpenSearch storage with endpoint: %s and index: %s", config.OpenSearchURL, config.OpenSearchIndex)
-		log.Printf("Created NATS KV bucket: ticket.kv")
+		log.Printf("Created NATS KV bucket: ticket-kv")
 	case "dynamodb":
 		dynamoStorage, err := storage2.NewDynamoDBStorage(context.Background(), config.DynamoDBTable, config.AWSRegion, config.DynamoDBURL, config.DynamoDBAddress)
 		if err != nil {
@@ -875,6 +894,7 @@ func main() {
 	service := &TicketService{
 		natsManager: natsManager,
 		storage:     storage,
+		kvStore:     kvStore,
 	}
 
 	sub, err := natsManager.conn.Subscribe("ticket.service", service.handleServiceRequest)
