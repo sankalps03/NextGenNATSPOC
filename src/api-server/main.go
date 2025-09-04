@@ -75,6 +75,7 @@ type ErrorResponse struct {
 
 type APIHandler struct {
 	natsManager *NATSManager
+	objStore    jetstream.ObjectStore
 }
 
 func tenantMiddleware(next http.Handler) http.Handler {
@@ -177,8 +178,18 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Process object store response if applicable
+	finalResponse, err := h.processObjectStoreResponse(response)
+	if err != nil {
+		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "object_store_error", Message: "Failed to retrieve data"})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(response)
+	w.Write(finalResponse)
 }
 
 func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
@@ -211,8 +222,18 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Process object store response if applicable
+	finalResponse, err := h.processObjectStoreResponse(response)
+	if err != nil {
+		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "object_store_error", Message: "Failed to retrieve data"})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(response)
+	w.Write(finalResponse)
 }
 
 func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
@@ -344,8 +365,18 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Process object store response if applicable
+	finalResponse, err := h.processObjectStoreResponse(response)
+	if err != nil {
+		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "object_store_error", Message: "Failed to retrieve data"})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(response)
+	w.Write(finalResponse)
 }
 
 func (h *APIHandler) ListNotifications(w http.ResponseWriter, r *http.Request) {
@@ -441,6 +472,41 @@ func (h *APIHandler) sendNATSRequest(subject string, requestData interface{}, ti
 	return msg.Data, nil
 }
 
+// processObjectStoreResponse checks if response contains object_id and retrieves data from object store
+func (h *APIHandler) processObjectStoreResponse(response []byte) ([]byte, error) {
+	// Parse the response to check for object store reference
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(response, &responseData); err != nil {
+		// Not JSON or parsing failed, return as-is
+		return response, nil
+	}
+
+	// Check if response contains data field
+	if data, exists := responseData["data"]; exists {
+		if dataMap, ok := data.(map[string]interface{}); ok {
+			// Check if data contains object_id (indicating object store reference)
+			if objectID, hasObjectID := dataMap["object_id"]; hasObjectID && h.objStore != nil {
+				// This is an object store reference, retrieve the actual data
+				objectIDStr := fmt.Sprintf("%v", objectID)
+				log.Printf("Retrieving object from store: %s", objectIDStr)
+
+				// Get object from store
+				objData, err := h.objStore.GetBytes(context.Background(), objectIDStr)
+				if err != nil {
+					log.Printf("Failed to retrieve object %s: %v", objectIDStr, err)
+					return nil, fmt.Errorf("failed to retrieve data from object store: %w", err)
+				}
+
+				// Return the retrieved data directly
+				return objData, nil
+			}
+		}
+	}
+
+	// Not an object store reference, return original response
+	return response, nil
+}
+
 func connectNATS(urls string) (*NATSManager, error) {
 	serverList := strings.Split(urls, ",")
 	for i, url := range serverList {
@@ -526,8 +592,17 @@ func main() {
 		log.Fatalf("Failed to connect to NATS: %v", err)
 	}
 
+	// Get or create object store for retrieving ticket responses
+	objStore, err := natsManager.js.ObjectStore(context.Background(), "ticket-responses")
+	if err != nil {
+		log.Printf("WARNING: Failed to connect to object store: %v. Large responses may not be available.", err)
+	} else {
+		log.Println("Connected to NATS Object Store: ticket-responses")
+	}
+
 	handler := &APIHandler{
 		natsManager: natsManager,
+		objStore:    objStore,
 	}
 
 	router := setupRouter(handler)

@@ -56,6 +56,7 @@ type TicketService struct {
 	natsManager *NATSManager
 	storage     storage2.TicketStorage
 	kvStore     jetstream.KeyValue
+	objStore    jetstream.ObjectStore
 }
 
 // Removed hardcoded request structs - now using dynamic field handling
@@ -186,6 +187,31 @@ func ticketToJSON(ticket *ticketpb.TicketData) map[string]interface{} {
 	delete(result, "fields")
 
 	return result
+}
+
+// storeInObjectStore stores data in NATS object store and returns object ID
+func (ts *TicketService) storeInObjectStore(data interface{}, prefix string) (string, int64, error) {
+	// Serialize data to JSON
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to marshal data: %w", err)
+	}
+
+	// Generate unique object ID
+	objectID := fmt.Sprintf("%s-%s-%s", prefix, time.Now().Format("20060102-150405"), uuid.New().String()[:8])
+
+	// Store in object store
+	/*objectMeta := jetstream.ObjectMeta{
+		Name:        objectID,
+		Description: fmt.Sprintf("Response for %s at %s", prefix, time.Now().Format(time.RFC3339)),
+	}
+	*/
+	objInfo, err := ts.objStore.PutBytes(context.Background(), objectID, jsonData)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to store in object store: %w", err)
+	}
+
+	return objectID, int64(objInfo.Size), nil
 }
 
 // fieldsEqual compares two FieldValue instances for equality
@@ -359,11 +385,41 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 		jsonTickets = append(jsonTickets, ticketToJSON(ticket))
 	}
 
+	// Prepare response data
+	responseData := map[string]interface{}{
+		"tickets":     jsonTickets,
+		"tenant":      req.Tenant,
+		"total_count": len(tickets),
+	}
+
+	// Store in object store if available
+	if ts.objStore != nil {
+		objectID, size, err := ts.storeInObjectStore(responseData, fmt.Sprintf("list-%s", req.Tenant))
+		if err != nil {
+			log.Printf("Failed to store in object store: %v", err)
+			// Fallback to direct response if object store fails
+			return ResponseWithLatency{
+				Data:            responseData,
+				DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+			}, nil
+		}
+
+		// Return object store reference
+		return ResponseWithLatency{
+			Data: map[string]interface{}{
+				"object_id":   objectID,
+				"object_size": size,
+				"total_count": len(tickets),
+				"expires_at":  time.Now().Add(30 * time.Minute).Format(time.RFC3339),
+				"type":        "ticket_list",
+			},
+			DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+		}, nil
+	}
+
+	// Fallback to direct response if object store not available
 	return ResponseWithLatency{
-		Data: map[string]interface{}{
-			"tickets": jsonTickets,
-			"tenant":  req.Tenant,
-		},
+		Data:            responseData,
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
 	}, nil
 }
@@ -378,8 +434,36 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 		return ErrorResponse{Error: "ticket_not_found"}, nil
 	}
 
+	// Convert to JSON
+	jsonTicket := ticketToJSON(ticketData)
+
+	// Store in object store if available
+	if ts.objStore != nil {
+		objectID, size, err := ts.storeInObjectStore(jsonTicket, fmt.Sprintf("ticket-%s", req.TicketID))
+		if err != nil {
+			log.Printf("Failed to store in object store: %v", err)
+			// Fallback to direct response if object store fails
+			return ResponseWithLatency{
+				Data:            jsonTicket,
+				DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+			}, nil
+		}
+
+		// Return object store reference
+		return ResponseWithLatency{
+			Data: map[string]interface{}{
+				"object_id":   objectID,
+				"object_size": size,
+				"expires_at":  time.Now().Add(30 * time.Minute).Format(time.RFC3339),
+				"type":        "ticket",
+			},
+			DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+		}, nil
+	}
+
+	// Fallback to direct response if object store not available
 	return ResponseWithLatency{
-		Data:            ticketToJSON(ticketData),
+		Data:            jsonTicket,
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
 	}, nil
 }
@@ -546,8 +630,42 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 		responseTickets = append(responseTickets, ticketMap)
 	}
 
+	// Prepare response data
+	responseData := map[string]interface{}{
+		"tickets":     responseTickets,
+		"tenant":      req.Tenant,
+		"total_count": len(tickets),
+		"conditions":  searchRequest.Conditions,
+	}
+
+	// Store in object store if available
+	if ts.objStore != nil {
+		objectID, size, err := ts.storeInObjectStore(responseData, fmt.Sprintf("search-%s", req.Tenant))
+		if err != nil {
+			log.Printf("Failed to store in object store: %v", err)
+			// Fallback to direct response if object store fails
+			return ResponseWithLatency{
+				Data:            responseData,
+				DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+			}, nil
+		}
+
+		// Return object store reference
+		return ResponseWithLatency{
+			Data: map[string]interface{}{
+				"object_id":   objectID,
+				"object_size": size,
+				"total_count": len(tickets),
+				"expires_at":  time.Now().Add(30 * time.Minute).Format(time.RFC3339),
+				"type":        "search_results",
+			},
+			DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+		}, nil
+	}
+
+	// Fallback to direct response if object store not available
 	return ResponseWithLatency{
-		Data:            responseTickets,
+		Data:            responseData,
 		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
 	}, nil
 }
@@ -818,6 +936,24 @@ func createKVBucket(natsManager *NATSManager, bucketName string) (jetstream.KeyV
 	return kv, nil
 }
 
+func createObjectStore(natsManager *NATSManager, bucketName string) (jetstream.ObjectStore, error) {
+	objStore, err := natsManager.js.CreateObjectStore(context.Background(), jetstream.ObjectStoreConfig{
+		Bucket:      bucketName,
+		Description: "Store for large ticket responses",
+		TTL:         30 * time.Minute, // 30 minutes TTL
+	})
+	if err != nil {
+		// If object store already exists, try to get it
+		objStore, err = natsManager.js.ObjectStore(context.Background(), bucketName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create or get object store '%s': %w", bucketName, err)
+		}
+	}
+
+	log.Printf("NATS Object Store '%s' ready with 30 minute TTL", bucketName)
+	return objStore, nil
+}
+
 func promptForStorageType() string {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -872,6 +1008,14 @@ func main() {
 
 	// Initialize selected storage
 	var kvStore jetstream.KeyValue
+	var objStore jetstream.ObjectStore
+
+	// Always create object store for large responses
+	objStore, err = createObjectStore(natsManager, "ticket-responses")
+	if err != nil {
+		log.Printf("WARNING: Failed to create object store: %v. Large responses will use fallback.", err)
+	}
+
 	switch storageType {
 	case "opensearch":
 		opensearchStorage, err := storage2.NewOpenSearchStorage(context.Background(), config.OpenSearchURL, config.OpenSearchIndex)
@@ -909,6 +1053,7 @@ func main() {
 		natsManager: natsManager,
 		storage:     storage,
 		kvStore:     kvStore,
+		objStore:    objStore,
 	}
 
 	sub, err := natsManager.conn.Subscribe("ticket.service", service.handleServiceRequest)
