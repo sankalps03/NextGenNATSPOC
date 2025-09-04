@@ -506,15 +506,18 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 			ticketMap[fieldName] = convertFieldValueToInterface(fieldValue)
 		}
 
-		entries, err := ts.kvStore.Get(context.Background(), fmt.Sprintf("%s-%s", ticket.Tenant, ticket.Id))
+		if ts.kvStore != nil {
 
-		if err == nil {
+			entries, err := ts.kvStore.Get(context.Background(), fmt.Sprintf("%s-%s", ticket.Tenant, ticket.Id))
 
-			json.Unmarshal(entries.Value(), &ticketMap)
+			if err == nil {
 
-			for key, value := range ticketMap {
+				json.Unmarshal(entries.Value(), &ticketMap)
 
-				ticketMap[key] = value
+				for key, value := range ticketMap {
+
+					ticketMap[key] = value
+				}
 			}
 		}
 		responseTickets = append(responseTickets, ticketMap)
