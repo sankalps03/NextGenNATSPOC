@@ -611,12 +611,14 @@ func main() {
 		log.Fatalf("Failed to connect to NATS: %v", err)
 	}
 
-	// Get or create object store for retrieving ticket responses
-	objStore, err := natsManager.js.ObjectStore(context.Background(), "ticket-responses")
+	var objStore jetstream.ObjectStore
+
+	// Always create object store for large responses
+	objStore, err = createObjectStore(natsManager, "ticket-responses")
 	if err != nil {
-		log.Printf("WARNING: Failed to connect to object store: %v. Large responses may not be available.", err)
-	} else {
-		log.Println("Connected to NATS Object Store: ticket-responses")
+		log.Printf("WARNING: Failed to create object store: %v. Large responses will use fallback.", err)
+
+		return
 	}
 
 	handler := &APIHandler{
@@ -659,4 +661,22 @@ func main() {
 	}
 
 	log.Println("Server exited")
+}
+
+func createObjectStore(natsManager *NATSManager, bucketName string) (jetstream.ObjectStore, error) {
+	objStore, err := natsManager.js.CreateObjectStore(context.Background(), jetstream.ObjectStoreConfig{
+		Bucket:      bucketName,
+		Description: "Store for large ticket responses",
+		TTL:         30 * time.Minute, // 30 minutes TTL
+	})
+	if err != nil {
+		// If object store already exists, try to get it
+		objStore, err = natsManager.js.ObjectStore(context.Background(), bucketName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create or get object store '%s': %w", bucketName, err)
+		}
+	}
+
+	log.Printf("NATS Object Store '%s' ready with 30 minute TTL", bucketName)
+	return objStore, nil
 }

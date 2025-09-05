@@ -109,8 +109,7 @@ func (g *Generator) Start(ctx context.Context) error {
 func (g *Generator) runCreateGenerator(ctx context.Context) {
 	g.logger.Info(fmt.Sprintf("Starting create generator with EPS: %.2f", g.config.EPS.Create))
 
-	interval := time.Duration(float64(time.Second) / g.config.EPS.Create)
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -119,7 +118,11 @@ func (g *Generator) runCreateGenerator(ctx context.Context) {
 			log.Println("Create generator stopped")
 			return
 		case <-ticker.C:
-			g.createTicket(ctx)
+
+			for i := 0; i < int(g.config.EPS.Create); i++ {
+
+				g.createTicket(ctx)
+			}
 		}
 	}
 }
@@ -128,8 +131,7 @@ func (g *Generator) runCreateGenerator(ctx context.Context) {
 func (g *Generator) runSearchGenerator(ctx context.Context) {
 	g.logger.Info(fmt.Sprintf("Starting search generator with EPS: %.2f", g.config.EPS.Search))
 
-	interval := time.Duration(float64(time.Second) / g.config.EPS.Search)
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -138,7 +140,11 @@ func (g *Generator) runSearchGenerator(ctx context.Context) {
 			log.Println("Search generator stopped")
 			return
 		case <-ticker.C:
-			g.searchTickets(ctx)
+
+			for i := 0; i < int(g.config.EPS.Search); i++ {
+
+				g.searchTickets(ctx)
+			}
 		}
 	}
 }
