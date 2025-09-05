@@ -718,19 +718,7 @@ func (g *Generator) getRandomTicketID() (string, string) {
 // countSearchResults counts the number of results in a search response
 func (g *Generator) countSearchResults(responseBody map[string]interface{}) int {
 	// Try to find results in different possible locations
-	if data, exists := responseBody["data"]; exists {
-		if temp, ok := data.([]interface{}); ok {
-			return len(temp)
-		}
-	}
-
-	if tickets, exists := responseBody["tickets"]; exists {
-		if ticketsArray, ok := tickets.([]interface{}); ok {
-			return len(ticketsArray)
-		}
-	}
-
-	if results, exists := responseBody["results"]; exists {
+	if results, exists := responseBody["result"]; exists {
 		if resultsArray, ok := results.([]interface{}); ok {
 			return len(resultsArray)
 		}
