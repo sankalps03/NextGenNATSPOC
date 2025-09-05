@@ -39,7 +39,7 @@ EXPOSE 8082
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/api-server", "--health-check"] || exit 1
+    CMD ["/api-server", "--health-check"]
 
 # Set user (security best practice)
 USER 65534

@@ -914,7 +914,7 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
-		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "true") == "true",
+		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "false") == "true",
 	}
 }
 
