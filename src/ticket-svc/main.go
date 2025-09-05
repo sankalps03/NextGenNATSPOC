@@ -387,7 +387,7 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 
 	// Prepare response data
 	responseData := map[string]interface{}{
-		"tickets":     jsonTickets,
+		"result":      jsonTickets,
 		"tenant":      req.Tenant,
 		"total_count": len(tickets),
 	}
@@ -437,9 +437,15 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 	// Convert to JSON
 	jsonTicket := ticketToJSON(ticketData)
 
+	responseData := map[string]interface{}{
+		"result":      jsonTicket,
+		"tenant":      req.Tenant,
+		"total_count": 1,
+	}
+
 	// Store in object store if available
 	if ts.objStore != nil {
-		objectID, size, err := ts.storeInObjectStore(jsonTicket, fmt.Sprintf("ticket-%s", req.TicketID))
+		objectID, size, err := ts.storeInObjectStore(responseData, fmt.Sprintf("ticket-%s", req.TicketID))
 		if err != nil {
 			log.Printf("Failed to store in object store: %v", err)
 			// Fallback to direct response if object store fails
@@ -632,10 +638,9 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 
 	// Prepare response data
 	responseData := map[string]interface{}{
-		"tickets":     responseTickets,
+		"result":      responseTickets,
 		"tenant":      req.Tenant,
 		"total_count": len(tickets),
-		"conditions":  searchRequest.Conditions,
 	}
 
 	// Store in object store if available

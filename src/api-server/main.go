@@ -169,6 +169,8 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 		"tenant": tenant,
 	}
 
+	start := time.Now()
+
 	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
@@ -179,7 +181,7 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process object store response if applicable
-	finalResponse, err := h.processObjectStoreResponse(response)
+	finalResponse, err := h.processObjectStoreResponse(response, start)
 	if err != nil {
 		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -203,6 +205,8 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 		"ticket_id": ticketID,
 	}
 
+	start := time.Now()
+
 	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
 	if err != nil {
 		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
@@ -223,7 +227,7 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process object store response if applicable
-	finalResponse, err := h.processObjectStoreResponse(response)
+	finalResponse, err := h.processObjectStoreResponse(response, start)
 	if err != nil {
 		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -316,6 +320,8 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 
+	start := time.Now()
+
 	// Parse search request from request body (supports field projection)
 	var searchRequest struct {
 		Conditions      []map[string]interface{} `json:"conditions"`
@@ -366,7 +372,7 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process object store response if applicable
-	finalResponse, err := h.processObjectStoreResponse(response)
+	finalResponse, err := h.processObjectStoreResponse(response, start)
 	if err != nil {
 		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -473,7 +479,7 @@ func (h *APIHandler) sendNATSRequest(subject string, requestData interface{}, ti
 }
 
 // processObjectStoreResponse checks if response contains object_id and retrieves data from object store
-func (h *APIHandler) processObjectStoreResponse(response []byte) ([]byte, error) {
+func (h *APIHandler) processObjectStoreResponse(response []byte, start time.Time) ([]byte, error) {
 	// Parse the response to check for object store reference
 	var responseData map[string]interface{}
 	if err := json.Unmarshal(response, &responseData); err != nil {
@@ -485,6 +491,9 @@ func (h *APIHandler) processObjectStoreResponse(response []byte) ([]byte, error)
 	if data, exists := responseData["data"]; exists {
 		if dataMap, ok := data.(map[string]interface{}); ok {
 			// Check if data contains object_id (indicating object store reference)
+
+			latency := responseData["database_latency_ms"]
+
 			if objectID, hasObjectID := dataMap["object_id"]; hasObjectID && h.objStore != nil {
 				// This is an object store reference, retrieve the actual data
 				objectIDStr := fmt.Sprintf("%v", objectID)
@@ -497,8 +506,18 @@ func (h *APIHandler) processObjectStoreResponse(response []byte) ([]byte, error)
 					return nil, fmt.Errorf("failed to retrieve data from object store: %w", err)
 				}
 
+				var objDataMap map[string]interface{}
+
+				json.Unmarshal(objData, &objDataMap)
+
+				objDataMap["database_latency_ms"] = latency
+
+				objDataMap["api_latency_ms"] = time.Now().UnixMilli() - start.UnixMilli()
+
+				responses, err := json.Marshal(objDataMap)
+
 				// Return the retrieved data directly
-				return objData, nil
+				return responses, err
 			}
 		}
 	}
