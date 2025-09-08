@@ -40,10 +40,12 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb" or "opensearch"
+	StorageType       string // "dynamodb", "opensearch", or "postgresql"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
+	PostgreSQLURL     string // PostgreSQL connection string
+	PostgreSQLTable   string // PostgreSQL base table name
 	InteractivePrompt bool   // Enable interactive storage selection
 }
 
@@ -914,6 +916,8 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
+		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
+		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
 		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "false") == "true",
 	}
 }
@@ -923,6 +927,36 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// maskConnectionString masks sensitive information in PostgreSQL connection string for logging
+func maskConnectionString(connectionString string) string {
+	// Simple masking - replace password with ***
+	if strings.Contains(connectionString, "password=") {
+		parts := strings.Split(connectionString, " ")
+		for i, part := range parts {
+			if strings.HasPrefix(part, "password=") {
+				parts[i] = "password=***"
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+
+	// Handle URL format: postgres://user:password@host/db
+	if strings.HasPrefix(connectionString, "postgres://") {
+		// Find the password part
+		if atIndex := strings.Index(connectionString, "@"); atIndex != -1 {
+			beforeAt := connectionString[:atIndex]
+			afterAt := connectionString[atIndex:]
+
+			if colonIndex := strings.LastIndex(beforeAt, ":"); colonIndex != -1 {
+				// Replace password with ***
+				return beforeAt[:colonIndex+1] + "***" + afterAt
+			}
+		}
+	}
+
+	return connectionString
 }
 
 func createKVBucket(natsManager *NATSManager, bucketName string) (jetstream.KeyValue, error) {
@@ -947,7 +981,8 @@ func promptForStorageType() string {
 		fmt.Println("\nSelect storage backend:")
 		fmt.Println("1. DynamoDB")
 		fmt.Println("2. OpenSearch")
-		fmt.Print("Enter your choice (1 or 2): ")
+		fmt.Println("3. PostgreSQL")
+		fmt.Print("Enter your choice (1, 2, or 3): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -963,8 +998,11 @@ func promptForStorageType() string {
 		case "2":
 			fmt.Println("Selected: OpenSearch")
 			return "opensearch"
+		case "3":
+			fmt.Println("Selected: PostgreSQL")
+			return "postgresql"
 		default:
-			fmt.Println("Invalid choice. Please enter 1 or 2.")
+			fmt.Println("Invalid choice. Please enter 1, 2, or 3.")
 		}
 	}
 }
@@ -1026,15 +1064,16 @@ func main() {
 
 		log.Printf("Using OpenSearch storage with endpoint: %s and index: %s", config.OpenSearchURL, config.OpenSearchIndex)
 		log.Printf("Created NATS KV bucket: ticket-kv")
-	case "dynamodb":
-		dynamoStorage, err := storage2.NewDynamoDBStorage(context.Background(), config.DynamoDBTable, config.AWSRegion, config.DynamoDBURL, config.DynamoDBAddress)
+	case "postgresql":
+		postgresStorage, err := storage2.NewPostgreSQLStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
 		if err != nil {
-			log.Fatalf("Failed to initialize DynamoDB storage: %v", err)
+			log.Fatalf("Failed to initialize PostgreSQL storage: %v", err)
 
 			return
 		}
-		storage = dynamoStorage
-		log.Printf("Using DynamoDB dynamic storage (protobuf) with table: %s in region: %s", config.DynamoDBTable, config.AWSRegion)
+		storage = postgresStorage
+		log.Printf("Using PostgreSQL storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}

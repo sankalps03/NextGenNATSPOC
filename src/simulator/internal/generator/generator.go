@@ -495,22 +495,22 @@ func (g *Generator) generateSearchRequest() (httpclient.SearchRequest, string) {
 	}, tenantID
 }
 
-// generateRandomSearchConditions generates 1-3 random search conditions using collected values from the 19 GSI fields only
+// generateRandomSearchConditions generates 1-3 random search conditions using collected values from the indexed fields only
 func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchCondition, string) {
-	// Get the 19 hardcoded GSI fields (these are the ONLY fields we can search on)
+	// Get the indexed fields (these are the ONLY fields we can search on efficiently)
 	businessCriticalFields := g.getBusinessCriticalFields()
 
-	// Check which of these 19 fields have collected values from inserted tickets
+	// Check which of these indexed fields have collected values from inserted tickets
 	availableFields := g.getAvailableSearchableFields(businessCriticalFields)
 
 	if len(availableFields) == 0 {
-		g.logger.Warn("No searchable values available for the 19 supported GSI fields. Need to create tickets first.")
-		g.logger.Debug(fmt.Sprintf("Supported GSI fields: %v", businessCriticalFields))
+		g.logger.Warn("No searchable values available for the supported indexed fields. Need to create tickets first.")
+		g.logger.Debug(fmt.Sprintf("Supported indexed fields: %v", businessCriticalFields))
 		return []httpclient.SearchCondition{}, ""
 	}
 
-	// Generate 1-3 random conditions using collected values from the 19 GSI fields only
-	numConditions := g.rand.Intn(3) + 1
+	// Generate 1-3 random conditions using collected values from the indexed fields only
+	numConditions := g.rand.Intn(5) + 1
 	var conditions []httpclient.SearchCondition
 	usedFields := make(map[string]bool)
 	var searchTenantID string
@@ -912,19 +912,13 @@ func getMapKeys(m map[string]interface{}) []string {
 }
 
 // collectSearchableValues collects values from searchable fields during ticket creation
-// Only collects values for the 19 supported GSI fields to prevent unsupported field searches
+// Only collects values for the supported indexed fields to prevent unsupported field searches
 func (g *Generator) collectSearchableValues(tenantID string, ticketData map[string]interface{}) {
 	g.searchValuesMu.Lock()
 	defer g.searchValuesMu.Unlock()
 
-	// Define ONLY the 19 business-critical searchable fields (matching DynamoDB GSI definitions)
-	// These are the ONLY fields that will be collected and available for searching
-	searchableFields := []string{
-		"requesterid", "technicianid", "groupid", "statusid", "priorityid",
-		"urgencyid", "categoryid", "companyid", "departmentid", "locationid",
-		"createdtime", "updatedtime", "lastresolvedtime", "lastclosedtime",
-		"dueby", "oladueby", "ucdueby", "lastviolationtime", "violatedslaid",
-	}
+	// Use the same fields as defined in getBusinessCriticalFields() for consistency
+	searchableFields := g.getBusinessCriticalFields()
 
 	// Extract fields from ticket data - check if wrapped in "fields" or direct
 	var fields map[string]interface{}
@@ -935,10 +929,9 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 	} else {
 		// Data is directly at top level (CSV format)
 		fields = ticketData
-		g.logger.Debug(fmt.Sprintf("Using direct fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields)))
 	}
 
-	// Collect values for each searchable field (only the 19 supported fields)
+	// Collect values for each searchable field (all supported indexed fields)
 	collectedCount := 0
 	skippedCount := 0
 
@@ -989,7 +982,7 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 
 	// Log collection summary
 	if collectedCount > 0 {
-		g.logger.Debug(fmt.Sprintf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only 19 GSI fields supported)",
+		g.logger.Debug(fmt.Sprintf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only indexed fields supported)",
 			tenantID, collectedCount, skippedCount))
 	}
 }
@@ -1030,76 +1023,161 @@ func (g *Generator) getRandomSearchableValue(fieldName string) (string, string) 
 	return selected.value, selected.tenantID
 }
 
-// isSupportedSearchField checks if a field is in the 19 supported GSI fields
+// isSupportedSearchField checks if a field is in the updated supported indexed fields
 func (g *Generator) isSupportedSearchField(field string) bool {
 	supportedFields := map[string]bool{
-		"requesterid":       true,
-		"technicianid":      true,
-		"groupid":           true,
-		"statusid":          true,
-		"priorityid":        true,
-		"urgencyid":         true,
-		"categoryid":        true,
-		"companyid":         true,
-		"departmentid":      true,
-		"locationid":        true,
-		"createdtime":       true,
-		"updatedtime":       true,
-		"lastresolvedtime":  true,
-		"lastclosedtime":    true,
-		"dueby":             true,
-		"oladueby":          true,
-		"ucdueby":           true,
-		"lastviolationtime": true,
-		"violatedslaid":     true,
+		// User and assignment fields
+		"updatedbyid":  true,
+		"createdbyid":  true,
+		"removedbyid":  true,
+		"requesterid":  true,
+		"technicianid": true,
+		"closedby":     true,
+		"resolvedby":   true,
+
+		// Organizational and categorization fields
+		"departmentid":        true,
+		"groupid":             true,
+		"impactid":            true,
+		"locationid":          true,
+		"priorityid":          true,
+		"resolutionduelevel":  true,
+		"responseduelevel":    true,
+		"statusid":            true,
+		"templateid":          true,
+		"urgencyid":           true,
+		"violatedslaid":       true,
+		"emailreadconfigid":   true,
+		"requesttype":         true,
+		"servicecatalogid":    true,
+		"sourceid":            true,
+		"oladuelevel":         true,
+		"suggestedcategoryid": true,
+		"suggestedgroupid":    true,
+		"companyid":           true,
+		"vendorid":            true,
+		"violateducid":        true,
+		"transitionmodelid":   true,
+		"messengerconfigid":   true,
+
+		// Timestamp fields
+		"updatedtime":            true,
+		"createdtime":            true,
+		"removedtime":            true,
+		"lastclosedtime":         true,
+		"lastopenedtime":         true,
+		"lastresolvedtime":       true,
+		"lastviolationtime":      true,
+		"olddueby":               true,
+		"oldresponsedue":         true,
+		"responsedue":            true,
+		"responseescalationtime": true,
+		"statuschangedtime":      true,
+		"groupchangedtime":       true,
+		"oladueby":               true,
+		"olaescalationtime":      true,
+		"askfeedbackdate":        true,
+		"firstfeedbackdate":      true,
+		"lastucviolationtime":    true,
+		"lastapproveddate":       true,
 	}
 	return supportedFields[field]
 }
 
-// getBusinessCriticalFields returns the 19 business-critical searchable fields (matching CSV structure)
+// getBusinessCriticalFields returns the updated searchable fields (matching PostgreSQL indexed columns)
 func (g *Generator) getBusinessCriticalFields() []string {
 	return []string{
-		"requesterid", "technicianid", "groupid", "statusid", "priorityid",
-		"urgencyid", "categoryid", "companyid", "departmentid", "locationid",
-		"createdtime", "updatedtime", "lastresolvedtime", "lastclosedtime",
-		"dueby", "oladueby", "ucdueby", "lastviolationtime", "violatedslaid",
+		// User and assignment fields
+		"updatedbyid", "createdbyid", "removedbyid", "requesterid", "technicianid",
+		"closedby", "resolvedby",
+
+		// Organizational and categorization fields
+		"departmentid", "groupid", "impactid", "locationid", "priorityid",
+		"resolutionduelevel", "responseduelevel", "statusid", "templateid",
+		"urgencyid", "violatedslaid", "emailreadconfigid", "requesttype",
+		"servicecatalogid", "sourceid", "oladuelevel", "suggestedcategoryid",
+		"suggestedgroupid", "companyid", "vendorid", "violateducid",
+		"transitionmodelid", "messengerconfigid",
+
+		// Timestamp fields
+		"updatedtime", "createdtime", "removedtime", "lastclosedtime",
+		"lastopenedtime", "lastresolvedtime", "lastviolationtime", "olddueby",
+		"oldresponsedue", "responsedue", "responseescalationtime",
+		"statuschangedtime", "groupchangedtime", "oladueby", "olaescalationtime",
+		"askfeedbackdate", "firstfeedbackdate", "lastucviolationtime",
+		"lastapproveddate",
 	}
 }
 
 // getAvailableSearchableFields returns fields that have collected values available for searching
-// Only returns fields that are in the 19 business-critical GSI fields
+// Only returns fields that are in the updated supported indexed fields
 func (g *Generator) getAvailableSearchableFields(businessFields []string) []string {
 	g.searchValuesMu.RLock()
 	defer g.searchValuesMu.RUnlock()
 
-	// Define the exact 19 supported fields (must match DynamoDB GSI definitions)
+	// Define the updated supported fields (must match PostgreSQL indexed columns)
 	supportedFields := map[string]bool{
-		"requesterid":       true,
-		"technicianid":      true,
-		"groupid":           true,
-		"statusid":          true,
-		"priorityid":        true,
-		"urgencyid":         true,
-		"categoryid":        true,
-		"companyid":         true,
-		"departmentid":      true,
-		"locationid":        true,
-		"createdtime":       true,
-		"updatedtime":       true,
-		"lastresolvedtime":  true,
-		"lastclosedtime":    true,
-		"dueby":             true,
-		"oladueby":          true,
-		"ucdueby":           true,
-		"lastviolationtime": true,
-		"violatedslaid":     true,
+		// User and assignment fields
+		"updatedbyid":  true,
+		"createdbyid":  true,
+		"removedbyid":  true,
+		"requesterid":  true,
+		"technicianid": true,
+		"closedby":     true,
+		"resolvedby":   true,
+
+		// Organizational and categorization fields
+		"departmentid":        true,
+		"groupid":             true,
+		"impactid":            true,
+		"locationid":          true,
+		"priorityid":          true,
+		"resolutionduelevel":  true,
+		"responseduelevel":    true,
+		"statusid":            true,
+		"templateid":          true,
+		"urgencyid":           true,
+		"violatedslaid":       true,
+		"emailreadconfigid":   true,
+		"requesttype":         true,
+		"servicecatalogid":    true,
+		"sourceid":            true,
+		"oladuelevel":         true,
+		"suggestedcategoryid": true,
+		"suggestedgroupid":    true,
+		"companyid":           true,
+		"vendorid":            true,
+		"violateducid":        true,
+		"transitionmodelid":   true,
+		"messengerconfigid":   true,
+
+		// Timestamp fields
+		"updatedtime":            true,
+		"createdtime":            true,
+		"removedtime":            true,
+		"lastclosedtime":         true,
+		"lastopenedtime":         true,
+		"lastresolvedtime":       true,
+		"lastviolationtime":      true,
+		"olddueby":               true,
+		"oldresponsedue":         true,
+		"responsedue":            true,
+		"responseescalationtime": true,
+		"statuschangedtime":      true,
+		"groupchangedtime":       true,
+		"oladueby":               true,
+		"olaescalationtime":      true,
+		"askfeedbackdate":        true,
+		"firstfeedbackdate":      true,
+		"lastucviolationtime":    true,
+		"lastapproveddate":       true,
 	}
 
 	var availableFields []string
 	for _, field := range businessFields {
 		// Only consider fields that are in the supported list
 		if !supportedFields[field] {
-			g.logger.Warn(fmt.Sprintf("Field '%s' is not in the 19 supported GSI fields, skipping", field))
+			g.logger.Warn(fmt.Sprintf("Field '%s' is not in the supported indexed fields, skipping", field))
 			continue
 		}
 
@@ -1118,13 +1196,12 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 		}
 	}
 
-	g.logger.Debug(fmt.Sprintf("Available searchable fields: %v (filtered to 19 supported GSI fields)", availableFields))
 	return availableFields
 }
 
 // generateConditionFromCollectedValues generates a search condition using collected values
 func (g *Generator) generateConditionFromCollectedValues(field string) (*httpclient.SearchCondition, string) {
-	// Validate that the field is in the 19 supported GSI fields
+	// Validate that the field is in the supported indexed fields
 	if !g.isSupportedSearchField(field) {
 		g.logger.Warn(fmt.Sprintf("Attempted to generate condition for unsupported field '%s', skipping", field))
 		return nil, ""
