@@ -1,15 +1,18 @@
 version: '3.9'
 
 services:
-  dynamodb-local:
-    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /data"
-    image: "amazon/dynamodb-local:latest"
-    container_name: dynamodb-local
+  postgres:
+    image: "postgres:15"
+    container_name: postgres-db
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
     ports:
-      - "8000:8000"
+      - "5432:5432"
     volumes:
-      - "./dynamodb-data:/data"
-    user: "1000:1000"
+      - "./docker/postgres:/var/lib/postgresql/data"
+    restart: unless-stopped
 
   nats-server-1:
     image: nats:2.9-alpine
