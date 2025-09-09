@@ -11,10 +11,10 @@ RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 WORKDIR /app
 
 # Copy go mod files
-COPY go.mod go.sum ./
+COPY go.mod ./
 
 # Download dependencies
-RUN go mod download
+RUN go mod tidy
 
 # Copy proto files and generate protobuf code
 COPY proto/ ./proto/
