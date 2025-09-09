@@ -1027,8 +1027,8 @@ func main() {
 	} else if config.StorageType != "" {
 		storageType = config.StorageType
 	} else {
-		// Default to DynamoDB if no selection
-		storageType = "dynamodb"
+		// Default to PostgreSQL if no selection
+		storageType = "postgresql"
 	}
 
 	// Initialize selected storage
