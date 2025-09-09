@@ -504,8 +504,8 @@ func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchConditi
 	availableFields := g.getAvailableSearchableFields(businessCriticalFields)
 
 	if len(availableFields) == 0 {
-		g.logger.Warn("No searchable values available for the supported indexed fields. Need to create tickets first.")
-		g.logger.Debug(fmt.Sprintf("Supported indexed fields: %v", businessCriticalFields))
+		//g.logger.Warn("No searchable values available for the supported indexed fields. Need to create tickets first.")
+		//g.logger.Debug(fmt.Sprintf("Supported indexed fields: %v", businessCriticalFields))
 		return []httpclient.SearchCondition{}, ""
 	}
 
@@ -925,7 +925,7 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 	if fieldsWrapper, ok := ticketData["fields"].(map[string]interface{}); ok {
 		// Data is wrapped in "fields" object
 		fields = fieldsWrapper
-		g.logger.Debug(fmt.Sprintf("Using wrapped fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields)))
+		//g.logger.Debug(fmt.Sprintf("Using wrapped fields for tenant %s. Available fields: %v", tenantID, getMapKeys(fields)))
 	} else {
 		// Data is directly at top level (CSV format)
 		fields = ticketData
@@ -982,8 +982,8 @@ func (g *Generator) collectSearchableValues(tenantID string, ticketData map[stri
 
 	// Log collection summary
 	if collectedCount > 0 {
-		g.logger.Debug(fmt.Sprintf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only indexed fields supported)",
-			tenantID, collectedCount, skippedCount))
+		/*g.logger.Debug(fmt.Sprintf("Collected searchable values for tenant %s: %d fields collected, %d fields skipped (only indexed fields supported)",
+		tenantID, collectedCount, skippedCount))*/
 	}
 }
 
@@ -1177,7 +1177,7 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 	for _, field := range businessFields {
 		// Only consider fields that are in the supported list
 		if !supportedFields[field] {
-			g.logger.Warn(fmt.Sprintf("Field '%s' is not in the supported indexed fields, skipping", field))
+			//g.logger.Warn(fmt.Sprintf("Field '%s' is not in the supported indexed fields, skipping", field))
 			continue
 		}
 
@@ -1203,7 +1203,7 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 func (g *Generator) generateConditionFromCollectedValues(field string) (*httpclient.SearchCondition, string) {
 	// Validate that the field is in the supported indexed fields
 	if !g.isSupportedSearchField(field) {
-		g.logger.Warn(fmt.Sprintf("Attempted to generate condition for unsupported field '%s', skipping", field))
+		//g.logger.Warn(fmt.Sprintf("Attempted to generate condition for unsupported field '%s', skipping", field))
 		return nil, ""
 	}
 
