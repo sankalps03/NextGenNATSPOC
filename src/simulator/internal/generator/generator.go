@@ -1229,8 +1229,8 @@ func (g *Generator) generateConditionFromCollectedValues(field string) (*httpcli
 	// Determine operator based on field type and value
 	operator := g.selectOperatorForValue(cleanedValue)
 
-	g.logger.Debug(fmt.Sprintf("Generated search condition: field=%s, operator=%s, value=%v, tenant=%s",
-		field, operator, cleanedValue, tenantID))
+	/*g.logger.Debug(fmt.Sprintf("Generated search condition: field=%s, operator=%s, value=%v, tenant=%s",
+	field, operator, cleanedValue, tenantID))*/
 
 	return &httpclient.SearchCondition{
 		Field:    field,
