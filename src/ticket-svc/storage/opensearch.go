@@ -22,25 +22,58 @@ type OpenSearchStorage struct {
 }
 
 var staticFields = map[string]struct{}{
-	"requesterid":       {},
-	"technicianid":      {},
-	"groupid":           {},
-	"statusid":          {},
-	"priorityid":        {},
-	"urgencyid":         {},
-	"categoryid":        {},
-	"companyid":         {},
-	"departmentid":      {},
-	"locationid":        {},
-	"createdtime":       {},
-	"updatedtime":       {},
-	"lastresolvedtime":  {},
-	"lastclosedtime":    {},
-	"dueby":             {},
-	"oladueby":          {},
-	"ucdueby":           {},
-	"lastviolationtime": {},
-	"violatedslaid":     {},
+	"requesterid":            {},
+	"technicianid":           {},
+	"groupid":                {},
+	"statusid":               {},
+	"priorityid":             {},
+	"urgencyid":              {},
+	"categoryid":             {},
+	"companyid":              {},
+	"departmentid":           {},
+	"locationid":             {},
+	"createdtime":            {},
+	"updatedtime":            {},
+	"lastresolvedtime":       {},
+	"lastclosedtime":         {},
+	"dueby":                  {},
+	"oladueby":               {},
+	"ucdueby":                {},
+	"lastviolationtime":      {},
+	"violatedslaid":          {},
+	"updatedbyid":            {},
+	"createdbyid":            {},
+	"removedbyid":            {},
+	"impactid":               {},
+	"resolutionduelevel":     {},
+	"responseduelevel":       {},
+	"templateid":             {},
+	"emailreadconfigid":      {},
+	"requesttype":            {},
+	"servicecatalogid":       {},
+	"sourceid":               {},
+	"groupchangedtime":       {},
+	"oladuelevel":            {},
+	"suggestedcategoryid":    {},
+	"suggestedgroupid":       {},
+	"closedby":               {},
+	"resolvedby":             {},
+	"vendorid":               {},
+	"violateducid":           {},
+	"transitionmodelid":      {},
+	"messengerconfigid":      {},
+	"removedtime":            {},
+	"lastopenedtime":         {},
+	"olddueby":               {},
+	"oldresponsedue":         {},
+	"responsedue":            {},
+	"responseescalationtime": {},
+	"statuschangedtime":      {},
+	"olaescalationtime":      {},
+	"askfeedbackdate":        {},
+	"firstfeedbackdate":      {},
+	"lastucviolationtime":    {},
+	"lastapproveddate":       {},
 }
 
 func NewOpenSearchStorage(ctx context.Context, endpoint, indexName string) (*OpenSearchStorage, error) {
@@ -104,7 +137,7 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 				"fields": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						// 20 predefined static fields
+						// Predefined static fields
 						"requesterid": map[string]interface{}{
 							"type": "keyword",
 						},
@@ -161,6 +194,105 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 						},
 						"violatedslaid": map[string]interface{}{
 							"type": "keyword",
+						},
+						"updatedbyid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"createdbyid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"removedbyid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"impactid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"resolutionduelevel": map[string]interface{}{
+							"type": "keyword",
+						},
+						"responseduelevel": map[string]interface{}{
+							"type": "keyword",
+						},
+						"templateid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"emailreadconfigid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"requesttype": map[string]interface{}{
+							"type": "keyword",
+						},
+						"servicecatalogid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"sourceid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"groupchangedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"oladuelevel": map[string]interface{}{
+							"type": "keyword",
+						},
+						"suggestedcategoryid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"suggestedgroupid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"closedby": map[string]interface{}{
+							"type": "keyword",
+						},
+						"resolvedby": map[string]interface{}{
+							"type": "keyword",
+						},
+						"vendorid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"violateducid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"transitionmodelid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"messengerconfigid": map[string]interface{}{
+							"type": "keyword",
+						},
+						"removedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"lastopenedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"olddueby": map[string]interface{}{
+							"type": "date",
+						},
+						"oldresponsedue": map[string]interface{}{
+							"type": "date",
+						},
+						"responsedue": map[string]interface{}{
+							"type": "date",
+						},
+						"responseescalationtime": map[string]interface{}{
+							"type": "date",
+						},
+						"statuschangedtime": map[string]interface{}{
+							"type": "date",
+						},
+						"olaescalationtime": map[string]interface{}{
+							"type": "date",
+						},
+						"askfeedbackdate": map[string]interface{}{
+							"type": "date",
+						},
+						"firstfeedbackdate": map[string]interface{}{
+							"type": "date",
+						},
+						"lastucviolationtime": map[string]interface{}{
+							"type": "date",
+						},
+						"lastapproveddate": map[string]interface{}{
+							"type": "date",
 						},
 					},
 					"dynamic": true, // Allow dynamic fields for the remaining 100-200 fields
