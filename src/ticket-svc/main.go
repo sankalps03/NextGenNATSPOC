@@ -40,12 +40,15 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", or "postgresql"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", or "scylladb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
 	PostgreSQLURL     string // PostgreSQL connection string
 	PostgreSQLTable   string // PostgreSQL base table name
+	ScyllaDBHosts     string // ScyllaDB hosts (comma-separated)
+	ScyllaDBKeyspace  string // ScyllaDB keyspace name
+	ScyllaDBTable     string // ScyllaDB base table name
 	InteractivePrompt bool   // Enable interactive storage selection
 }
 
@@ -918,6 +921,9 @@ func loadConfig() *Config {
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
 		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
 		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
+		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
+		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),
+		ScyllaDBTable:     getEnv("SCYLLADB_TABLE", "tickets"),
 		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "false") == "true",
 	}
 }
@@ -982,7 +988,8 @@ func promptForStorageType() string {
 		fmt.Println("1. DynamoDB")
 		fmt.Println("2. OpenSearch")
 		fmt.Println("3. PostgreSQL")
-		fmt.Print("Enter your choice (1, 2, or 3): ")
+		fmt.Println("4. ScyllaDB")
+		fmt.Print("Enter your choice (1, 2, 3, or 4): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1001,8 +1008,10 @@ func promptForStorageType() string {
 		case "3":
 			fmt.Println("Selected: PostgreSQL")
 			return "postgresql"
+		case "4":
+			return "scylladb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1, 2, or 3.")
+			fmt.Println("Invalid choice. Please enter 1, 2, 3, or 4.")
 		}
 	}
 }
@@ -1074,6 +1083,22 @@ func main() {
 		storage = postgresStorage
 		log.Printf("Using PostgreSQL storage with connection: %s and base table: %s",
 			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+	case "scylladb":
+		// Parse hosts from comma-separated string
+		hosts := strings.Split(config.ScyllaDBHosts, ",")
+		for i, host := range hosts {
+			hosts[i] = strings.TrimSpace(host)
+		}
+
+		scyllaStorage, err := storage2.NewScyllaDBStorage(context.Background(), hosts, config.ScyllaDBKeyspace, config.ScyllaDBTable)
+		if err != nil {
+			log.Fatalf("Failed to initialize ScyllaDB storage: %v", err)
+
+			return
+		}
+		storage = scyllaStorage
+		log.Printf("Using ScyllaDB storage with hosts: %v, keyspace: %s, base table: %s",
+			hosts, config.ScyllaDBKeyspace, config.ScyllaDBTable)
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}
