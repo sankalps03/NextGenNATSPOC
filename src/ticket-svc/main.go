@@ -40,7 +40,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", or "scylladb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "scylladb", or "mongodb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -49,6 +49,11 @@ type Config struct {
 	ScyllaDBHosts     string // ScyllaDB hosts (comma-separated)
 	ScyllaDBKeyspace  string // ScyllaDB keyspace name
 	ScyllaDBTable     string // ScyllaDB base table name
+	MongoDBURL        string // MongoDB connection string
+	MongoDBDatabase   string // MongoDB database name
+	MongoDBCollection string // MongoDB base collection name
+	MongoDBUsername   string // MongoDB username (optional)
+	MongoDBPassword   string // MongoDB password (optional)
 	InteractivePrompt bool   // Enable interactive storage selection
 }
 
@@ -924,6 +929,11 @@ func loadConfig() *Config {
 		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
 		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),
 		ScyllaDBTable:     getEnv("SCYLLADB_TABLE", "tickets"),
+		MongoDBURL:        getEnv("MONGODB_URL", "mongodb://localhost:27017"),
+		MongoDBDatabase:   getEnv("MONGODB_DATABASE", "tickets"),
+		MongoDBCollection: getEnv("MONGODB_COLLECTION", "tickets"),
+		MongoDBUsername:   getEnv("MONGODB_USERNAME", ""),
+		MongoDBPassword:   getEnv("MONGODB_PASSWORD", ""),
 		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "false") == "true",
 	}
 }
@@ -933,6 +943,49 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// buildMongoDBConnectionString constructs a MongoDB connection string with authentication if provided
+func buildMongoDBConnectionString(config *Config) string {
+	baseURL := config.MongoDBURL
+	username := config.MongoDBUsername
+	password := config.MongoDBPassword
+
+	// If no username/password provided, return the base URL as-is
+	if username == "" || password == "" {
+		return baseURL
+	}
+
+	// Parse the base URL to inject credentials
+	if strings.HasPrefix(baseURL, "mongodb://") {
+		// Remove mongodb:// prefix
+		urlWithoutPrefix := strings.TrimPrefix(baseURL, "mongodb://")
+
+		// Check if URL already contains credentials
+		if strings.Contains(urlWithoutPrefix, "@") {
+			log.Printf("WARNING: MongoDB URL already contains credentials, using provided URL as-is")
+			return baseURL
+		}
+
+		// Build URL with credentials: mongodb://username:password@host:port/database
+		return fmt.Sprintf("mongodb://%s:%s@%s", username, password, urlWithoutPrefix)
+	} else if strings.HasPrefix(baseURL, "mongodb+srv://") {
+		// Remove mongodb+srv:// prefix
+		urlWithoutPrefix := strings.TrimPrefix(baseURL, "mongodb+srv://")
+
+		// Check if URL already contains credentials
+		if strings.Contains(urlWithoutPrefix, "@") {
+			log.Printf("WARNING: MongoDB URL already contains credentials, using provided URL as-is")
+			return baseURL
+		}
+
+		// Build URL with credentials: mongodb+srv://username:password@host/database
+		return fmt.Sprintf("mongodb+srv://%s:%s@%s", username, password, urlWithoutPrefix)
+	}
+
+	// If URL format is not recognized, return as-is with warning
+	log.Printf("WARNING: Unrecognized MongoDB URL format, using provided URL as-is")
+	return baseURL
 }
 
 // maskConnectionString masks sensitive information in PostgreSQL connection string for logging
@@ -989,7 +1042,8 @@ func promptForStorageType() string {
 		fmt.Println("2. OpenSearch")
 		fmt.Println("3. PostgreSQL")
 		fmt.Println("4. ScyllaDB")
-		fmt.Print("Enter your choice (1, 2, 3, or 4): ")
+		fmt.Println("5. MongoDB")
+		fmt.Print("Enter your choice (1, 2, 3, 4, or 5): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1009,9 +1063,13 @@ func promptForStorageType() string {
 			fmt.Println("Selected: PostgreSQL")
 			return "postgresql"
 		case "4":
+			fmt.Println("Selected: ScyllaDB")
 			return "scylladb"
+		case "5":
+			fmt.Println("Selected: MongoDB")
+			return "mongodb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1, 2, 3, or 4.")
+			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, or 5.")
 		}
 	}
 }
@@ -1099,6 +1157,19 @@ func main() {
 		storage = scyllaStorage
 		log.Printf("Using ScyllaDB storage with hosts: %v, keyspace: %s, base table: %s",
 			hosts, config.ScyllaDBKeyspace, config.ScyllaDBTable)
+	case "mongodb":
+		// Build MongoDB connection string with authentication if provided
+		mongoURL := buildMongoDBConnectionString(config)
+
+		mongoStorage, err := storage2.NewMongoDBStorage(context.Background(), config.MongoDBCollection, mongoURL, config.MongoDBDatabase)
+		if err != nil {
+			log.Fatalf("Failed to initialize MongoDB storage: %v", err)
+
+			return
+		}
+		storage = mongoStorage
+		log.Printf("Using MongoDB storage with connection: %s, database: %s, base collection: %s",
+			maskConnectionString(mongoURL), config.MongoDBDatabase, config.MongoDBCollection)
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}
