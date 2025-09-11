@@ -209,6 +209,17 @@ func (p *PostgreSQLStorage) adaptSchemaForTenant(schemaContent, tableName string
 			}
 		}
 
+		if strings.Contains(strings.ToUpper(stmt), "CREATE UNIQUE INDEX") {
+			// Replace "ON tickets" with "ON {tableName}"
+			stmt = strings.ReplaceAll(stmt, "ON tickets(", fmt.Sprintf("ON %s(", tableName))
+			stmt = strings.ReplaceAll(stmt, "ON tickets ", fmt.Sprintf("ON %s ", tableName))
+
+			// Replace index names to be table-specific
+			if strings.Contains(stmt, "idx_tickets_") {
+				stmt = strings.ReplaceAll(stmt, "idx_tickets_", fmt.Sprintf("idx_%s_", tableName))
+			}
+		}
+
 		// Replace table name in TRIGGER statements
 		if strings.Contains(strings.ToUpper(stmt), "CREATE TRIGGER") {
 			stmt = strings.ReplaceAll(stmt, "ON tickets", fmt.Sprintf("ON %s", tableName))
