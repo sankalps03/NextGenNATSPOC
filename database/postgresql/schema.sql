@@ -148,66 +148,56 @@ COMMENT ON COLUMN tickets.statusid IS 'Current status of the ticket';
 COMMENT ON COLUMN tickets.priorityid IS 'Priority level of the ticket';
 COMMENT ON COLUMN tickets.dueby IS 'Unix timestamp when ticket is due for resolution';
 
--- Indexes for specified columns only (excluding primary key 'id')
--- User and assignment fields
-CREATE INDEX idx_tickets_updatedbyid ON tickets(updatedbyid);
-CREATE INDEX idx_tickets_createdbyid ON tickets(createdbyid);
-CREATE INDEX idx_tickets_removedbyid ON tickets(removedbyid);
-CREATE INDEX idx_tickets_requesterid ON tickets(requesterid);
-CREATE INDEX idx_tickets_technicianid ON tickets(technicianid);
-CREATE INDEX idx_tickets_closedby ON tickets(closedby);
-CREATE INDEX idx_tickets_resolvedby ON tickets(resolvedby);
+-- CLUSTERED INDEXES - Grouped by Business Domain
+-- Replaces individual field indexes to reduce write burden and improve query performance
 
--- Organizational and categorization fields
-CREATE INDEX idx_tickets_departmentid ON tickets(departmentid);
-CREATE INDEX idx_tickets_groupid ON tickets(groupid);
-CREATE INDEX idx_tickets_impactid ON tickets(impactid);
-CREATE INDEX idx_tickets_locationid ON tickets(locationid);
-CREATE INDEX idx_tickets_priorityid ON tickets(priorityid);
-CREATE INDEX idx_tickets_resolutionduelevel ON tickets(resolutionduelevel);
-CREATE INDEX idx_tickets_responseduelevel ON tickets(responseduelevel);
-CREATE INDEX idx_tickets_statusid ON tickets(statusid);
-CREATE INDEX idx_tickets_templateid ON tickets(templateid);
-CREATE INDEX idx_tickets_urgencyid ON tickets(urgencyid);
-CREATE INDEX idx_tickets_violatedslaid ON tickets(violatedslaid);
-CREATE INDEX idx_tickets_emailreadconfigid ON tickets(emailreadconfigid);
-CREATE INDEX idx_tickets_requesttype ON tickets(requesttype);
-CREATE INDEX idx_tickets_servicecatalogid ON tickets(servicecatalogid);
-CREATE INDEX idx_tickets_sourceid ON tickets(sourceid);
-CREATE INDEX idx_tickets_oladuelevel ON tickets(oladuelevel);
-CREATE INDEX idx_tickets_suggestedcategoryid ON tickets(suggestedcategoryid);
-CREATE INDEX idx_tickets_suggestedgroupid ON tickets(suggestedgroupid);
-CREATE INDEX idx_tickets_companyid ON tickets(companyid);
-CREATE INDEX idx_tickets_vendorid ON tickets(vendorid);
-CREATE INDEX idx_tickets_violateducid ON tickets(violateducid);
-CREATE INDEX idx_tickets_transitionmodelid ON tickets(transitionmodelid);
-CREATE INDEX idx_tickets_messengerconfigid ON tickets(messengerconfigid);
-
--- Timestamp fields
-CREATE INDEX idx_tickets_updatedtime ON tickets(updatedtime);
+-- Essential individual indexes for primary lookups
+CREATE UNIQUE INDEX idx_tickets_ticket_id ON tickets(ticket_id);
 CREATE INDEX idx_tickets_createdtime ON tickets(createdtime);
-CREATE INDEX idx_tickets_removedtime ON tickets(removedtime);
-CREATE INDEX idx_tickets_lastclosedtime ON tickets(lastclosedtime);
-CREATE INDEX idx_tickets_lastopenedtime ON tickets(lastopenedtime);
-CREATE INDEX idx_tickets_lastresolvedtime ON tickets(lastresolvedtime);
-CREATE INDEX idx_tickets_lastviolationtime ON tickets(lastviolationtime);
-CREATE INDEX idx_tickets_olddueby ON tickets(olddueby);
-CREATE INDEX idx_tickets_oldresponsedue ON tickets(oldresponsedue);
-CREATE INDEX idx_tickets_responsedue ON tickets(responsedue);
-CREATE INDEX idx_tickets_responseescalationtime ON tickets(responseescalationtime);
-CREATE INDEX idx_tickets_statuschangedtime ON tickets(statuschangedtime);
-CREATE INDEX idx_tickets_groupchangedtime ON tickets(groupchangedtime);
-CREATE INDEX idx_tickets_oladueby ON tickets(oladueby);
-CREATE INDEX idx_tickets_olaescalationtime ON tickets(olaescalationtime);
-CREATE INDEX idx_tickets_askfeedbackdate ON tickets(askfeedbackdate);
-CREATE INDEX idx_tickets_firstfeedbackdate ON tickets(firstfeedbackdate);
-CREATE INDEX idx_tickets_lastucviolationtime ON tickets(lastucviolationtime);
-CREATE INDEX idx_tickets_lastapproveddate ON tickets(lastapproveddate);
 
--- Composite indexes for common query patterns
-CREATE INDEX idx_tickets_tenant_status ON tickets(tenant, statusid);
-CREATE INDEX idx_tickets_company_status ON tickets(companyid, statusid);
-CREATE INDEX idx_tickets_requester_status ON tickets(requesterid, statusid);
-CREATE INDEX idx_tickets_technician_status ON tickets(technicianid, statusid);
-CREATE INDEX idx_tickets_group_priority ON tickets(groupid, priorityid);
-CREATE INDEX idx_tickets_created_status ON tickets(createdtime, statusid);
+-- 1. Request Metadata & Identity Cluster
+-- Groups: createdbyid, requesterid, technicianid, groupid, departmentid
+CREATE INDEX idx_tickets_request_identity ON tickets(tenant, requesterid, technicianid, groupid, departmentid, createdbyid);
+
+-- 2. SLA & Response Tracking Cluster
+-- Groups: dueby, firstresponsetime, responsedue, resolutionescalationtime, slaviolated
+CREATE INDEX idx_tickets_sla_tracking ON tickets(tenant, dueby, firstresponsetime, responsedue, resolutionescalationtime, lastviolationtime);
+
+-- 3. Status & Lifecycle Cluster
+-- Groups: statusid, statuschangedtime, lastopenedtime, lastresolvedtime, lastclosedtime
+CREATE INDEX idx_tickets_status_lifecycle ON tickets(tenant, statusid, statuschangedtime, lastopenedtime, lastresolvedtime, lastclosedtime);
+
+-- 4. Priority, Urgency & Impact Cluster
+-- Groups: priorityid, urgencyid, impactid, supportlevel, approvalstatus
+CREATE INDEX idx_tickets_priority_impact ON tickets(tenant, priorityid, urgencyid, impactid, supportlevel, approvalstatus);
+
+-- 5. OLA (Operational Level Agreements) Cluster
+-- Groups: oladueby, oladuelevel, olaescalationtime, olaviolated, lastolaviolationtime
+CREATE INDEX idx_tickets_ola_tracking ON tickets(tenant, oladueby, oladuelevel, olaescalationtime, lastolaviolationtime);
+
+-- 6. UC (Underlying Contract) Cluster
+-- Groups: ucdueby, ucduelevel, ucescalationtime, ucviolated, lastucviolationtime
+CREATE INDEX idx_tickets_uc_tracking ON tickets(tenant, ucdueby, ucduelevel, ucescalationtime, lastucviolationtime);
+
+-- 7. Timing & Durations Cluster
+-- Groups: totalonholdduration, totalresolutiontime, totalslapausetime, totalworkingtime, reopened
+CREATE INDEX idx_tickets_timing_durations ON tickets(tenant, totalonholdduration, totalresolutiontime, totalslapausetime, totalworkingtime, reopened);
+
+-- 8. Feedback & Closure Cluster
+-- Groups: askfeedbackdate, firstfeedbackdate, closedby, resolvedby, lastapproveddate
+CREATE INDEX idx_tickets_feedback_closure ON tickets(tenant, closedby, resolvedby, askfeedbackdate, firstfeedbackdate, lastapproveddate);
+
+-- 9. Category & Templates Cluster
+-- Groups: categoryid, suggestedcategoryid, templateid, servicecatalogid, requesttype
+CREATE INDEX idx_tickets_category_templates ON tickets(tenant, categoryid, templateid, servicecatalogid, requesttype, suggestedcategoryid);
+
+-- 10. Misc/Integration Cluster
+-- Groups: emailreadconfigid, messengerconfigid, vendorid, companyid
+CREATE INDEX idx_tickets_integration_misc ON tickets(tenant, companyid, vendorid, emailreadconfigid, messengerconfigid);
+
+-- Additional high-performance composite indexes for common query patterns
+CREATE INDEX idx_tickets_requester_status_priority ON tickets(requesterid, statusid, priorityid);
+CREATE INDEX idx_tickets_technician_status_created ON tickets(technicianid, statusid, createdtime);
+CREATE INDEX idx_tickets_group_status_due ON tickets(groupid, statusid, dueby);
+CREATE INDEX idx_tickets_company_category_status ON tickets(companyid, categoryid, statusid);
+CREATE INDEX idx_tickets_created_status_priority ON tickets(createdtime, statusid, priorityid);

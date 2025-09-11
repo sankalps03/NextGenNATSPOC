@@ -147,8 +147,10 @@ func (p *PostgreSQLStorage) loadSchemaFromFile() (string, error) {
 }
 
 // createTableIfNotExists creates a new PostgreSQL table using the schema from file
+// The schema includes clustered indexes grouped by business domain to reduce write burden
+// and improve query performance compared to individual field indexes
 func (p *PostgreSQLStorage) createTableIfNotExists(ctx context.Context, tableName string) error {
-	// Load schema from file
+	// Load schema from file (includes clustered indexing strategy)
 	schemaContent, err := p.loadSchemaFromFile()
 	if err != nil {
 		return fmt.Errorf("failed to load schema file: %w", err)
@@ -160,11 +162,13 @@ func (p *PostgreSQLStorage) createTableIfNotExists(ctx context.Context, tableNam
 		return fmt.Errorf("failed to adapt schema for tenant: %w", err)
 	}
 
-	// Execute the adapted schema
+	// Execute the adapted schema with clustered indexes
 	_, err = p.db.ExecContext(ctx, adaptedSchema)
 	if err != nil {
-		return fmt.Errorf("failed to create table %s: %w", tableName, err)
+		return fmt.Errorf("failed to create table %s with clustered indexes: %w", tableName, err)
 	}
+
+	log.Printf("Created PostgreSQL table %s with clustered indexing strategy", tableName)
 
 	log.Printf("Successfully created table %s from schema file", tableName)
 	return nil

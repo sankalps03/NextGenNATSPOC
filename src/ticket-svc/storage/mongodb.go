@@ -173,89 +173,201 @@ func (m *MongoDBStorage) ensureTenantCollection(ctx context.Context, tenant stri
 	return nil
 }
 
-// createIndexes creates indexes for all 49 fields on the collection
+// createIndexes creates clustered compound indexes grouped by business domain
+// This replaces individual field indexes to reduce write burden and improve query performance
 func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName string) error {
 	collection := m.database.Collection(collectionName)
 
-	// List of all fields that need indexes (based on ScyllaDB implementation)
-	indexFields := []string{
-		// Core fields
-		"ticket_id", "tenant", "created_at", "updated_at",
-
-		// User and assignment fields
-		"updatedbyid", "createdbyid", "removedbyid", "requesterid", "technicianid",
-		"closedby", "resolvedby",
-
-		// Timestamp fields
-		"updatedtime", "createdtime", "removedtime", "dueby", "firstresponsetime",
-		"lastclosedtime", "lastopenedtime", "lastresolvedtime", "lastviolationtime",
-		"olddueby", "oldresponsedue", "resolutionescalationtime", "responsedue",
-		"responseescalationtime", "statuschangedtime", "groupchangedtime",
-		"lastolaviolationtime", "oladueby", "oldoladueby", "askfeedbackdate",
-		"firstfeedbackdate", "olaescalationtime", "lastucviolationtime",
-		"olducdueby", "ucdueby", "ucescalationtime", "lastapproveddate",
-
-		// Category and classification fields
-		"categoryid", "departmentid", "groupid", "impactid", "locationid",
-		"priorityid", "statusid", "urgencyid", "violatedslaid", "servicecatalogid",
-		"sourceid", "requesttype", "suggestedcategoryid", "suggestedgroupid",
-		"companyid", "vendorid", "violateducid", "transitionmodelid",
-		"messengerconfigid",
-
-		// Approval and workflow fields
-		"approvalstatus", "approvaltype", "resolutionduelevel", "responseduelevel",
-		"supportlevel", "oladuelevel", "ucduelevel",
-
-		// Duration and time tracking fields
-		"totalonholdduration", "totalresolutiontime", "totalslapausetime",
-		"totalworkingtime", "totaluconholdduration", "totalucpausetime",
-		"totalucworkingtime", "totalucresolutiontime",
-
-		// Configuration and template fields
-		"templateid", "emailreadconfigid",
-	}
-
-	// Create compound index for tenant and ticket_id (primary lookup pattern)
-	compoundIndex := mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "tenant", Value: 1},
-			{Key: "ticket_id", Value: 1},
+	// Essential primary indexes
+	primaryIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "ticket_id", Value: 1}},
+			Options: options.Index().SetName("idx_ticket_id"),
 		},
-		Options: options.Index().SetUnique(true),
+		{
+			Keys:    bson.D{{Key: "createdtime", Value: 1}},
+			Options: options.Index().SetName("idx_created_time"),
+		},
 	}
 
-	if _, err := collection.Indexes().CreateOne(ctx, compoundIndex); err != nil {
-		log.Printf("Warning: Failed to create compound index on %s: %v", collectionName, err)
-	} else {
-		log.Printf("Created compound index (tenant, ticket_id) on collection: %s", collectionName)
+	// Clustered compound indexes grouped by business domain
+	clusterIndexes := []mongo.IndexModel{
+		// 1. Request Metadata & Identity Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "requesterid", Value: 1},
+				{Key: "technicianid", Value: 1},
+				{Key: "groupid", Value: 1},
+				{Key: "departmentid", Value: 1},
+				{Key: "createdbyid", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_request_identity"),
+		},
+		// 2. SLA & Response Tracking Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "dueby", Value: 1},
+				{Key: "firstresponsetime", Value: 1},
+				{Key: "responsedue", Value: 1},
+				{Key: "resolutionescalationtime", Value: 1},
+				{Key: "lastviolationtime", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_sla_tracking"),
+		},
+		// 3. Status & Lifecycle Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "statusid", Value: 1},
+				{Key: "statuschangedtime", Value: 1},
+				{Key: "lastopenedtime", Value: 1},
+				{Key: "lastresolvedtime", Value: 1},
+				{Key: "lastclosedtime", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_status_lifecycle"),
+		},
+		// 4. Priority, Urgency & Impact Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "priorityid", Value: 1},
+				{Key: "urgencyid", Value: 1},
+				{Key: "impactid", Value: 1},
+				{Key: "supportlevel", Value: 1},
+				{Key: "approvalstatus", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_priority_impact"),
+		},
+		// 5. OLA (Operational Level Agreements) Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "oladueby", Value: 1},
+				{Key: "oladuelevel", Value: 1},
+				{Key: "olaescalationtime", Value: 1},
+				{Key: "lastolaviolationtime", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_ola_tracking"),
+		},
+		// 6. UC (Underlying Contract) Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "ucdueby", Value: 1},
+				{Key: "ucduelevel", Value: 1},
+				{Key: "ucescalationtime", Value: 1},
+				{Key: "lastucviolationtime", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_uc_tracking"),
+		},
+		// 7. Timing & Durations Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "totalonholdduration", Value: 1},
+				{Key: "totalresolutiontime", Value: 1},
+				{Key: "totalslapausetime", Value: 1},
+				{Key: "totalworkingtime", Value: 1},
+				{Key: "reopened", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_timing_durations"),
+		},
+		// 8. Feedback & Closure Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "closedby", Value: 1},
+				{Key: "resolvedby", Value: 1},
+				{Key: "askfeedbackdate", Value: 1},
+				{Key: "firstfeedbackdate", Value: 1},
+				{Key: "lastapproveddate", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_feedback_closure"),
+		},
+		// 9. Category & Templates Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "categoryid", Value: 1},
+				{Key: "templateid", Value: 1},
+				{Key: "servicecatalogid", Value: 1},
+				{Key: "requesttype", Value: 1},
+				{Key: "suggestedcategoryid", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_category_templates"),
+		},
+		// 10. Misc/Integration Cluster
+		{
+			Keys: bson.D{
+				{Key: "tenant", Value: 1},
+				{Key: "companyid", Value: 1},
+				{Key: "vendorid", Value: 1},
+				{Key: "emailreadconfigid", Value: 1},
+				{Key: "messengerconfigid", Value: 1},
+			},
+			Options: options.Index().SetName("idx_cluster_integration_misc"),
+		},
 	}
 
-	// Create individual indexes for each field
-	var indexModels []mongo.IndexModel
-	for _, field := range indexFields {
-		indexModel := mongo.IndexModel{
-			Keys:    bson.D{{Key: field, Value: 1}},
-			Options: options.Index().SetName(fmt.Sprintf("idx_%s", field)),
-		}
-		indexModels = append(indexModels, indexModel)
+	// High-performance composite indexes for common query patterns
+	performanceIndexes := []mongo.IndexModel{
+		{
+			Keys: bson.D{
+				{Key: "requesterid", Value: 1},
+				{Key: "statusid", Value: 1},
+				{Key: "priorityid", Value: 1},
+			},
+			Options: options.Index().SetName("idx_perf_requester_status_priority"),
+		},
+		{
+			Keys: bson.D{
+				{Key: "technicianid", Value: 1},
+				{Key: "statusid", Value: 1},
+				{Key: "createdtime", Value: 1},
+			},
+			Options: options.Index().SetName("idx_perf_technician_status_created"),
+		},
+		{
+			Keys: bson.D{
+				{Key: "groupid", Value: 1},
+				{Key: "statusid", Value: 1},
+				{Key: "dueby", Value: 1},
+			},
+			Options: options.Index().SetName("idx_perf_group_status_due"),
+		},
+		{
+			Keys: bson.D{
+				{Key: "companyid", Value: 1},
+				{Key: "categoryid", Value: 1},
+				{Key: "statusid", Value: 1},
+			},
+			Options: options.Index().SetName("idx_perf_company_category_status"),
+		},
 	}
+
+	// Combine all indexes
+	allIndexes := append(primaryIndexes, clusterIndexes...)
+	allIndexes = append(allIndexes, performanceIndexes...)
 
 	// Create indexes in batches to avoid timeout
-	batchSize := 10
-	for i := 0; i < len(indexModels); i += batchSize {
+	batchSize := 5
+	for i := 0; i < len(allIndexes); i += batchSize {
 		end := i + batchSize
-		if end > len(indexModels) {
-			end = len(indexModels)
+		if end > len(allIndexes) {
+			end = len(allIndexes)
 		}
 
-		batch := indexModels[i:end]
+		batch := allIndexes[i:end]
 		if _, err := collection.Indexes().CreateMany(ctx, batch); err != nil {
-			log.Printf("Warning: Failed to create index batch %d-%d on %s: %v", i, end-1, collectionName, err)
+			log.Printf("Warning: Failed to create clustered index batch %d-%d on %s: %v", i, end-1, collectionName, err)
 		} else {
-			log.Printf("Created indexes batch %d-%d on collection: %s", i, end-1, collectionName)
+			log.Printf("Created clustered indexes batch %d-%d on collection: %s", i, end-1, collectionName)
 		}
 	}
 
+	log.Printf("Successfully created %d clustered indexes on collection: %s", len(allIndexes), collectionName)
 	return nil
 }
 

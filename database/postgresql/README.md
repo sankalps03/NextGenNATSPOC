@@ -23,34 +23,42 @@ This directory contains the PostgreSQL database schema and related files for the
 - **Text fields**: `VARCHAR` for limited text, `TEXT` for long content
 - **Numeric fields**: `INTEGER` for levels and counts, `BIGINT` for durations
 
-### Indexes
-The schema includes comprehensive indexing for optimal query performance:
+### Clustered Indexing Strategy
+The schema uses a clustered indexing approach that groups related fields by business domain to reduce write burden and improve query performance:
 
-#### Business-Critical Indexes
-- `requesterid` - User-based ticket searches
-- `technicianid` - Assignment and workload queries
-- `groupid` - Team-based filtering
-- `statusid` - Status-based filtering
-- `priorityid` - Priority-based queries
-- `companyid` - Multi-tenant isolation
-- `categoryid` - Service categorization
-
-#### Time-Based Indexes
+#### Essential Primary Indexes
+- `ticket_id` (unique) - Primary ticket lookup
+- `tenant` - Multi-tenant isolation
 - `createdtime` - Chronological sorting and range queries
-- `updatedtime` - Recent activity tracking
-- `dueby` - SLA deadline tracking
-- `lastresolvedtime` - Resolution analytics
-- `lastclosedtime` - Closure tracking
 
-#### Composite Indexes
-- `(companyid, statusid)` - Tenant-specific status queries
-- `(requesterid, statusid)` - User ticket status tracking
-- `(technicianid, statusid)` - Technician workload by status
-- `(groupid, priorityid)` - Team priority management
+#### Business Domain Clusters (10 clustered indexes)
+1. **Request Identity**: `(tenant, requesterid, technicianid, groupid, departmentid, createdbyid)`
+2. **SLA Tracking**: `(tenant, dueby, firstresponsetime, responsedue, resolutionescalationtime, lastviolationtime)`
+3. **Status Lifecycle**: `(tenant, statusid, statuschangedtime, lastopenedtime, lastresolvedtime, lastclosedtime)`
+4. **Priority Impact**: `(tenant, priorityid, urgencyid, impactid, supportlevel, approvalstatus)`
+5. **OLA Tracking**: `(tenant, oladueby, oladuelevel, olaescalationtime, lastolaviolationtime)`
+6. **UC Tracking**: `(tenant, ucdueby, ucduelevel, ucescalationtime, lastucviolationtime)`
+7. **Timing Durations**: `(tenant, totalonholdduration, totalresolutiontime, totalslapausetime, totalworkingtime, reopened)`
+8. **Feedback Closure**: `(tenant, closedby, resolvedby, askfeedbackdate, firstfeedbackdate, lastapproveddate)`
+9. **Category Templates**: `(tenant, categoryid, templateid, servicecatalogid, requesttype, suggestedcategoryid)`
+10. **Integration Misc**: `(tenant, companyid, vendorid, emailreadconfigid, messengerconfigid)`
+
+#### High-Performance Composite Indexes
+- `(requesterid, statusid, priorityid)` - User ticket management
+- `(technicianid, statusid, createdtime)` - Technician workload tracking
+- `(groupid, statusid, dueby)` - Team SLA management
+- `(companyid, categoryid, statusid)` - Company service analytics
+- `(createdtime, statusid, priorityid)` - Time-based priority queries
+
+#### Benefits of Clustered Indexing
+- **Reduced Write Overhead**: ~60% fewer indexes (17 vs 49+)
+- **Better Query Performance**: Single index satisfies multi-field queries
+- **Lower Storage Overhead**: More efficient index storage
+- **Logical Organization**: Indexes grouped by business domain
 
 ## Usage Instructions
 
-### 1. Database Setup
+### 1. New Database Setup
 ```sql
 -- Create database
 CREATE DATABASE ticket_management;
@@ -58,8 +66,19 @@ CREATE DATABASE ticket_management;
 -- Connect to database
 \c ticket_management;
 
--- Run schema creation
+-- Run schema creation with clustered indexes
 \i schema.sql
+```
+
+### 2. Migrating Existing Database
+```sql
+-- For existing databases, use the migration script
+\i migrate_to_clustered_indexes.sql
+
+-- The migration script will:
+-- 1. Create new clustered indexes alongside existing ones
+-- 2. Allow verification of query performance
+-- 3. Provide option to drop old individual indexes
 ```
 
 ### 2. Sample Data
