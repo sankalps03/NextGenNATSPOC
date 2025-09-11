@@ -1,18 +1,31 @@
-version: '3.9'
 
 services:
-  postgres:
-    image: "postgres:15"
-    container_name: postgres-db
-    environment:
-      POSTGRES_DB: myapp
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+  mongo:
+    image: mongo:latest   # always pulls the latest stable release
+    container_name: mongo
+    restart: always
     ports:
-      - "5432:5432"
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
     volumes:
-      - "./docker/postgres:/var/lib/postgresql/data"
-    restart: unless-stopped
+      - mongo-data:/data/db
+
+  scylla:
+    image: scylladb/scylla:latest
+    container_name: scylla
+    command:
+      - --smp=1
+      - --memory=2G
+      - --overprovisioned=1
+      - --api-address=0.0.0.0
+    ports:
+      - "9042:9042"   # CQL
+      - "9180:9180"   # REST API
+      - "10000:10000" # Prometheus metrics
+    volumes:
+      - scylla-data:/var/lib/scylla
 
   nats-server-1:
     image: nats:2.9-alpine
@@ -68,38 +81,6 @@ services:
     volumes:
       - "./nats-data-3:/data"
 
-  opensearch:
-    image: opensearchproject/opensearch:2.11.0
-    container_name: opensearch
-    environment:
-      - cluster.name=opensearch-cluster
-      - node.name=opensearch-node1
-      - discovery.type=single-node
-      - bootstrap.memory_lock=true
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Mind@#$123
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
-      - plugins.security.disabled=true        # disable security for local POC
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    volumes:
-      - opensearch-data1:/usr/share/opensearch/data
-    ports:
-      - 9200:9200
-      - 9600:9600
-
-  opensearch-dashboards:
-    image: opensearchproject/opensearch-dashboards:2.11.0
-    container_name: opensearch-dashboards
-    ports:
-      - 5601:5601
-    environment:
-      - OPENSEARCH_HOSTS=http://opensearch:9200
-      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
-    depends_on:
-      - opensearch
-
 # Volume definitions must be at the root level
 volumes:
-  opensearch-data1:
+  monetdb-data:
