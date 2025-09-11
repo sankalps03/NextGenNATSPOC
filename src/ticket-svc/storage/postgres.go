@@ -864,6 +864,45 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(tenant string, request S
 	return tickets, nil
 }
 
+// Analytics methods - stub implementations for PostgreSQL
+// TODO: Implement full PostgreSQL analytics queries
+
+// GetSLAViolatedTicketCount returns the count of tickets with SLA violations
+func (p *PostgreSQLStorage) GetSLAViolatedTicketCount(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Value: 0,
+		Count: 0,
+	}, fmt.Errorf("analytics not yet implemented for PostgreSQL storage")
+}
+
+// GetSLAViolationPercentage returns the percentage of tickets with SLA violations
+func (p *PostgreSQLStorage) GetSLAViolationPercentage(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Value: 0.0,
+	}, fmt.Errorf("analytics not yet implemented for PostgreSQL storage")
+}
+
+// GetDepartmentWiseUnresolvedTicketCount returns unresolved ticket count by department
+func (p *PostgreSQLStorage) GetDepartmentWiseUnresolvedTicketCount(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Data: []map[string]interface{}{},
+	}, fmt.Errorf("analytics not yet implemented for PostgreSQL storage")
+}
+
+// GetPriorityWiseTicketCount returns ticket count by priority
+func (p *PostgreSQLStorage) GetPriorityWiseTicketCount(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Data: []map[string]interface{}{},
+	}, fmt.Errorf("analytics not yet implemented for PostgreSQL storage")
+}
+
+// GetResolutionTimePerTechnician returns average resolution time per technician
+func (p *PostgreSQLStorage) GetResolutionTimePerTechnician(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Data: []map[string]interface{}{},
+	}, fmt.Errorf("analytics not yet implemented for PostgreSQL storage")
+}
+
 // Close closes the database connection
 func (p *PostgreSQLStorage) Close() error {
 	if p.db != nil {

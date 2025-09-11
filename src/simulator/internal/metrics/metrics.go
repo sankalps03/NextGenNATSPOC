@@ -16,38 +16,43 @@ type Metrics struct {
 	logger logger.Logger
 
 	// Request counters
-	createRequests int64
-	searchRequests int64
-	getRequests    int64
-	updateRequests int64
+	createRequests    int64
+	searchRequests    int64
+	getRequests       int64
+	updateRequests    int64
+	analyticsRequests int64
 
 	// Success counters
-	createSuccess int64
-	searchSuccess int64
-	getSuccess    int64
-	updateSuccess int64
+	createSuccess    int64
+	searchSuccess    int64
+	getSuccess       int64
+	updateSuccess    int64
+	analyticsSuccess int64
 
 	// Error counters
-	createErrors int64
-	searchErrors int64
-	getErrors    int64
-	updateErrors int64
+	createErrors    int64
+	searchErrors    int64
+	getErrors       int64
+	updateErrors    int64
+	analyticsErrors int64
 
 	// Response time tracking
-	createResponseTimes []time.Duration
-	searchResponseTimes []time.Duration
-	getResponseTimes    []time.Duration
-	updateResponseTimes []time.Duration
+	createResponseTimes    []time.Duration
+	searchResponseTimes    []time.Duration
+	getResponseTimes       []time.Duration
+	updateResponseTimes    []time.Duration
+	analyticsResponseTimes []time.Duration
 
 	// Rate tracking
 	startTime      time.Time
 	lastReportTime time.Time
 
 	// Current rates (requests per second)
-	currentCreateRate float64
-	currentSearchRate float64
-	currentGetRate    float64
-	currentUpdateRate float64
+	currentCreateRate    float64
+	currentSearchRate    float64
+	currentGetRate       float64
+	currentUpdateRate    float64
+	currentAnalyticsRate float64
 }
 
 // MetricsSnapshot represents a point-in-time view of metrics
@@ -60,40 +65,46 @@ type MetricsSnapshot struct {
 	TotalErrors   int64 `json:"total_errors"`
 
 	// Per-operation counts
-	CreateRequests int64 `json:"create_requests"`
-	SearchRequests int64 `json:"search_requests"`
-	GetRequests    int64 `json:"get_requests"`
-	UpdateRequests int64 `json:"update_requests"`
+	CreateRequests    int64 `json:"create_requests"`
+	SearchRequests    int64 `json:"search_requests"`
+	GetRequests       int64 `json:"get_requests"`
+	UpdateRequests    int64 `json:"update_requests"`
+	AnalyticsRequests int64 `json:"analytics_requests"`
 
-	CreateSuccess int64 `json:"create_success"`
-	SearchSuccess int64 `json:"search_success"`
-	GetSuccess    int64 `json:"get_success"`
-	UpdateSuccess int64 `json:"update_success"`
+	CreateSuccess    int64 `json:"create_success"`
+	SearchSuccess    int64 `json:"search_success"`
+	GetSuccess       int64 `json:"get_success"`
+	UpdateSuccess    int64 `json:"update_success"`
+	AnalyticsSuccess int64 `json:"analytics_success"`
 
-	CreateErrors int64 `json:"create_errors"`
-	SearchErrors int64 `json:"search_errors"`
-	GetErrors    int64 `json:"get_errors"`
-	UpdateErrors int64 `json:"update_errors"`
+	CreateErrors    int64 `json:"create_errors"`
+	SearchErrors    int64 `json:"search_errors"`
+	GetErrors       int64 `json:"get_errors"`
+	UpdateErrors    int64 `json:"update_errors"`
+	AnalyticsErrors int64 `json:"analytics_errors"`
 
 	// Success rates (percentage)
-	CreateSuccessRate  float64 `json:"create_success_rate"`
-	SearchSuccessRate  float64 `json:"search_success_rate"`
-	GetSuccessRate     float64 `json:"get_success_rate"`
-	UpdateSuccessRate  float64 `json:"update_success_rate"`
-	OverallSuccessRate float64 `json:"overall_success_rate"`
+	CreateSuccessRate    float64 `json:"create_success_rate"`
+	SearchSuccessRate    float64 `json:"search_success_rate"`
+	GetSuccessRate       float64 `json:"get_success_rate"`
+	UpdateSuccessRate    float64 `json:"update_success_rate"`
+	AnalyticsSuccessRate float64 `json:"analytics_success_rate"`
+	OverallSuccessRate   float64 `json:"overall_success_rate"`
 
 	// Current rates (requests per second)
-	CreateRate float64 `json:"create_rate"`
-	SearchRate float64 `json:"search_rate"`
-	GetRate    float64 `json:"get_rate"`
-	UpdateRate float64 `json:"update_rate"`
-	TotalRate  float64 `json:"total_rate"`
+	CreateRate    float64 `json:"create_rate"`
+	SearchRate    float64 `json:"search_rate"`
+	GetRate       float64 `json:"get_rate"`
+	UpdateRate    float64 `json:"update_rate"`
+	AnalyticsRate float64 `json:"analytics_rate"`
+	TotalRate     float64 `json:"total_rate"`
 
 	// Average response times (milliseconds)
-	AvgCreateResponseTime float64 `json:"avg_create_response_time_ms"`
-	AvgSearchResponseTime float64 `json:"avg_search_response_time_ms"`
-	AvgGetResponseTime    float64 `json:"avg_get_response_time_ms"`
-	AvgUpdateResponseTime float64 `json:"avg_update_response_time_ms"`
+	AvgCreateResponseTime    float64 `json:"avg_create_response_time_ms"`
+	AvgSearchResponseTime    float64 `json:"avg_search_response_time_ms"`
+	AvgGetResponseTime       float64 `json:"avg_get_response_time_ms"`
+	AvgUpdateResponseTime    float64 `json:"avg_update_response_time_ms"`
+	AvgAnalyticsResponseTime float64 `json:"avg_analytics_response_time_ms"`
 
 	// Runtime information
 	UptimeSeconds float64 `json:"uptime_seconds"`
@@ -169,6 +180,21 @@ func (m *Metrics) RecordUpdateRequest(duration time.Duration, success bool) {
 	}
 }
 
+// RecordAnalyticsRequest records an analytics request
+func (m *Metrics) RecordAnalyticsRequest(duration time.Duration, success bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.analyticsRequests++
+	m.analyticsResponseTimes = append(m.analyticsResponseTimes, duration)
+
+	if success {
+		m.analyticsSuccess++
+	} else {
+		m.analyticsErrors++
+	}
+}
+
 // GetSnapshot returns a snapshot of current metrics
 func (m *Metrics) GetSnapshot() MetricsSnapshot {
 	m.mu.RLock()
@@ -178,15 +204,16 @@ func (m *Metrics) GetSnapshot() MetricsSnapshot {
 	uptime := now.Sub(m.startTime).Seconds()
 
 	// Calculate totals
-	totalRequests := m.createRequests + m.searchRequests + m.getRequests + m.updateRequests
-	totalSuccess := m.createSuccess + m.searchSuccess + m.getSuccess + m.updateSuccess
-	totalErrors := m.createErrors + m.searchErrors + m.getErrors + m.updateErrors
+	totalRequests := m.createRequests + m.searchRequests + m.getRequests + m.updateRequests + m.analyticsRequests
+	totalSuccess := m.createSuccess + m.searchSuccess + m.getSuccess + m.updateSuccess + m.analyticsSuccess
+	totalErrors := m.createErrors + m.searchErrors + m.getErrors + m.updateErrors + m.analyticsErrors
 
 	// Calculate success rates
 	createSuccessRate := calculateSuccessRate(m.createSuccess, m.createRequests)
 	searchSuccessRate := calculateSuccessRate(m.searchSuccess, m.searchRequests)
 	getSuccessRate := calculateSuccessRate(m.getSuccess, m.getRequests)
 	updateSuccessRate := calculateSuccessRate(m.updateSuccess, m.updateRequests)
+	analyticsSuccessRate := calculateSuccessRate(m.analyticsSuccess, m.analyticsRequests)
 	overallSuccessRate := calculateSuccessRate(totalSuccess, totalRequests)
 
 	// Calculate current rates
@@ -194,6 +221,7 @@ func (m *Metrics) GetSnapshot() MetricsSnapshot {
 	searchRate := float64(m.searchRequests) / uptime
 	getRate := float64(m.getRequests) / uptime
 	updateRate := float64(m.updateRequests) / uptime
+	analyticsRate := float64(m.analyticsRequests) / uptime
 	totalRate := float64(totalRequests) / uptime
 
 	// Calculate average response times
@@ -201,6 +229,7 @@ func (m *Metrics) GetSnapshot() MetricsSnapshot {
 	avgSearchResponseTime := calculateAvgResponseTime(m.searchResponseTimes)
 	avgGetResponseTime := calculateAvgResponseTime(m.getResponseTimes)
 	avgUpdateResponseTime := calculateAvgResponseTime(m.updateResponseTimes)
+	avgAnalyticsResponseTime := calculateAvgResponseTime(m.analyticsResponseTimes)
 
 	return MetricsSnapshot{
 		Timestamp: now,
@@ -209,37 +238,43 @@ func (m *Metrics) GetSnapshot() MetricsSnapshot {
 		TotalSuccess:  totalSuccess,
 		TotalErrors:   totalErrors,
 
-		CreateRequests: m.createRequests,
-		SearchRequests: m.searchRequests,
-		GetRequests:    m.getRequests,
-		UpdateRequests: m.updateRequests,
+		CreateRequests:    m.createRequests,
+		SearchRequests:    m.searchRequests,
+		GetRequests:       m.getRequests,
+		UpdateRequests:    m.updateRequests,
+		AnalyticsRequests: m.analyticsRequests,
 
-		CreateSuccess: m.createSuccess,
-		SearchSuccess: m.searchSuccess,
-		GetSuccess:    m.getSuccess,
-		UpdateSuccess: m.updateSuccess,
+		CreateSuccess:    m.createSuccess,
+		SearchSuccess:    m.searchSuccess,
+		GetSuccess:       m.getSuccess,
+		UpdateSuccess:    m.updateSuccess,
+		AnalyticsSuccess: m.analyticsSuccess,
 
-		CreateErrors: m.createErrors,
-		SearchErrors: m.searchErrors,
-		GetErrors:    m.getErrors,
-		UpdateErrors: m.updateErrors,
+		CreateErrors:    m.createErrors,
+		SearchErrors:    m.searchErrors,
+		GetErrors:       m.getErrors,
+		UpdateErrors:    m.updateErrors,
+		AnalyticsErrors: m.analyticsErrors,
 
-		CreateSuccessRate:  createSuccessRate,
-		SearchSuccessRate:  searchSuccessRate,
-		GetSuccessRate:     getSuccessRate,
-		UpdateSuccessRate:  updateSuccessRate,
-		OverallSuccessRate: overallSuccessRate,
+		CreateSuccessRate:    createSuccessRate,
+		SearchSuccessRate:    searchSuccessRate,
+		GetSuccessRate:       getSuccessRate,
+		UpdateSuccessRate:    updateSuccessRate,
+		AnalyticsSuccessRate: analyticsSuccessRate,
+		OverallSuccessRate:   overallSuccessRate,
 
-		CreateRate: createRate,
-		SearchRate: searchRate,
-		GetRate:    getRate,
-		UpdateRate: updateRate,
-		TotalRate:  totalRate,
+		CreateRate:    createRate,
+		SearchRate:    searchRate,
+		GetRate:       getRate,
+		UpdateRate:    updateRate,
+		AnalyticsRate: analyticsRate,
+		TotalRate:     totalRate,
 
-		AvgCreateResponseTime: avgCreateResponseTime,
-		AvgSearchResponseTime: avgSearchResponseTime,
-		AvgGetResponseTime:    avgGetResponseTime,
-		AvgUpdateResponseTime: avgUpdateResponseTime,
+		AvgCreateResponseTime:    avgCreateResponseTime,
+		AvgSearchResponseTime:    avgSearchResponseTime,
+		AvgGetResponseTime:       avgGetResponseTime,
+		AvgUpdateResponseTime:    avgUpdateResponseTime,
+		AvgAnalyticsResponseTime: avgAnalyticsResponseTime,
 
 		UptimeSeconds: uptime,
 	}

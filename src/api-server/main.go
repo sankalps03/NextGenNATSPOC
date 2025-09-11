@@ -578,6 +578,113 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// Analytics handler methods
+
+func (h *APIHandler) GetSLAViolatedTicketCount(w http.ResponseWriter, r *http.Request) {
+	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	requestData := map[string]interface{}{
+		"action": "analytics_sla_violated_count",
+		"tenant": tenant,
+	}
+
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	if err != nil {
+		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(response)
+}
+
+func (h *APIHandler) GetSLAViolationPercentage(w http.ResponseWriter, r *http.Request) {
+	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	requestData := map[string]interface{}{
+		"action": "analytics_sla_violation_percentage",
+		"tenant": tenant,
+	}
+
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	if err != nil {
+		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(response)
+}
+
+func (h *APIHandler) GetDepartmentWiseUnresolvedTicketCount(w http.ResponseWriter, r *http.Request) {
+	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	requestData := map[string]interface{}{
+		"action": "analytics_department_unresolved_tickets",
+		"tenant": tenant,
+	}
+
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	if err != nil {
+		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(response)
+}
+
+func (h *APIHandler) GetPriorityWiseTicketCount(w http.ResponseWriter, r *http.Request) {
+	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	requestData := map[string]interface{}{
+		"action": "analytics_priority_ticket_count",
+		"tenant": tenant,
+	}
+
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	if err != nil {
+		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(response)
+}
+
+func (h *APIHandler) GetResolutionTimePerTechnician(w http.ResponseWriter, r *http.Request) {
+	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
+
+	requestData := map[string]interface{}{
+		"action": "analytics_technician_resolution_time",
+		"tenant": tenant,
+	}
+
+	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	if err != nil {
+		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(response)
+}
+
 func setupRouter(handler *APIHandler) *mux.Router {
 	r := mux.NewRouter()
 
@@ -595,6 +702,14 @@ func setupRouter(handler *APIHandler) *mux.Router {
 	api.HandleFunc("/tickets/{id}", handler.GetTicket).Methods("GET")
 	api.HandleFunc("/tickets/{id}", handler.UpdateTicket).Methods("PUT")
 	api.HandleFunc("/tickets/{id}", handler.DeleteTicket).Methods("DELETE")
+
+	// Analytics endpoints
+	analytics := api.PathPrefix("/analytics").Subrouter()
+	analytics.HandleFunc("/sla-violated-count", handler.GetSLAViolatedTicketCount).Methods("GET")
+	analytics.HandleFunc("/sla-violation-percentage", handler.GetSLAViolationPercentage).Methods("GET")
+	analytics.HandleFunc("/department-unresolved-tickets", handler.GetDepartmentWiseUnresolvedTicketCount).Methods("GET")
+	analytics.HandleFunc("/priority-ticket-count", handler.GetPriorityWiseTicketCount).Methods("GET")
+	analytics.HandleFunc("/technician-resolution-time", handler.GetResolutionTimePerTechnician).Methods("GET")
 
 	api.HandleFunc("/notifications", handler.ListNotifications).Methods("GET")
 	api.HandleFunc("/notifications/{id}", handler.GetNotification).Methods("GET")

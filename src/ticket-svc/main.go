@@ -297,6 +297,16 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 		response, err = ts.handleDeleteTicket(req)
 	case "search":
 		response, err = ts.handleSearchTickets(req)
+	case "analytics_sla_violated_count":
+		response, err = ts.handleSLAViolatedTicketCount(req)
+	case "analytics_sla_violation_percentage":
+		response, err = ts.handleSLAViolationPercentage(req)
+	case "analytics_department_unresolved_tickets":
+		response, err = ts.handleDepartmentWiseUnresolvedTicketCount(req)
+	case "analytics_priority_ticket_count":
+		response, err = ts.handlePriorityWiseTicketCount(req)
+	case "analytics_technician_resolution_time":
+		response, err = ts.handleResolutionTimePerTechnician(req)
 	default:
 		response = ErrorResponse{Error: "unknown_action", Message: "Unknown action: " + req.Action}
 	}
@@ -909,6 +919,88 @@ func (ts *TicketService) publishTicketSearched(ctx context.Context, tenant strin
 	}
 
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
+}
+
+// Analytics handler methods
+
+func (ts *TicketService) handleSLAViolatedTicketCount(req ServiceRequest) (interface{}, error) {
+	// Measure database latency
+	dbStart := time.Now()
+	result, err := ts.storage.GetSLAViolatedTicketCount(req.Tenant)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get SLA violated ticket count: %w", err)
+	}
+
+	return ResponseWithLatency{
+		Data:            result,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
+}
+
+func (ts *TicketService) handleSLAViolationPercentage(req ServiceRequest) (interface{}, error) {
+	// Measure database latency
+	dbStart := time.Now()
+	result, err := ts.storage.GetSLAViolationPercentage(req.Tenant)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get SLA violation percentage: %w", err)
+	}
+
+	return ResponseWithLatency{
+		Data:            result,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
+}
+
+func (ts *TicketService) handleDepartmentWiseUnresolvedTicketCount(req ServiceRequest) (interface{}, error) {
+	// Measure database latency
+	dbStart := time.Now()
+	result, err := ts.storage.GetDepartmentWiseUnresolvedTicketCount(req.Tenant)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get department-wise unresolved ticket count: %w", err)
+	}
+
+	return ResponseWithLatency{
+		Data:            result,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
+}
+
+func (ts *TicketService) handlePriorityWiseTicketCount(req ServiceRequest) (interface{}, error) {
+	// Measure database latency
+	dbStart := time.Now()
+	result, err := ts.storage.GetPriorityWiseTicketCount(req.Tenant)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get priority-wise ticket count: %w", err)
+	}
+
+	return ResponseWithLatency{
+		Data:            result,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
+}
+
+func (ts *TicketService) handleResolutionTimePerTechnician(req ServiceRequest) (interface{}, error) {
+	// Measure database latency
+	dbStart := time.Now()
+	result, err := ts.storage.GetResolutionTimePerTechnician(req.Tenant)
+	dbLatency := time.Since(dbStart)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get resolution time per technician: %w", err)
+	}
+
+	return ResponseWithLatency{
+		Data:            result,
+		DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
+	}, nil
 }
 
 func loadConfig() *Config {

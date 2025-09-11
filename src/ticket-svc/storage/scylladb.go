@@ -1377,6 +1377,265 @@ func scanRowSafely(iter *gocql.Iter) (map[string]interface{}, bool) {
 	return rowMap, true
 }
 
+// GetSLAViolatedTicketCount returns the count of tickets with SLA violations
+func (s *ScyllaDBStorage) GetSLAViolatedTicketCount(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := s.ensureTenantTable(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	tableName := s.getTenantTableName(tenant)
+
+	// CQL query for SLA violated ticket count
+	query := fmt.Sprintf(`
+		SELECT COUNT(*) as ticket_count
+		FROM %s.%s
+		WHERE slaviolated = true
+		ALLOW FILTERING
+	`, s.keyspace, tableName)
+
+	var count int64
+	if err := s.session.Query(query).WithContext(ctx).Scan(&count); err != nil {
+		return nil, fmt.Errorf("failed to execute SLA violated count query: %w", err)
+	}
+
+	return &AnalyticsResult{
+		Value: count,
+		Count: count,
+	}, nil
+}
+
+// GetSLAViolationPercentage returns the percentage of tickets with SLA violations
+func (s *ScyllaDBStorage) GetSLAViolationPercentage(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := s.ensureTenantTable(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	tableName := s.getTenantTableName(tenant)
+
+	// Get total count
+	totalQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s.%s`, s.keyspace, tableName)
+	var totalCount int64
+	if err := s.session.Query(totalQuery).WithContext(ctx).Scan(&totalCount); err != nil {
+		return nil, fmt.Errorf("failed to get total ticket count: %w", err)
+	}
+
+	if totalCount == 0 {
+		return &AnalyticsResult{
+			Value: 0.0,
+		}, nil
+	}
+
+	// Get SLA violated count
+	violatedQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM %s.%s
+		WHERE slaviolated = true
+		ALLOW FILTERING
+	`, s.keyspace, tableName)
+
+	var violatedCount int64
+	if err := s.session.Query(violatedQuery).WithContext(ctx).Scan(&violatedCount); err != nil {
+		return nil, fmt.Errorf("failed to get SLA violated count: %w", err)
+	}
+
+	percentage := (float64(violatedCount) / float64(totalCount)) * 100.0
+
+	return &AnalyticsResult{
+		Value: percentage,
+	}, nil
+}
+
+// GetDepartmentWiseUnresolvedTicketCount returns unresolved ticket count by department
+func (s *ScyllaDBStorage) GetDepartmentWiseUnresolvedTicketCount(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := s.ensureTenantTable(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	tableName := s.getTenantTableName(tenant)
+
+	// Since ScyllaDB doesn't support GROUP BY on non-primary key columns efficiently,
+	// we'll fetch all unresolved tickets and aggregate client-side
+	query := fmt.Sprintf(`
+		SELECT departmentid
+		FROM %s.%s
+		WHERE tenant = ? AND statusid IN (8, 9, 10, 11, 12, 94, 96)
+		ALLOW FILTERING
+	`, s.keyspace, tableName)
+
+	iter := s.session.Query(query, tenant).WithContext(ctx).Iter()
+	defer iter.Close()
+
+	// Map to count tickets per department
+	departmentCounts := make(map[int64]int64)
+
+	var departmentID *int64
+
+	for iter.Scan(&departmentID) {
+		if departmentID != nil {
+			departmentCounts[*departmentID]++
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to execute department-wise query: %w", err)
+	}
+
+	// Build results from aggregated data
+	var results []map[string]interface{}
+	for deptID, count := range departmentCounts {
+		results = append(results, map[string]interface{}{
+			"department_id": deptID,
+			"open_tickets":  count,
+		})
+	}
+
+	// Sort by open_tickets descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i]["open_tickets"].(int64) > results[j]["open_tickets"].(int64)
+	})
+
+	return &AnalyticsResult{
+		Data: results,
+	}, nil
+}
+
+// GetPriorityWiseTicketCount returns ticket count by priority
+func (s *ScyllaDBStorage) GetPriorityWiseTicketCount(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := s.ensureTenantTable(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	tableName := s.getTenantTableName(tenant)
+
+	// Since ScyllaDB doesn't support GROUP BY on non-primary key columns efficiently,
+	// we'll fetch all tickets and aggregate client-side
+	query := fmt.Sprintf(`
+		SELECT priorityid
+		FROM %s.%s
+		WHERE tenant = ?
+		ALLOW FILTERING
+	`, s.keyspace, tableName)
+
+	iter := s.session.Query(query, tenant).WithContext(ctx).Iter()
+	defer iter.Close()
+
+	// Map to count tickets per priority
+	priorityCounts := make(map[int64]int64)
+
+	var priorityID *int64
+
+	for iter.Scan(&priorityID) {
+		if priorityID != nil {
+			priorityCounts[*priorityID]++
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to execute priority-wise query: %w", err)
+	}
+
+	// Build results from aggregated data
+	var results []map[string]interface{}
+	for prioID, count := range priorityCounts {
+		results = append(results, map[string]interface{}{
+			"priority_id":   prioID,
+			"total_tickets": count,
+		})
+	}
+
+	// Sort by total_tickets descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i]["total_tickets"].(int64) > results[j]["total_tickets"].(int64)
+	})
+
+	return &AnalyticsResult{
+		Data: results,
+	}, nil
+}
+
+// GetResolutionTimePerTechnician returns average resolution time per technician
+func (s *ScyllaDBStorage) GetResolutionTimePerTechnician(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant table exists
+	if err := s.ensureTenantTable(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	}
+
+	tableName := s.getTenantTableName(tenant)
+
+	// Since ScyllaDB doesn't support GROUP BY on non-primary key columns efficiently,
+	// we'll fetch all records with non-null totalresolutiontime and aggregate client-side
+	query := fmt.Sprintf(`
+		SELECT technicianid, totalresolutiontime
+		FROM %s.%s
+		WHERE tenant = ? AND totalresolutiontime IS NOT NULL
+		ALLOW FILTERING
+	`, s.keyspace, tableName)
+
+	iter := s.session.Query(query, tenant).WithContext(ctx).Iter()
+	defer iter.Close()
+
+	// Map to store technician data for aggregation
+	technicianData := make(map[int64][]float64)
+
+	var technicianID *int64
+	var resolutionTime *float64
+
+	for iter.Scan(&technicianID, &resolutionTime) {
+		if technicianID != nil && resolutionTime != nil {
+			technicianData[*technicianID] = append(technicianData[*technicianID], *resolutionTime)
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to execute resolution time query: %w", err)
+	}
+
+	// Calculate averages and build results
+	var results []map[string]interface{}
+	for techID, times := range technicianData {
+		if len(times) > 0 {
+			sum := 0.0
+			for _, time := range times {
+				sum += time
+			}
+			avgTime := sum / float64(len(times))
+
+			results = append(results, map[string]interface{}{
+				"technician_id":       techID,
+				"avg_resolution_time": avgTime,
+			})
+		}
+	}
+
+	// Sort by avg_resolution_time ascending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i]["avg_resolution_time"].(float64) < results[j]["avg_resolution_time"].(float64)
+	})
+
+	return &AnalyticsResult{
+		Data: results,
+	}, nil
+}
+
 // Close closes the ScyllaDB session
 func (s *ScyllaDBStorage) Close() error {
 	if s.session != nil {

@@ -910,6 +910,45 @@ func (storage *OpenSearchStorage) documentToTicket(doc map[string]interface{}) *
 	return ticket
 }
 
+// Analytics methods - stub implementations for OpenSearch
+// TODO: Implement full OpenSearch analytics queries
+
+// GetSLAViolatedTicketCount returns the count of tickets with SLA violations
+func (storage *OpenSearchStorage) GetSLAViolatedTicketCount(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Value: 0,
+		Count: 0,
+	}, fmt.Errorf("analytics not yet implemented for OpenSearch storage")
+}
+
+// GetSLAViolationPercentage returns the percentage of tickets with SLA violations
+func (storage *OpenSearchStorage) GetSLAViolationPercentage(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Value: 0.0,
+	}, fmt.Errorf("analytics not yet implemented for OpenSearch storage")
+}
+
+// GetDepartmentWiseUnresolvedTicketCount returns unresolved ticket count by department
+func (storage *OpenSearchStorage) GetDepartmentWiseUnresolvedTicketCount(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Data: []map[string]interface{}{},
+	}, fmt.Errorf("analytics not yet implemented for OpenSearch storage")
+}
+
+// GetPriorityWiseTicketCount returns ticket count by priority
+func (storage *OpenSearchStorage) GetPriorityWiseTicketCount(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Data: []map[string]interface{}{},
+	}, fmt.Errorf("analytics not yet implemented for OpenSearch storage")
+}
+
+// GetResolutionTimePerTechnician returns average resolution time per technician
+func (storage *OpenSearchStorage) GetResolutionTimePerTechnician(tenant string) (*AnalyticsResult, error) {
+	return &AnalyticsResult{
+		Data: []map[string]interface{}{},
+	}, fmt.Errorf("analytics not yet implemented for OpenSearch storage")
+}
+
 func (storage *OpenSearchStorage) Close() error {
 	// HTTP client doesn't need explicit close
 	return nil

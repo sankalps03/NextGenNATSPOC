@@ -25,6 +25,13 @@ type SearchRequest struct {
 	SortFields      []SortField       `json:"sort_fields,omitempty"`      // fields to sort by
 }
 
+// AnalyticsResult represents the result of an analytics query
+type AnalyticsResult struct {
+	Value interface{} `json:"value"` // Single value for gauge metrics
+	Data  interface{} `json:"data"`  // Grouped data for grid metrics
+	Count int64       `json:"count"` // Total count when applicable
+}
+
 // TicketStorage defines the interface for ticket storage operations
 type TicketStorage interface {
 	CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{})
@@ -34,5 +41,13 @@ type TicketStorage interface {
 	ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error)
 	SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error)
 	SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error)
+
+	// Analytics methods
+	GetSLAViolatedTicketCount(tenant string) (*AnalyticsResult, error)
+	GetSLAViolationPercentage(tenant string) (*AnalyticsResult, error)
+	GetDepartmentWiseUnresolvedTicketCount(tenant string) (*AnalyticsResult, error)
+	GetPriorityWiseTicketCount(tenant string) (*AnalyticsResult, error)
+	GetResolutionTimePerTechnician(tenant string) (*AnalyticsResult, error)
+
 	Close() error
 }

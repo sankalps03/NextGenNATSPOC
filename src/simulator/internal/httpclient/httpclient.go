@@ -409,6 +409,16 @@ func joinFields(fields []string) string {
 	return result
 }
 
+// Analytics methods
+
+// CallAnalyticsEndpoint calls an analytics endpoint
+func (c *HTTPClient) CallAnalyticsEndpoint(ctx context.Context, endpoint string, tenantID string) (*APIResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/analytics/%s", c.baseURL, endpoint)
+
+	// Use the existing makeRequestWithTenant method which handles retries
+	return c.makeRequestWithTenant(ctx, "GET", url, nil, tenantID)
+}
+
 // Close closes the HTTP client and cleans up resources
 func (c *HTTPClient) Close() error {
 	// Close idle connections

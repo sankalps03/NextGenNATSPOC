@@ -905,6 +905,297 @@ func (m *MongoDBStorage) SearchTicketsWithProjection(tenant string, request Sear
 	return tickets, nil
 }
 
+// GetSLAViolatedTicketCount returns the count of tickets with SLA violations
+func (m *MongoDBStorage) GetSLAViolatedTicketCount(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant collection exists
+	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
+	}
+
+	collectionName := m.getTenantCollectionName(tenant)
+	collection := m.database.Collection(collectionName)
+
+	// MongoDB aggregation pipeline for SLA violated ticket count
+	pipeline := []bson.M{
+		{
+			"$match": bson.M{
+				"slaviolated": true,
+			},
+		},
+		{
+			"$group": bson.M{
+				"_id":          nil,
+				"ticket_count": bson.M{"$sum": 1},
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute SLA violated count aggregation: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var result struct {
+		TicketCount int64 `bson:"ticket_count"`
+	}
+
+	if cursor.Next(ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode SLA violated count result: %w", err)
+		}
+	}
+
+	return &AnalyticsResult{
+		Value: result.TicketCount,
+		Count: result.TicketCount,
+	}, nil
+}
+
+// GetSLAViolationPercentage returns the percentage of tickets with SLA violations
+func (m *MongoDBStorage) GetSLAViolationPercentage(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant collection exists
+	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
+	}
+
+	collectionName := m.getTenantCollectionName(tenant)
+	collection := m.database.Collection(collectionName)
+
+	// MongoDB aggregation pipeline for SLA violation percentage
+	pipeline := []bson.M{
+		{
+			"$group": bson.M{
+				"_id":           nil,
+				"total_tickets": bson.M{"$sum": 1},
+				"sla_violated_tickets": bson.M{
+					"$sum": bson.M{
+						"$cond": []interface{}{
+							bson.M{"$eq": []interface{}{"$slaviolated", true}},
+							1,
+							0,
+						},
+					},
+				},
+			},
+		},
+		{
+			"$project": bson.M{
+				"sla_violation_percentage": bson.M{
+					"$multiply": []interface{}{
+						bson.M{
+							"$divide": []interface{}{"$sla_violated_tickets", "$total_tickets"},
+						},
+						100.0,
+					},
+				},
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute SLA violation percentage aggregation: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var result struct {
+		SLAViolationPercentage float64 `bson:"sla_violation_percentage"`
+	}
+
+	if cursor.Next(ctx) {
+		if err := cursor.Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode SLA violation percentage result: %w", err)
+		}
+	}
+
+	return &AnalyticsResult{
+		Value: result.SLAViolationPercentage,
+	}, nil
+}
+
+// GetDepartmentWiseUnresolvedTicketCount returns unresolved ticket count by department
+func (m *MongoDBStorage) GetDepartmentWiseUnresolvedTicketCount(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant collection exists
+	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
+	}
+
+	collectionName := m.getTenantCollectionName(tenant)
+	collection := m.database.Collection(collectionName)
+
+	// MongoDB aggregation pipeline for department-wise unresolved tickets
+	pipeline := []bson.M{
+		{
+			"$match": bson.M{
+				"statusid": bson.M{
+					"$in": []int{8, 9, 10, 11, 12, 94, 96},
+				},
+			},
+		},
+		{
+			"$group": bson.M{
+				"_id":          "$departmentid",
+				"open_tickets": bson.M{"$sum": 1},
+			},
+		},
+		{
+			"$sort": bson.M{
+				"open_tickets": -1,
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute department-wise unresolved count aggregation: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var results []map[string]interface{}
+	for cursor.Next(ctx) {
+		var result struct {
+			DepartmentID int64 `bson:"_id"`
+			OpenTickets  int64 `bson:"open_tickets"`
+		}
+		if err := cursor.Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode department-wise result: %w", err)
+		}
+		results = append(results, map[string]interface{}{
+			"department_id": result.DepartmentID,
+			"open_tickets":  result.OpenTickets,
+		})
+	}
+
+	return &AnalyticsResult{
+		Data: results,
+	}, nil
+}
+
+// GetPriorityWiseTicketCount returns ticket count by priority
+func (m *MongoDBStorage) GetPriorityWiseTicketCount(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant collection exists
+	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
+	}
+
+	collectionName := m.getTenantCollectionName(tenant)
+	collection := m.database.Collection(collectionName)
+
+	// MongoDB aggregation pipeline for priority-wise ticket count
+	pipeline := []bson.M{
+		{
+			"$group": bson.M{
+				"_id":           "$priorityid",
+				"total_tickets": bson.M{"$sum": 1},
+			},
+		},
+		{
+			"$sort": bson.M{
+				"total_tickets": -1,
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute priority-wise count aggregation: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var results []map[string]interface{}
+	for cursor.Next(ctx) {
+		var result struct {
+			PriorityID   int64 `bson:"_id"`
+			TotalTickets int64 `bson:"total_tickets"`
+		}
+		if err := cursor.Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode priority-wise result: %w", err)
+		}
+		results = append(results, map[string]interface{}{
+			"priority_id":   result.PriorityID,
+			"total_tickets": result.TotalTickets,
+		})
+	}
+
+	return &AnalyticsResult{
+		Data: results,
+	}, nil
+}
+
+// GetResolutionTimePerTechnician returns average resolution time per technician
+func (m *MongoDBStorage) GetResolutionTimePerTechnician(tenant string) (*AnalyticsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Ensure tenant collection exists
+	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
+	}
+
+	collectionName := m.getTenantCollectionName(tenant)
+	collection := m.database.Collection(collectionName)
+
+	// MongoDB aggregation pipeline for resolution time per technician
+	pipeline := []bson.M{
+		{
+			"$match": bson.M{
+				"totalresolutiontime": bson.M{
+					"$ne": nil,
+				},
+			},
+		},
+		{
+			"$group": bson.M{
+				"_id":                 "$technicianid",
+				"avg_resolution_time": bson.M{"$avg": "$totalresolutiontime"},
+			},
+		},
+		{
+			"$sort": bson.M{
+				"avg_resolution_time": 1,
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute resolution time per technician aggregation: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var results []map[string]interface{}
+	for cursor.Next(ctx) {
+		var result struct {
+			TechnicianID      int64   `bson:"_id"`
+			AvgResolutionTime float64 `bson:"avg_resolution_time"`
+		}
+		if err := cursor.Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode resolution time result: %w", err)
+		}
+		results = append(results, map[string]interface{}{
+			"technician_id":       result.TechnicianID,
+			"avg_resolution_time": result.AvgResolutionTime,
+		})
+	}
+
+	return &AnalyticsResult{
+		Data: results,
+	}, nil
+}
+
 // Close closes the MongoDB connection
 func (m *MongoDBStorage) Close() error {
 	if m.client != nil {

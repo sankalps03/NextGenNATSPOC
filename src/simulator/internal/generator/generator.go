@@ -97,8 +97,17 @@ func (g *Generator) Start(ctx context.Context) error {
 		}()
 	}
 
-	g.logger.Info(fmt.Sprintf("Generator started with EPS rates - Create: %.2f, Search: %.2f, Get: %.2f, Update: %.2f",
-		g.config.EPS.Create, g.config.EPS.Search, g.config.EPS.Get, g.config.EPS.Update))
+	// Start analytics generator
+	if g.config.Operations.Analytics.Enabled && g.config.EPS.Analytics > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g.runAnalyticsGenerator(ctx)
+		}()
+	}
+
+	g.logger.Info(fmt.Sprintf("Generator started with EPS rates - Create: %.2f, Search: %.2f, Get: %.2f, Update: %.2f, Analytics: %.2f",
+		g.config.EPS.Create, g.config.EPS.Search, g.config.EPS.Get, g.config.EPS.Update, g.config.EPS.Analytics))
 
 	wg.Wait()
 	g.logger.Info("All generators stopped")
@@ -1237,4 +1246,58 @@ func (g *Generator) generateConditionFromCollectedValues(field string) (*httpcli
 		Operator: operator,
 		Value:    cleanedValue,
 	}, tenantID
+}
+
+// runAnalyticsGenerator runs the analytics generator
+func (g *Generator) runAnalyticsGenerator(ctx context.Context) {
+	g.logger.Info(fmt.Sprintf("Starting analytics generator with EPS: %.2f", g.config.EPS.Analytics))
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Analytics generator stopped")
+			return
+		case <-ticker.C:
+			for i := 0; i < int(g.config.EPS.Analytics); i++ {
+				g.callAnalyticsEndpoint(ctx)
+			}
+		}
+	}
+}
+
+// callAnalyticsEndpoint calls a random analytics endpoint
+func (g *Generator) callAnalyticsEndpoint(ctx context.Context) {
+	if len(g.config.Operations.Analytics.Endpoints) == 0 {
+		return
+	}
+
+	// Select random endpoint
+	endpoint := g.config.Operations.Analytics.Endpoints[rand.Intn(len(g.config.Operations.Analytics.Endpoints))]
+
+	// Select random tenant
+	tenantID := g.config.TenantIDs[rand.Intn(len(g.config.TenantIDs))]
+
+	startTime := time.Now()
+
+	// Make API request
+	response, err := g.httpClient.CallAnalyticsEndpoint(ctx, endpoint, tenantID)
+	duration := time.Since(startTime)
+
+	success := err == nil && response != nil && response.StatusCode >= 200 && response.StatusCode < 300
+	g.metrics.RecordAnalyticsRequest(duration, success)
+
+	if err != nil {
+		g.logger.Error(fmt.Sprintf("Analytics call failed for endpoint %s: %v", endpoint, err))
+		return
+	}
+
+	if !success {
+		g.logger.Error(fmt.Sprintf("Analytics call failed for endpoint %s with status %d: %s", endpoint, response.StatusCode, response.Error))
+		return
+	}
+
+	g.logger.Debug(fmt.Sprintf("Analytics call successful for endpoint %s, tenant %s, duration: %v", endpoint, tenantID, duration))
 }

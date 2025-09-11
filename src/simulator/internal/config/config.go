@@ -37,10 +37,11 @@ type Config struct {
 
 // EPSConfig defines the events per second for different operations
 type EPSConfig struct {
-	Create float64 `json:"create"` // Tickets created per second
-	Search float64 `json:"search"` // Search requests per second
-	Get    float64 `json:"get"`    // Get requests per second
-	Update float64 `json:"update"` // Update requests per second
+	Create    float64 `json:"create"`    // Tickets created per second
+	Search    float64 `json:"search"`    // Search requests per second
+	Get       float64 `json:"get"`       // Get requests per second
+	Update    float64 `json:"update"`    // Update requests per second
+	Analytics float64 `json:"analytics"` // Analytics requests per second
 }
 
 // HTTPClientConfig defines HTTP client settings
@@ -61,10 +62,11 @@ type MetricsConfig struct {
 
 // OperationsConfig defines configuration for different API operations
 type OperationsConfig struct {
-	Create CreateConfig `json:"create"`
-	Search SearchConfig `json:"search"`
-	Get    GetConfig    `json:"get"`
-	Update UpdateConfig `json:"update"`
+	Create    CreateConfig    `json:"create"`
+	Search    SearchConfig    `json:"search"`
+	Get       GetConfig       `json:"get"`
+	Update    UpdateConfig    `json:"update"`
+	Analytics AnalyticsConfig `json:"analytics"`
 }
 
 // CreateConfig defines ticket creation settings
@@ -112,6 +114,12 @@ type UpdateConfig struct {
 	RandomizeValues bool                   `json:"randomize_values"`
 }
 
+// AnalyticsConfig defines analytics operation settings
+type AnalyticsConfig struct {
+	Enabled   bool     `json:"enabled"`
+	Endpoints []string `json:"endpoints"` // List of analytics endpoints to call
+}
+
 // Load loads configuration from environment variables and .env file
 func Load() (*Config, error) {
 	// Try to load .env file (optional)
@@ -124,10 +132,11 @@ func Load() (*Config, error) {
 		LogLevel:    getEnvOrDefault("LOG_LEVEL", "info"),
 
 		EPS: EPSConfig{
-			Create: getEnvFloat("EPS_CREATE", 10),
-			Search: getEnvFloat("EPS_SEARCH", 2),
-			Get:    getEnvFloat("EPS_GET", 1),
-			Update: getEnvFloat("EPS_UPDATE", 1),
+			Create:    getEnvFloat("EPS_CREATE", 1),
+			Search:    getEnvFloat("EPS_SEARCH", 2),
+			Get:       getEnvFloat("EPS_GET", 1),
+			Update:    getEnvFloat("EPS_UPDATE", 1),
+			Analytics: getEnvFloat("EPS_ANALYTICS", 10),
 		},
 
 		HTTPClient: HTTPClientConfig{
@@ -172,6 +181,16 @@ func Load() (*Config, error) {
 				UpdateFields:    getEnvStringSlice("UPDATE_FIELDS", []string{"description", "statusid", "priorityid"}),
 				UpdateTemplates: getDefaultUpdateTemplates(),
 				RandomizeValues: getEnvBool("UPDATE_RANDOMIZE_VALUES", true),
+			},
+			Analytics: AnalyticsConfig{
+				Enabled: getEnvBool("ANALYTICS_ENABLED", true),
+				Endpoints: getEnvStringSlice("ANALYTICS_ENDPOINTS", []string{
+					"sla-violated-count",
+					"sla-violation-percentage",
+					"department-unresolved-tickets",
+					"priority-ticket-count",
+					"technician-resolution-time",
+				}),
 			},
 		},
 	}
