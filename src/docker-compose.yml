@@ -22,8 +22,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - "./docker/postgres:/var/lib/postgresql/data"
-    restart: unless-stopped
+      - postgres-data:/var/lib/postgresql/data
 
   scylla:
     image: scylladb/scylla:latest
@@ -96,4 +95,6 @@ services:
 
 # Volume definitions must be at the root level
 volumes:
-  monetdb-data:
+  mongo-data:
+  scylla-data:
+  postgres-data:

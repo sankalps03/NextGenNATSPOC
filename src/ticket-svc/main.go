@@ -1095,7 +1095,7 @@ func main() {
 		storageType = config.StorageType
 	} else {
 		// Default to PostgreSQL if no selection
-		storageType = "postgresql"
+		storageType = "mongodb"
 	}
 
 	// Initialize selected storage
