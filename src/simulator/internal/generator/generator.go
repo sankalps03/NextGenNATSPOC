@@ -495,28 +495,36 @@ func (g *Generator) generateSearchRequest() (httpclient.SearchRequest, string) {
 	}, tenantID
 }
 
-// generateRandomSearchConditions generates 1-3 random search conditions using collected values from the indexed fields only
+// generateRandomSearchConditions generates 1-3 random search conditions using CSV values from the indexed fields only
 func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchCondition, string) {
 	// Get the indexed fields (these are the ONLY fields we can search on efficiently)
 	businessCriticalFields := g.getBusinessCriticalFields()
 
-	// Check which of these indexed fields have collected values from inserted tickets
-	availableFields := g.getAvailableSearchableFields(businessCriticalFields)
+	// Check which of these indexed fields have values available in CSV data
+	availableFields := g.getAvailableSearchableFieldsFromCSV(businessCriticalFields)
 
 	if len(availableFields) == 0 {
-		//g.logger.Warn("No searchable values available for the supported indexed fields. Need to create tickets first.")
+		//g.logger.Warn("No searchable values available for the supported indexed fields in CSV data.")
 		//g.logger.Debug(fmt.Sprintf("Supported indexed fields: %v", businessCriticalFields))
 		return []httpclient.SearchCondition{}, ""
 	}
 
-	// Generate 1-3 random conditions using collected values from the indexed fields only
+	// Generate 1-3 random conditions using CSV values from the indexed fields only
 	numConditions := g.rand.Intn(5) + 1
 	var conditions []httpclient.SearchCondition
 	usedFields := make(map[string]bool)
+
+	// Select a random tenant ID from configured tenants for the search
 	var searchTenantID string
+	if tenantIDs := g.httpClient.GetTenantIDs(); len(tenantIDs) > 0 {
+		tenantIndex := g.rand.Intn(len(tenantIDs))
+		searchTenantID = tenantIDs[tenantIndex]
+	} else {
+		searchTenantID = "default-tenant"
+	}
 
 	for i := 0; i < numConditions && len(usedFields) < len(availableFields); i++ {
-		// Select random field that hasn't been used (only from the 19 GSI fields that have collected values)
+		// Select random field that hasn't been used (only from the indexed fields that have CSV values)
 		var selectedField string
 		attempts := 0
 		for attempts < 10 {
@@ -533,14 +541,10 @@ func (g *Generator) generateRandomSearchConditions() ([]httpclient.SearchConditi
 			continue
 		}
 
-		// Generate condition for this field using actual values collected from inserted tickets
-		condition, tenantID := g.generateConditionFromCollectedValues(selectedField)
+		// Generate condition for this field using CSV values
+		condition := g.generateConditionForField(selectedField)
 		if condition != nil {
 			conditions = append(conditions, *condition)
-			// Use the tenant ID from the first successful condition
-			if searchTenantID == "" {
-				searchTenantID = tenantID
-			}
 		}
 	}
 
@@ -1191,6 +1195,96 @@ func (g *Generator) getAvailableSearchableFields(businessFields []string) []stri
 				}
 			}
 			if hasValues {
+				availableFields = append(availableFields, field)
+			}
+		}
+	}
+
+	return availableFields
+}
+
+// getAvailableSearchableFieldsFromCSV returns fields that have values available in CSV data
+// Only returns fields that are in the supported indexed fields and have non-empty values in CSV
+func (g *Generator) getAvailableSearchableFieldsFromCSV(businessFields []string) []string {
+	// Get supported fields map for quick lookup
+	supportedFields := map[string]bool{
+		// User and assignment fields
+		"updatedbyid":  true,
+		"createdbyid":  true,
+		"removedbyid":  true,
+		"requesterid":  true,
+		"technicianid": true,
+		"closedby":     true,
+		"resolvedby":   true,
+
+		// Organizational and categorization fields
+		"departmentid":        true,
+		"groupid":             true,
+		"impactid":            true,
+		"locationid":          true,
+		"priorityid":          true,
+		"resolutionduelevel":  true,
+		"responseduelevel":    true,
+		"statusid":            true,
+		"templateid":          true,
+		"urgencyid":           true,
+		"violatedslaid":       true,
+		"emailreadconfigid":   true,
+		"requesttype":         true,
+		"servicecatalogid":    true,
+		"sourceid":            true,
+		"oladuelevel":         true,
+		"suggestedcategoryid": true,
+		"suggestedgroupid":    true,
+		"companyid":           true,
+		"vendorid":            true,
+		"violateducid":        true,
+		"transitionmodelid":   true,
+		"messengerconfigid":   true,
+
+		// Timestamp fields
+		"updatedtime":            true,
+		"createdtime":            true,
+		"removedtime":            true,
+		"lastclosedtime":         true,
+		"lastopenedtime":         true,
+		"lastresolvedtime":       true,
+		"lastviolationtime":      true,
+		"olddueby":               true,
+		"oldresponsedue":         true,
+		"responsedue":            true,
+		"responseescalationtime": true,
+		"statuschangedtime":      true,
+		"groupchangedtime":       true,
+		"oladueby":               true,
+		"olaescalationtime":      true,
+		"askfeedbackdate":        true,
+		"firstfeedbackdate":      true,
+		"lastucviolationtime":    true,
+		"lastapproveddate":       true,
+	}
+
+	var availableFields []string
+	for _, field := range businessFields {
+		// Only consider fields that are in the supported list
+		if !supportedFields[field] {
+			continue
+		}
+
+		// Check if field has values in CSV data
+		if values := g.csvReader.GetFieldValues(field); len(values) > 0 {
+			// Check if field has non-empty values
+			hasNonEmptyValues := false
+			for _, value := range values {
+				if value != nil {
+					valueStr := fmt.Sprintf("%v", value)
+					if valueStr != "" && valueStr != "<nil>" {
+						hasNonEmptyValues = true
+						break
+					}
+				}
+			}
+			if hasNonEmptyValues {
 				availableFields = append(availableFields, field)
 			}
 		}
