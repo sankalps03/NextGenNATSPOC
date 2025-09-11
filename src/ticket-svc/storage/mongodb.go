@@ -195,7 +195,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 1. Request Metadata & Identity Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "requesterid", Value: 1},
 				{Key: "technicianid", Value: 1},
 				{Key: "groupid", Value: 1},
@@ -207,7 +206,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 2. SLA & Response Tracking Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "dueby", Value: 1},
 				{Key: "firstresponsetime", Value: 1},
 				{Key: "responsedue", Value: 1},
@@ -219,7 +217,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 3. Status & Lifecycle Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "statusid", Value: 1},
 				{Key: "statuschangedtime", Value: 1},
 				{Key: "lastopenedtime", Value: 1},
@@ -231,7 +228,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 4. Priority, Urgency & Impact Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "priorityid", Value: 1},
 				{Key: "urgencyid", Value: 1},
 				{Key: "impactid", Value: 1},
@@ -243,7 +239,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 5. OLA (Operational Level Agreements) Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "oladueby", Value: 1},
 				{Key: "oladuelevel", Value: 1},
 				{Key: "olaescalationtime", Value: 1},
@@ -254,7 +249,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 6. UC (Underlying Contract) Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "ucdueby", Value: 1},
 				{Key: "ucduelevel", Value: 1},
 				{Key: "ucescalationtime", Value: 1},
@@ -265,7 +259,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 7. Timing & Durations Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "totalonholdduration", Value: 1},
 				{Key: "totalresolutiontime", Value: 1},
 				{Key: "totalslapausetime", Value: 1},
@@ -277,7 +270,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 8. Feedback & Closure Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "closedby", Value: 1},
 				{Key: "resolvedby", Value: 1},
 				{Key: "askfeedbackdate", Value: 1},
@@ -289,7 +281,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 9. Category & Templates Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "categoryid", Value: 1},
 				{Key: "templateid", Value: 1},
 				{Key: "servicecatalogid", Value: 1},
@@ -301,7 +292,6 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 		// 10. Misc/Integration Cluster
 		{
 			Keys: bson.D{
-				{Key: "tenant", Value: 1},
 				{Key: "companyid", Value: 1},
 				{Key: "vendorid", Value: 1},
 				{Key: "emailreadconfigid", Value: 1},
