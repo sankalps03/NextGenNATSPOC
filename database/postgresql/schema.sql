@@ -157,43 +157,43 @@ CREATE INDEX idx_tickets_createdtime ON tickets(createdtime);
 
 -- 1. Request Metadata & Identity Cluster
 -- Groups: createdbyid, requesterid, technicianid, groupid, departmentid
-CREATE INDEX idx_tickets_request_identity ON tickets(tenant, requesterid, technicianid, groupid, departmentid, createdbyid);
+CREATE INDEX idx_tickets_request_identity ON tickets( requesterid, technicianid, groupid, departmentid, createdbyid);
 
 -- 2. SLA & Response Tracking Cluster
 -- Groups: dueby, firstresponsetime, responsedue, resolutionescalationtime, slaviolated
-CREATE INDEX idx_tickets_sla_tracking ON tickets(tenant, dueby, firstresponsetime, responsedue, resolutionescalationtime, lastviolationtime);
+CREATE INDEX idx_tickets_sla_tracking ON tickets( dueby, firstresponsetime, responsedue, resolutionescalationtime, lastviolationtime);
 
 -- 3. Status & Lifecycle Cluster
 -- Groups: statusid, statuschangedtime, lastopenedtime, lastresolvedtime, lastclosedtime
-CREATE INDEX idx_tickets_status_lifecycle ON tickets(tenant, statusid, statuschangedtime, lastopenedtime, lastresolvedtime, lastclosedtime);
+CREATE INDEX idx_tickets_status_lifecycle ON tickets( statusid, statuschangedtime, lastopenedtime, lastresolvedtime, lastclosedtime);
 
 -- 4. Priority, Urgency & Impact Cluster
 -- Groups: priorityid, urgencyid, impactid, supportlevel, approvalstatus
-CREATE INDEX idx_tickets_priority_impact ON tickets(tenant, priorityid, urgencyid, impactid, supportlevel, approvalstatus);
+CREATE INDEX idx_tickets_priority_impact ON tickets( priorityid, urgencyid, impactid, supportlevel, approvalstatus);
 
 -- 5. OLA (Operational Level Agreements) Cluster
 -- Groups: oladueby, oladuelevel, olaescalationtime, olaviolated, lastolaviolationtime
-CREATE INDEX idx_tickets_ola_tracking ON tickets(tenant, oladueby, oladuelevel, olaescalationtime, lastolaviolationtime);
+CREATE INDEX idx_tickets_ola_tracking ON tickets( oladueby, oladuelevel, olaescalationtime, lastolaviolationtime);
 
 -- 6. UC (Underlying Contract) Cluster
 -- Groups: ucdueby, ucduelevel, ucescalationtime, ucviolated, lastucviolationtime
-CREATE INDEX idx_tickets_uc_tracking ON tickets(tenant, ucdueby, ucduelevel, ucescalationtime, lastucviolationtime);
+CREATE INDEX idx_tickets_uc_tracking ON tickets( ucdueby, ucduelevel, ucescalationtime, lastucviolationtime);
 
 -- 7. Timing & Durations Cluster
 -- Groups: totalonholdduration, totalresolutiontime, totalslapausetime, totalworkingtime, reopened
-CREATE INDEX idx_tickets_timing_durations ON tickets(tenant, totalonholdduration, totalresolutiontime, totalslapausetime, totalworkingtime, reopened);
+CREATE INDEX idx_tickets_timing_durations ON tickets( totalonholdduration, totalresolutiontime, totalslapausetime, totalworkingtime, reopened);
 
 -- 8. Feedback & Closure Cluster
 -- Groups: askfeedbackdate, firstfeedbackdate, closedby, resolvedby, lastapproveddate
-CREATE INDEX idx_tickets_feedback_closure ON tickets(tenant, closedby, resolvedby, askfeedbackdate, firstfeedbackdate, lastapproveddate);
+CREATE INDEX idx_tickets_feedback_closure ON tickets( closedby, resolvedby, askfeedbackdate, firstfeedbackdate, lastapproveddate);
 
 -- 9. Category & Templates Cluster
 -- Groups: categoryid, suggestedcategoryid, templateid, servicecatalogid, requesttype
-CREATE INDEX idx_tickets_category_templates ON tickets(tenant, categoryid, templateid, servicecatalogid, requesttype, suggestedcategoryid);
+CREATE INDEX idx_tickets_category_templates ON tickets( categoryid, templateid, servicecatalogid, requesttype, suggestedcategoryid);
 
 -- 10. Misc/Integration Cluster
 -- Groups: emailreadconfigid, messengerconfigid, vendorid, companyid
-CREATE INDEX idx_tickets_integration_misc ON tickets(tenant, companyid, vendorid, emailreadconfigid, messengerconfigid);
+CREATE INDEX idx_tickets_integration_misc ON tickets( companyid, vendorid, emailreadconfigid, messengerconfigid);
 
 -- Additional high-performance composite indexes for common query patterns
 CREATE INDEX idx_tickets_requester_status_priority ON tickets(requesterid, statusid, priorityid);
