@@ -12,6 +12,19 @@ services:
     volumes:
       - mongo-data:/data/db
 
+  postgres:
+    image: "postgres:15"
+    container_name: postgres-db
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - "./docker/postgres:/var/lib/postgresql/data"
+    restart: unless-stopped
+
   scylla:
     image: scylladb/scylla:latest
     container_name: scylla
