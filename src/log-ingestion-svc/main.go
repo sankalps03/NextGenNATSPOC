@@ -22,16 +22,15 @@ import (
 )
 
 type LogIngestionService struct {
-	natsConn        *nats.Conn
-	js              jetstream.JetStream
-	tcpListener     net.Listener
-	udpConn         *net.UDPConn
-	tlsConfig       *tls.Config
-	serviceName     string
-	shutdownCh      chan struct{}
-	wg              sync.WaitGroup
-	tenantConsumers map[string]jetstream.Consumer
-	mu              sync.RWMutex
+	natsConn    *nats.Conn
+	js          jetstream.JetStream
+	objStore    jetstream.ObjectStore
+	tcpListener net.Listener
+	udpConn     *net.UDPConn
+	tlsConfig   *tls.Config
+	serviceName string
+	shutdownCh  chan struct{}
+	wg          sync.WaitGroup
 }
 
 type LogEntry struct {
@@ -52,12 +51,6 @@ type Config struct {
 	TLSKeyFile  string
 	CACertFile  string
 	LogLevel    string
-}
-
-type TenantRegistrationRequest struct {
-	TenantID   string `json:"tenant_id"`
-	Action     string `json:"action"`
-	StreamName string `json:"stream_name"`
 }
 
 func main() {
@@ -131,13 +124,25 @@ func NewLogIngestionService(config Config) (*LogIngestionService, error) {
 		return nil, fmt.Errorf("failed to ensure stream: %w", err)
 	}
 
+	// Initialize Object Store for raw logs
+	objStore, err := js.CreateOrUpdateObjectStore(context.Background(), jetstream.ObjectStoreConfig{
+		Bucket:      "raw_logs",
+		Description: "Object store for raw log storage",
+		TTL:         48 * time.Hour,
+		Storage:     jetstream.FileStorage,
+		Replicas:    1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Object Store: %w", err)
+	}
+
 	service := &LogIngestionService{
-		natsConn:        natsConn,
-		js:              js,
-		tlsConfig:       tlsConfig,
-		serviceName:     config.ServiceName,
-		shutdownCh:      make(chan struct{}),
-		tenantConsumers: make(map[string]jetstream.Consumer),
+		natsConn:    natsConn,
+		js:          js,
+		objStore:    objStore,
+		tlsConfig:   tlsConfig,
+		serviceName: config.ServiceName,
+		shutdownCh:  make(chan struct{}),
 	}
 
 	return service, nil
@@ -212,17 +217,60 @@ func extractTenantFromCert(cert *x509.Certificate) string {
 }
 
 func (s *LogIngestionService) publishLogEntry(logEntry LogEntry) error {
+	startTime := time.Now()
+	correlationID := logEntry.Metadata["correlation_id"]
+
+	log.Printf("INFO: Publishing log entry tenant=%s source=%s size=%d log_id=%s correlation_id=%s",
+		logEntry.TenantID, logEntry.Source, len(logEntry.Content), logEntry.ID, correlationID)
+
+	// Store raw log in Object Store first
+	objectName := fmt.Sprintf("%s/%s/%d_%s", logEntry.TenantID, time.Now().Format("2006/01/02"), time.Now().UnixNano(), logEntry.ID)
+	objectMeta := jetstream.ObjectMeta{
+		Name: objectName,
+		Headers: map[string][]string{
+			"tenant-id":      {logEntry.TenantID},
+			"correlation-id": {correlationID},
+			"source":         {logEntry.Source},
+			"log-id":         {logEntry.ID},
+			"ingestion-time": {time.Now().Format(time.RFC3339Nano)},
+		},
+	}
+	_, err := s.objStore.Put(context.Background(), objectMeta, strings.NewReader(logEntry.Content))
+	if err != nil {
+		log.Printf("ERROR: Failed to store raw log in object store: %v correlation_id=%s", err, correlationID)
+		return fmt.Errorf("failed to store raw log in object store: %w", err)
+	}
+
+	// Add object store reference to metadata
+	logEntry.Metadata["object_name"] = objectName
+	logEntry.Metadata["object_store"] = "raw_logs"
+
 	data, err := json.Marshal(logEntry)
 	if err != nil {
 		return fmt.Errorf("failed to marshal log entry: %w", err)
 	}
 
-	// Publish to tenant-specific subject
-	subject := fmt.Sprintf("logs.%s.raw", logEntry.TenantID)
-	_, err = s.js.Publish(context.Background(), subject, data)
+	// Publish to fixed subject with headers for tracing
+	subject := "log.raw"
+	msg := &nats.Msg{
+		Subject: subject,
+		Data:    data,
+		Header: nats.Header{
+			"correlation-id": {correlationID},
+			"tenant-id":      {logEntry.TenantID},
+			"source":         {logEntry.Source},
+			"object-name":    {objectName},
+			"publish-time":   {time.Now().Format(time.RFC3339Nano)},
+		},
+	}
+	_, err = s.js.PublishMsg(context.Background(), msg)
 	if err != nil {
 		return fmt.Errorf("failed to publish to NATS: %w", err)
 	}
+
+	publishTime := time.Since(startTime)
+	log.Printf("INFO: Published log entry successfully tenant=%s log_id=%s object_name=%s publish_time=%v correlation_id=%s",
+		logEntry.TenantID, logEntry.ID, objectName, publishTime, correlationID)
 
 	return nil
 }
@@ -241,8 +289,8 @@ func (s *LogIngestionService) Start() error {
 	// Start NATS agent handler
 	s.startNATSAgent()
 
-	// Start tenant registration listener
-	go s.startTenantRegistrationListener()
+	// Start log processing with fixed subjects
+	go s.startLogProcessing()
 
 	log.Printf("Log ingestion service started successfully")
 	return nil
@@ -310,17 +358,23 @@ func (s *LogIngestionService) handleTCPConnection(conn net.Conn) {
 			continue
 		}
 
+		correlationID := uuid.New().String()
 		logEntry := LogEntry{
 			ID:       uuid.New().String(),
 			TenantID: tenantID,
 			Source:   "tcp",
 			Content:  line,
 			Metadata: map[string]string{
-				"client_ip":   conn.RemoteAddr().String(),
-				"client_cert": certs[0].Subject.CommonName,
+				"correlation_id": correlationID,
+				"client_ip":      conn.RemoteAddr().String(),
+				"client_cert":    certs[0].Subject.CommonName,
+				"ingestion_time": time.Now().Format(time.RFC3339Nano),
 			},
 			Timestamp: time.Now().UTC(),
 		}
+
+		log.Printf("INFO: TCP log received tenant=%s size=%d correlation_id=%s",
+			tenantID, len(line), correlationID)
 
 		if err := s.publishLogEntry(logEntry); err != nil {
 			log.Printf("Failed to publish log entry: %v", err)
@@ -392,16 +446,22 @@ func (s *LogIngestionService) handleUDPData(data, clientAddr string) {
 			continue
 		}
 
+		correlationID := uuid.New().String()
 		logEntry := LogEntry{
 			ID:       uuid.New().String(),
 			TenantID: tenantID,
 			Source:   "udp",
 			Content:  line,
 			Metadata: map[string]string{
-				"client_ip": clientAddr,
+				"correlation_id": correlationID,
+				"client_ip":      clientAddr,
+				"ingestion_time": time.Now().Format(time.RFC3339Nano),
 			},
 			Timestamp: time.Now().UTC(),
 		}
+
+		log.Printf("INFO: UDP log received tenant=%s size=%d correlation_id=%s",
+			tenantID, len(line), correlationID)
 
 		if err := s.publishLogEntry(logEntry); err != nil {
 			log.Printf("Failed to publish log entry: %v", err)
@@ -415,7 +475,7 @@ func (s *LogIngestionService) startNATSAgent() {
 		defer s.wg.Done()
 
 		// Subscribe to agent logs with queue group for load balancing
-		sub, err := s.natsConn.QueueSubscribe("log.agent.*", "log-ingestion", s.handleNATSAgentLog)
+		sub, err := s.natsConn.QueueSubscribe("log.agent", "log-ingestion", s.handleNATSAgentLog)
 		if err != nil {
 			log.Printf("Failed to subscribe to agent logs: %v", err)
 			return
@@ -428,18 +488,11 @@ func (s *LogIngestionService) startNATSAgent() {
 }
 
 func (s *LogIngestionService) handleNATSAgentLog(msg *nats.Msg) {
-	// Extract tenant ID from subject (log.agent.{tenantId})
-	subjectParts := strings.Split(msg.Subject, ".")
-	if len(subjectParts) < 3 {
-		log.Printf("Invalid agent log subject: %s", msg.Subject)
-		return
-	}
-	tenantID := subjectParts[2]
-
 	// Parse agent log message
 	var agentLog struct {
 		Content  string            `json:"content"`
 		Metadata map[string]string `json:"metadata"`
+		TenantID string            `json:"tenant_id"`
 	}
 
 	if err := json.Unmarshal(msg.Data, &agentLog); err != nil {
@@ -447,43 +500,61 @@ func (s *LogIngestionService) handleNATSAgentLog(msg *nats.Msg) {
 		return
 	}
 
+	// Use tenant ID from message payload, default to "default" if not provided
+	tenantID := agentLog.TenantID
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	correlationID := uuid.New().String()
 	logEntry := LogEntry{
-		ID:        uuid.New().String(),
-		TenantID:  tenantID,
-		Source:    "nats_agent",
-		Content:   agentLog.Content,
-		Metadata:  agentLog.Metadata,
+		ID:       uuid.New().String(),
+		TenantID: tenantID,
+		Source:   "nats_agent",
+		Content:  agentLog.Content,
+		Metadata: map[string]string{
+			"correlation_id": correlationID,
+			"ingestion_time": time.Now().Format(time.RFC3339Nano),
+		},
 		Timestamp: time.Now().UTC(),
 	}
+
+	// Merge agent metadata
+	for k, v := range agentLog.Metadata {
+		logEntry.Metadata[k] = v
+	}
+
+	log.Printf("INFO: NATS agent log received tenant=%s size=%d correlation_id=%s",
+		tenantID, len(agentLog.Content), correlationID)
 
 	if err := s.publishLogEntry(logEntry); err != nil {
 		log.Printf("Failed to publish agent log: %v", err)
 	}
 }
 
-func (s *LogIngestionService) startTenantRegistrationListener() {
+func (s *LogIngestionService) startLogProcessing() {
 	ctx := context.Background()
 
-	// Create consumer for tenant management events
-	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "TENANT_MANAGEMENT", jetstream.ConsumerConfig{
-		Name:          "log-ingestion-tenant-registration",
-		FilterSubject: "tenant.register.log-ingestion-service",
+	// Create consumer for log events
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "LOG_EVENTS", jetstream.ConsumerConfig{
+		Name:          "log-ingestion-processor",
+		FilterSubject: "log.raw",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		ReplayPolicy:  jetstream.ReplayInstantPolicy,
 	})
 	if err != nil {
-		log.Printf("Failed to create tenant registration consumer: %v", err)
+		log.Printf("Failed to create log processing consumer: %v", err)
 		return
 	}
 
 	iter, err := consumer.Messages()
 	if err != nil {
-		log.Printf("Failed to get messages from tenant registration consumer: %v", err)
+		log.Printf("Failed to get messages from log processing consumer: %v", err)
 		return
 	}
 
-	log.Printf("Started tenant registration listener")
+	log.Printf("Started log processing")
 
 	for {
 		select {
@@ -493,118 +564,35 @@ func (s *LogIngestionService) startTenantRegistrationListener() {
 		default:
 			msg, err := iter.Next()
 			if err != nil {
-				log.Printf("Error getting next tenant registration message: %v", err)
+				log.Printf("Error getting next log message: %v", err)
 				continue
 			}
-			s.handleTenantRegistration(msg)
+			s.processLogMessage(msg)
 		}
 	}
 }
 
-func (s *LogIngestionService) handleTenantRegistration(msg jetstream.Msg) {
-	var req TenantRegistrationRequest
-	if err := json.Unmarshal(msg.Data(), &req); err != nil {
-		log.Printf("Failed to unmarshal tenant registration request: %v", err)
+func (s *LogIngestionService) processLogMessage(msg jetstream.Msg) {
+	var logEntry LogEntry
+	if err := json.Unmarshal(msg.Data(), &logEntry); err != nil {
+		log.Printf("Failed to unmarshal log entry: %v", err)
 		msg.Ack()
 		return
 	}
 
-	log.Printf("Processing tenant registration: %s action for tenant %s", req.Action, req.TenantID)
+	log.Printf("Processing log entry from tenant %s: %s", logEntry.TenantID, logEntry.Content[:minInt(50, len(logEntry.Content))])
 
-	switch req.Action {
-	case "register":
-		if err := s.createTenantConsumer(req.TenantID, req.StreamName); err != nil {
-			log.Printf("Failed to create tenant consumer for %s: %v", req.TenantID, err)
-		} else {
-			log.Printf("Successfully created consumer for tenant %s", req.TenantID)
-		}
-	case "unregister":
-		if err := s.removeTenantConsumer(req.TenantID); err != nil {
-			log.Printf("Failed to remove tenant consumer for %s: %v", req.TenantID, err)
-		} else {
-			log.Printf("Successfully removed consumer for tenant %s", req.TenantID)
-		}
-	default:
-		log.Printf("Unknown tenant registration action: %s", req.Action)
-	}
+	// Process the log entry (could be forwarded to other systems, stored, etc.)
+	// For now, just acknowledge that we processed it
 
 	msg.Ack()
 }
 
-func (s *LogIngestionService) createTenantConsumer(tenantID, streamName string) error {
-	ctx := context.Background()
-	consumerName := fmt.Sprintf("log-ingestion-%s", tenantID)
-
-	// Create consumer for tenant's log events
-	consumer, err := s.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-		Name:          consumerName,
-		FilterSubject: fmt.Sprintf("logs.%s.>", tenantID),
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverNewPolicy,
-		ReplayPolicy:  jetstream.ReplayInstantPolicy,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create consumer for tenant %s: %w", tenantID, err)
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-
-	// Store the consumer
-	s.mu.Lock()
-	s.tenantConsumers[tenantID] = consumer
-	s.mu.Unlock()
-
-	// Start processing messages for this tenant
-	go s.processTenantLogs(tenantID, consumer)
-
-	return nil
-}
-
-func (s *LogIngestionService) removeTenantConsumer(tenantID string) error {
-	s.mu.Lock()
-	consumer, exists := s.tenantConsumers[tenantID]
-	if exists {
-		delete(s.tenantConsumers, tenantID)
-	}
-	s.mu.Unlock()
-
-	if exists {
-		// Consumer cleanup is handled by NATS when the service shuts down
-		_ = consumer // Acknowledge the consumer variable
-		log.Printf("Removed consumer tracking for tenant %s", tenantID)
-	}
-
-	return nil
-}
-
-func (s *LogIngestionService) processTenantLogs(tenantID string, consumer jetstream.Consumer) {
-	iter, err := consumer.Messages()
-	if err != nil {
-		log.Printf("Failed to get messages from tenant %s log consumer: %v", tenantID, err)
-		return
-	}
-
-	log.Printf("Started processing logs for tenant %s", tenantID)
-
-	for {
-		select {
-		case <-s.shutdownCh:
-			iter.Stop()
-			return
-		default:
-			msg, err := iter.Next()
-			if err != nil {
-				log.Printf("Error getting next log message for tenant %s: %v", tenantID, err)
-				continue
-			}
-			s.processTenantLogMessage(tenantID, msg)
-		}
-	}
-}
-
-func (s *LogIngestionService) processTenantLogMessage(tenantID string, msg jetstream.Msg) {
-	// Process the log message - this could involve parsing, filtering, enrichment, etc.
-	// For now, we'll just acknowledge that we received it
-	log.Printf("Processed log message for tenant %s: %s", tenantID, msg.Subject())
-	msg.Ack()
+	return b
 }
 
 func (s *LogIngestionService) Shutdown() {

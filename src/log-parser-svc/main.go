@@ -20,14 +20,14 @@ import (
 )
 
 type LogParserService struct {
-	natsConn        *nats.Conn
-	js              jetstream.JetStream
-	serviceName     string
-	parsers         []LogParser
-	shutdownCh      chan struct{}
-	wg              sync.WaitGroup
-	tenantConsumers map[string]jetstream.Consumer
-	mu              sync.RWMutex
+	natsConn    *nats.Conn
+	js          jetstream.JetStream
+	kv          jetstream.KeyValue
+	objStore    jetstream.ObjectStore
+	serviceName string
+	parsers     []LogParser
+	shutdownCh  chan struct{}
+	wg          sync.WaitGroup
 }
 
 type LogEntry struct {
@@ -85,12 +85,6 @@ type Config struct {
 	NATSURLs    []string
 	ServiceName string
 	LogLevel    string
-}
-
-type TenantRegistrationRequest struct {
-	TenantID   string `json:"tenant_id"`
-	Action     string `json:"action"`
-	StreamName string `json:"stream_name"`
 }
 
 func main() {
@@ -153,12 +147,37 @@ func NewLogParserService(config Config) (*LogParserService, error) {
 		return nil, fmt.Errorf("failed to ensure streams: %w", err)
 	}
 
+	// Initialize KV store for parsed logs
+	kv, err := js.CreateOrUpdateKeyValue(context.Background(), jetstream.KeyValueConfig{
+		Bucket:      "parsed_logs",
+		Description: "Key-Value store for parsed logs indexed by source",
+		TTL:         24 * time.Hour,
+		Storage:     jetstream.FileStorage,
+		Replicas:    1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create KV store: %w", err)
+	}
+
+	// Initialize Object Store for raw logs access
+	objStore, err := js.CreateOrUpdateObjectStore(context.Background(), jetstream.ObjectStoreConfig{
+		Bucket:      "raw_logs",
+		Description: "Object store for raw log storage",
+		TTL:         48 * time.Hour,
+		Storage:     jetstream.FileStorage,
+		Replicas:    1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Object Store: %w", err)
+	}
+
 	service := &LogParserService{
-		natsConn:        natsConn,
-		js:              js,
-		serviceName:     config.ServiceName,
-		shutdownCh:      make(chan struct{}),
-		tenantConsumers: make(map[string]jetstream.Consumer),
+		natsConn:    natsConn,
+		js:          js,
+		kv:          kv,
+		objStore:    objStore,
+		serviceName: config.ServiceName,
+		shutdownCh:  make(chan struct{}),
 	}
 
 	// Initialize parsers
@@ -205,8 +224,8 @@ func (s *LogParserService) initializeParsers() {
 }
 
 func (s *LogParserService) Start() error {
-	// Start tenant registration listener
-	go s.startTenantRegistrationListener()
+	// Start log processing with fixed subjects
+	go s.startLogProcessing()
 
 	log.Printf("Log parser service started successfully")
 	return nil
@@ -252,17 +271,65 @@ func (s *LogParserService) parseLogEntry(logEntry LogEntry) ParsedLog {
 }
 
 func (s *LogParserService) publishParsedLog(parsedLog ParsedLog) error {
+	correlationID := uuid.New().String()
+
+	log.Printf("INFO: Publishing parsed log tenant=%s source=%s status=%s correlation_id=%s",
+		parsedLog.TenantID, parsedLog.Source, parsedLog.ParseStatus, correlationID)
+
 	data, err := json.Marshal(parsedLog)
 	if err != nil {
 		return fmt.Errorf("failed to marshal parsed log: %w", err)
 	}
 
-	// Publish to tenant-specific subject
-	subject := fmt.Sprintf("logs.%s.parsed", parsedLog.TenantID)
+	// Publish to JetStream
+	subject := "log.parsed"
 	if parsedLog.ParseStatus == "failed" {
-		subject = fmt.Sprintf("logs.%s.failed", parsedLog.TenantID)
+		subject = "log.failed"
 	}
 
+	_, err = s.js.Publish(context.Background(), subject, data)
+	if err != nil {
+		return fmt.Errorf("failed to publish to NATS: %w", err)
+	}
+
+	// Store in KV store for fast lookup by source
+	kvKey := fmt.Sprintf("%s:source:%s", parsedLog.TenantID, parsedLog.Source)
+
+	// Get existing logs for this source
+	existingLogs := []ParsedLog{}
+	if entry, err := s.kv.Get(context.Background(), kvKey); err == nil {
+		json.Unmarshal(entry.Value(), &existingLogs)
+	}
+
+	// Add new log and keep only last 100 entries per source
+	existingLogs = append(existingLogs, parsedLog)
+	if len(existingLogs) > 100 {
+		existingLogs = existingLogs[len(existingLogs)-100:]
+	}
+
+	// Store back to KV
+	kvData, err := json.Marshal(existingLogs)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal logs for KV store: %v correlation_id=%s", err, correlationID)
+	} else {
+		_, err = s.kv.Put(context.Background(), kvKey, kvData)
+		if err != nil {
+			log.Printf("ERROR: Failed to store in KV: %v correlation_id=%s", err, correlationID)
+		} else {
+			log.Printf("INFO: Stored parsed log in KV key=%s correlation_id=%s", kvKey, correlationID)
+		}
+	}
+
+	return nil
+}
+
+func (s *LogParserService) publishParsedLogBatch(parsedLogs []ParsedLog) error {
+	data, err := json.Marshal(parsedLogs)
+	if err != nil {
+		return fmt.Errorf("failed to marshal parsed logs: %w", err)
+	}
+
+	subject := "log.structured"
 	_, err = s.js.Publish(context.Background(), subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish to NATS: %w", err)
@@ -271,53 +338,29 @@ func (s *LogParserService) publishParsedLog(parsedLog ParsedLog) error {
 	return nil
 }
 
-func (s *LogParserService) publishParsedLogBatch(parsedLogs []ParsedLog) error {
-	// Group logs by tenant
-	tenantLogs := make(map[string][]ParsedLog)
-	for _, log := range parsedLogs {
-		tenantLogs[log.TenantID] = append(tenantLogs[log.TenantID], log)
-	}
-
-	// Publish each tenant's logs separately
-	for tenantID, logs := range tenantLogs {
-		data, err := json.Marshal(logs)
-		if err != nil {
-			return fmt.Errorf("failed to marshal parsed logs for tenant %s: %w", tenantID, err)
-		}
-
-		subject := fmt.Sprintf("logs.%s.structured", tenantID)
-		_, err = s.js.Publish(context.Background(), subject, data)
-		if err != nil {
-			return fmt.Errorf("failed to publish to NATS for tenant %s: %w", tenantID, err)
-		}
-	}
-
-	return nil
-}
-
-func (s *LogParserService) startTenantRegistrationListener() {
+func (s *LogParserService) startLogProcessing() {
 	ctx := context.Background()
 
-	// Create consumer for tenant management events
-	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "TENANT_MANAGEMENT", jetstream.ConsumerConfig{
-		Name:          "log-parser-tenant-registration",
-		FilterSubject: "tenant.register.log-parser-service",
+	// Create consumer for raw log events
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, "LOG_EVENTS", jetstream.ConsumerConfig{
+		Name:          "log-parser-processor",
+		FilterSubject: "log.raw",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		ReplayPolicy:  jetstream.ReplayInstantPolicy,
 	})
 	if err != nil {
-		log.Printf("Failed to create tenant registration consumer: %v", err)
+		log.Printf("Failed to create log processing consumer: %v", err)
 		return
 	}
 
 	iter, err := consumer.Messages()
 	if err != nil {
-		log.Printf("Failed to get messages from tenant registration consumer: %v", err)
+		log.Printf("Failed to get messages from log processing consumer: %v", err)
 		return
 	}
 
-	log.Printf("Started tenant registration listener")
+	log.Printf("Started log processing")
 
 	for {
 		select {
@@ -327,130 +370,71 @@ func (s *LogParserService) startTenantRegistrationListener() {
 		default:
 			msg, err := iter.Next()
 			if err != nil {
-				log.Printf("Error getting next tenant registration message: %v", err)
+				log.Printf("Error getting next log message: %v", err)
 				continue
 			}
-			s.handleTenantRegistration(msg)
+			s.processRawLogMessage(msg)
 		}
 	}
 }
 
-func (s *LogParserService) handleTenantRegistration(msg jetstream.Msg) {
-	var req TenantRegistrationRequest
-	if err := json.Unmarshal(msg.Data(), &req); err != nil {
-		log.Printf("Failed to unmarshal tenant registration request: %v", err)
-		msg.Ack()
-		return
-	}
+func (s *LogParserService) processRawLogMessage(msg jetstream.Msg) {
+	startTime := time.Now()
+	correlationID := uuid.New().String()
 
-	log.Printf("Processing tenant registration: %s action for tenant %s", req.Action, req.TenantID)
-
-	switch req.Action {
-	case "register":
-		if err := s.createTenantConsumer(req.TenantID, req.StreamName); err != nil {
-			log.Printf("Failed to create tenant consumer for %s: %v", req.TenantID, err)
-		} else {
-			log.Printf("Successfully created consumer for tenant %s", req.TenantID)
-		}
-	case "unregister":
-		if err := s.removeTenantConsumer(req.TenantID); err != nil {
-			log.Printf("Failed to remove tenant consumer for %s: %v", req.TenantID, err)
-		} else {
-			log.Printf("Successfully removed consumer for tenant %s", req.TenantID)
-		}
-	default:
-		log.Printf("Unknown tenant registration action: %s", req.Action)
-	}
-
-	msg.Ack()
-}
-
-func (s *LogParserService) createTenantConsumer(tenantID, streamName string) error {
-	ctx := context.Background()
-	consumerName := fmt.Sprintf("log-parser-%s", tenantID)
-
-	// Create consumer for tenant's raw log events
-	consumer, err := s.js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
-		Name:          consumerName,
-		FilterSubject: fmt.Sprintf("logs.%s.raw", tenantID),
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverNewPolicy,
-		ReplayPolicy:  jetstream.ReplayInstantPolicy,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create consumer for tenant %s: %w", tenantID, err)
-	}
-
-	// Store the consumer
-	s.mu.Lock()
-	s.tenantConsumers[tenantID] = consumer
-	s.mu.Unlock()
-
-	// Start processing raw logs for this tenant
-	go s.processTenantRawLogs(tenantID, consumer)
-
-	return nil
-}
-
-func (s *LogParserService) removeTenantConsumer(tenantID string) error {
-	s.mu.Lock()
-	consumer, exists := s.tenantConsumers[tenantID]
-	if exists {
-		delete(s.tenantConsumers, tenantID)
-	}
-	s.mu.Unlock()
-
-	if exists {
-		// Consumer cleanup is handled by NATS when the service shuts down
-		_ = consumer // Acknowledge the consumer variable
-		log.Printf("Removed consumer tracking for tenant %s", tenantID)
-	}
-
-	return nil
-}
-
-func (s *LogParserService) processTenantRawLogs(tenantID string, consumer jetstream.Consumer) {
-	iter, err := consumer.Messages()
-	if err != nil {
-		log.Printf("Failed to get messages from tenant %s raw log consumer: %v", tenantID, err)
-		return
-	}
-
-	log.Printf("Started processing raw logs for tenant %s", tenantID)
-
-	for {
-		select {
-		case <-s.shutdownCh:
-			iter.Stop()
-			return
-		default:
-			msg, err := iter.Next()
-			if err != nil {
-				log.Printf("Error getting next raw log message for tenant %s: %v", tenantID, err)
-				continue
-			}
-			s.processTenantRawLogMessage(tenantID, msg)
+	// Extract correlation ID from headers if available
+	if headers := msg.Headers(); headers != nil {
+		if existing := headers.Get("correlation-id"); existing != "" {
+			correlationID = existing
 		}
 	}
-}
 
-func (s *LogParserService) processTenantRawLogMessage(tenantID string, msg jetstream.Msg) {
 	var logEntry LogEntry
 	if err := json.Unmarshal(msg.Data(), &logEntry); err != nil {
-		log.Printf("Failed to unmarshal raw log for tenant %s: %v", tenantID, err)
+		log.Printf("ERROR: Failed to unmarshal raw log entry: %v correlation_id=%s processing_time=%v",
+			err, correlationID, time.Since(startTime))
 		msg.Ack()
 		return
 	}
 
+	log.Printf("INFO: Processing raw log tenant=%s source=%s size=%d correlation_id=%s",
+		logEntry.TenantID, logEntry.Source, len(logEntry.Content), correlationID)
+
 	// Parse the log entry
+	parseStartTime := time.Now()
 	parsedLog := s.parseLogEntry(logEntry)
+	parseTime := time.Since(parseStartTime)
+
+	// Add tracing metadata
+	if parsedLog.Metadata == nil {
+		parsedLog.Metadata = make(map[string]string)
+	}
+	parsedLog.Metadata["correlation_id"] = correlationID
+	parsedLog.Metadata["parse_time_ms"] = fmt.Sprintf("%.2f", parseTime.Seconds()*1000)
+	parsedLog.Metadata["processing_start"] = startTime.Format(time.RFC3339Nano)
+
+	// Preserve object store reference from original log
+	if objectName := logEntry.Metadata["object_name"]; objectName != "" {
+		parsedLog.Metadata["object_name"] = objectName
+		parsedLog.Metadata["object_store"] = logEntry.Metadata["object_store"]
+	}
+
+	log.Printf("INFO: Parsed log tenant=%s source=%s status=%s parser=%s parse_time=%v correlation_id=%s",
+		logEntry.TenantID, logEntry.Source, parsedLog.ParseStatus, parsedLog.ParserUsed, parseTime, correlationID)
 
 	// Publish parsed log
+	publishStartTime := time.Now()
 	if err := s.publishParsedLog(parsedLog); err != nil {
-		log.Printf("Failed to publish parsed log for tenant %s: %v", tenantID, err)
+		log.Printf("ERROR: Failed to publish parsed log tenant=%s: %v correlation_id=%s processing_time=%v",
+			logEntry.TenantID, err, correlationID, time.Since(startTime))
 		// Don't ack if we can't publish
 		return
 	}
+	publishTime := time.Since(publishStartTime)
+
+	totalTime := time.Since(startTime)
+	log.Printf("INFO: Completed log processing tenant=%s source=%s status=%s total_time=%v parse_time=%v publish_time=%v correlation_id=%s",
+		logEntry.TenantID, logEntry.Source, parsedLog.ParseStatus, totalTime, parseTime, publishTime, correlationID)
 
 	msg.Ack()
 }
