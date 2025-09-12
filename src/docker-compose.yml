@@ -3,7 +3,6 @@ services:
   mongo:
     image: mongo:latest   # always pulls the latest stable release
     container_name: mongo
-    restart: always
     ports:
       - "27017:27017"
     environment:
