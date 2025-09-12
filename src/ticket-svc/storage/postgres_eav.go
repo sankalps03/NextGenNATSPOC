@@ -418,38 +418,69 @@ func (p *PostgreSQLEAVStorage) CreateTicket(ticketData *ticketpb.TicketData) (er
 		return fmt.Errorf("failed to convert ticket to EAV rows: %w", err), nil
 	}
 
-	var firstInsertedID int64
+	// Batch insert all EAV rows for this ticket
+	if len(eavRows) == 0 {
+		return fmt.Errorf("no EAV rows to insert"), nil
+	}
 
-	// Insert each EAV row
+	// Build batch insert query
+	columns := []string{"entity_id", "attribute_id", "string_value", "int_value", "boolean_value", "datatype"}
+
+	// Build VALUES clause with placeholders for all rows
+	var valuePlaceholders []string
+	var allValues []interface{}
+
 	for i, row := range eavRows {
-		columns := make([]string, 0, len(row))
-		placeholders := make([]string, 0, len(row))
-		values := make([]interface{}, 0, len(row))
+		// Each row has 6 columns, so we need 6 placeholders per row
+		rowPlaceholders := make([]string, 6)
+		baseIndex := i * 6
 
-		j := 1
-		for column, value := range row {
-			columns = append(columns, column)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", j))
-			values = append(values, value)
-			j++
-		}
+		rowPlaceholders[0] = fmt.Sprintf("$%d", baseIndex+1) // entity_id
+		rowPlaceholders[1] = fmt.Sprintf("$%d", baseIndex+2) // attribute_id
+		rowPlaceholders[2] = fmt.Sprintf("$%d", baseIndex+3) // string_value
+		rowPlaceholders[3] = fmt.Sprintf("$%d", baseIndex+4) // int_value
+		rowPlaceholders[4] = fmt.Sprintf("$%d", baseIndex+5) // boolean_value
+		rowPlaceholders[5] = fmt.Sprintf("$%d", baseIndex+6) // datatype
 
-		insertSQL := fmt.Sprintf(
-			"INSERT INTO %s (%s) VALUES (%s) RETURNING id",
-			p.tableName,
-			strings.Join(columns, ", "),
-			strings.Join(placeholders, ", "),
-		)
+		valuePlaceholders = append(valuePlaceholders, fmt.Sprintf("(%s)", strings.Join(rowPlaceholders, ", ")))
 
+		// Add values in the correct order
+		allValues = append(allValues, row["entity_id"])
+		allValues = append(allValues, row["attribute_id"])
+		allValues = append(allValues, row["string_value"])
+		allValues = append(allValues, row["int_value"])
+		allValues = append(allValues, row["boolean_value"])
+		allValues = append(allValues, row["datatype"])
+	}
+
+	batchInsertSQL := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES %s RETURNING id",
+		p.tableName,
+		strings.Join(columns, ", "),
+		strings.Join(valuePlaceholders, ", "),
+	)
+
+	rows, err := p.db.QueryContext(ctx, batchInsertSQL, allValues...)
+	if err != nil {
+		return fmt.Errorf("failed to batch insert EAV rows: %w", err), nil
+	}
+	defer rows.Close()
+
+	var firstInsertedID int64
+	var insertedCount int
+	for rows.Next() {
 		var insertedID int64
-		err = p.db.QueryRowContext(ctx, insertSQL, values...).Scan(&insertedID)
-		if err != nil {
-			return fmt.Errorf("failed to insert EAV row %d: %w", i, err), nil
+		if err := rows.Scan(&insertedID); err != nil {
+			return fmt.Errorf("failed to scan inserted ID: %w", err), nil
 		}
-
-		if i == 0 {
+		if insertedCount == 0 {
 			firstInsertedID = insertedID
 		}
+		insertedCount++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating over inserted IDs: %w", err), nil
 	}
 
 	log.Printf("Created ticket %s in EAV table %s with %d rows", ticketData.Id, p.tableName, len(eavRows))
@@ -552,32 +583,53 @@ func (p *PostgreSQLEAVStorage) UpdateTicket(ticketData *ticketpb.TicketData) boo
 		return false
 	}
 
-	// Insert updated EAV rows
+	// Batch insert updated EAV rows
+	if len(eavRows) == 0 {
+		log.Printf("WARNING: No EAV rows to insert for ticket %s", ticketData.Id)
+		return true
+	}
+
+	// Build batch insert query
+	columns := []string{"entity_id", "attribute_id", "string_value", "int_value", "boolean_value", "datatype"}
+
+	// Build VALUES clause with placeholders for all rows
+	var valuePlaceholders []string
+	var allValues []interface{}
+
 	for i, row := range eavRows {
-		columns := make([]string, 0, len(row))
-		placeholders := make([]string, 0, len(row))
-		values := make([]interface{}, 0, len(row))
+		// Each row has 6 columns, so we need 6 placeholders per row
+		rowPlaceholders := make([]string, 6)
+		baseIndex := i * 6
 
-		j := 1
-		for column, value := range row {
-			columns = append(columns, column)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", j))
-			values = append(values, value)
-			j++
-		}
+		rowPlaceholders[0] = fmt.Sprintf("$%d", baseIndex+1) // entity_id
+		rowPlaceholders[1] = fmt.Sprintf("$%d", baseIndex+2) // attribute_id
+		rowPlaceholders[2] = fmt.Sprintf("$%d", baseIndex+3) // string_value
+		rowPlaceholders[3] = fmt.Sprintf("$%d", baseIndex+4) // int_value
+		rowPlaceholders[4] = fmt.Sprintf("$%d", baseIndex+5) // boolean_value
+		rowPlaceholders[5] = fmt.Sprintf("$%d", baseIndex+6) // datatype
 
-		insertSQL := fmt.Sprintf(
-			"INSERT INTO %s (%s) VALUES (%s)",
-			p.tableName,
-			strings.Join(columns, ", "),
-			strings.Join(placeholders, ", "),
-		)
+		valuePlaceholders = append(valuePlaceholders, fmt.Sprintf("(%s)", strings.Join(rowPlaceholders, ", ")))
 
-		_, err = p.db.ExecContext(ctx, insertSQL, values...)
-		if err != nil {
-			log.Printf("ERROR: Failed to insert updated EAV row %d: %v", i, err)
-			return false
-		}
+		// Add values in the correct order
+		allValues = append(allValues, row["entity_id"])
+		allValues = append(allValues, row["attribute_id"])
+		allValues = append(allValues, row["string_value"])
+		allValues = append(allValues, row["int_value"])
+		allValues = append(allValues, row["boolean_value"])
+		allValues = append(allValues, row["datatype"])
+	}
+
+	batchInsertSQL := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES %s",
+		p.tableName,
+		strings.Join(columns, ", "),
+		strings.Join(valuePlaceholders, ", "),
+	)
+
+	_, err = p.db.ExecContext(ctx, batchInsertSQL, allValues...)
+	if err != nil {
+		log.Printf("ERROR: Failed to batch insert updated EAV rows: %v", err)
+		return false
 	}
 
 	log.Printf("Updated ticket %s in EAV table %s with %d rows", ticketData.Id, p.tableName, len(eavRows))
