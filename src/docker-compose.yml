@@ -1,9 +1,7 @@
-
 services:
   mongo:
     image: mongo:latest   # always pulls the latest stable release
     container_name: mongo
-    restart: always
     ports:
       - "27017:27017"
     environment:
@@ -13,7 +11,7 @@ services:
       - mongo-data:/data/db
 
   postgres:
-    image: "postgres:15"
+    image: "postgres:latest"
     container_name: postgres-db
     environment:
       POSTGRES_DB: myapp
@@ -55,7 +53,7 @@ services:
       -js
       -sd /data
     volumes:
-      - "./nats-data-1:/data"
+      - nats-data-1:/data
 
   nats-server-2:
     image: nats:2.9-alpine
@@ -73,7 +71,7 @@ services:
       -js
       -sd /data
     volumes:
-      - "./nats-data-2:/data"
+      - nats-data-2:/data
 
   nats-server-3:
     image: nats:2.9-alpine
@@ -91,10 +89,46 @@ services:
       -js
       -sd /data
     volumes:
-      - "./nats-data-3:/data"
+      - nats-data-3:/data
+
+#  opensearch:
+#    image: opensearchproject/opensearch:2.11.0
+#    container_name: opensearch
+#    environment:
+#      - cluster.name=opensearch-cluster
+#      - node.name=opensearch-node1
+#      - discovery.type=single-node
+#      - bootstrap.memory_lock=true
+#      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Mind@#$123
+#      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+#      - plugins.security.disabled=true        # disable security for local POC
+#    ulimits:
+#      memlock:
+#        soft: -1
+#        hard: -1
+#    volumes:
+#      - opensearch-data1:/usr/share/opensearch/data
+#    ports:
+#      - 9200:9200
+#      - 9600:9600
+#
+#  opensearch-dashboards:
+#    image: opensearchproject/opensearch-dashboards:2.11.0
+#    container_name: opensearch-dashboards
+#    ports:
+#      - 5601:5601
+#    environment:
+#      - OPENSEARCH_HOSTS=http://opensearch:9200
+#      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+#    depends_on:
+#      - opensearch
 
 # Volume definitions must be at the root level
 volumes:
   mongo-data:
   scylla-data:
   postgres-data:
+  nats-data-1:
+  nats-data-2:
+  nats-data-3:
+  #opensearch-data1:
