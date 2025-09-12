@@ -26,11 +26,10 @@ type TicketData struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Core required fields
 	Id        string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Tenant    string `protobuf:"bytes,2,opt,name=tenant,proto3" json:"tenant,omitempty"`
-	CreatedAt string `protobuf:"bytes,3,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	UpdatedAt string `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	CreatedAt string `protobuf:"bytes,2,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	UpdatedAt string `protobuf:"bytes,3,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	// Dynamic fields stored as key-value pairs
-	Fields        map[string]*FieldValue `protobuf:"bytes,5,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Fields        map[string]*FieldValue `protobuf:"bytes,4,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -68,13 +67,6 @@ func (*TicketData) Descriptor() ([]byte, []int) {
 func (x *TicketData) GetId() string {
 	if x != nil {
 		return x.Id
-	}
-	return ""
-}
-
-func (x *TicketData) GetTenant() string {
-	if x != nil {
-		return x.Tenant
 	}
 	return ""
 }
@@ -418,16 +410,15 @@ var File_proto_ticket_proto protoreflect.FileDescriptor
 
 const file_proto_ticket_proto_rawDesc = "" +
 	"\n" +
-	"\x12proto/ticket.proto\x12\bticketpb\"\xfd\x01\n" +
+	"\x12proto/ticket.proto\x12\bticketpb\"\xe5\x01\n" +
 	"\n" +
 	"TicketData\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06tenant\x18\x02 \x01(\tR\x06tenant\x12\x1d\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1d\n" +
 	"\n" +
-	"created_at\x18\x03 \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"created_at\x18\x02 \x01(\tR\tcreatedAt\x12\x1d\n" +
 	"\n" +
-	"updated_at\x18\x04 \x01(\tR\tupdatedAt\x128\n" +
-	"\x06fields\x18\x05 \x03(\v2 .ticketpb.TicketData.FieldsEntryR\x06fields\x1aO\n" +
+	"updated_at\x18\x03 \x01(\tR\tupdatedAt\x128\n" +
+	"\x06fields\x18\x04 \x03(\v2 .ticketpb.TicketData.FieldsEntryR\x06fields\x1aO\n" +
 	"\vFieldsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.ticketpb.FieldValueR\x05value:\x028\x01\"\xfe\x01\n" +

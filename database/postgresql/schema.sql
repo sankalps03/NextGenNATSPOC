@@ -12,7 +12,6 @@ CREATE TABLE tickets (
 
     -- Core fields for protobuf compatibility (managed by application)
     ticket_id VARCHAR(255) UNIQUE NOT NULL,
-    tenant VARCHAR(255) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -141,7 +140,7 @@ COMMENT ON TABLE tickets IS 'Main tickets table for ticket management system wit
 COMMENT ON COLUMN tickets.id IS 'Auto-increment primary key';
 COMMENT ON COLUMN tickets.createdtime IS 'Unix timestamp in milliseconds when ticket was created';
 COMMENT ON COLUMN tickets.updatedtime IS 'Unix timestamp in milliseconds when ticket was last updated';
-COMMENT ON COLUMN tickets.companyid IS 'Company/tenant ID for multi-tenant isolation';
+COMMENT ON COLUMN tickets.companyid IS 'Company ID for organizational grouping';
 COMMENT ON COLUMN tickets.requesterid IS 'ID of user who requested the ticket';
 COMMENT ON COLUMN tickets.technicianid IS 'ID of technician assigned to the ticket';
 COMMENT ON COLUMN tickets.statusid IS 'Current status of the ticket';

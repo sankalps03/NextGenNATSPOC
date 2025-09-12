@@ -182,7 +182,6 @@ func (s *ScyllaDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 			
 			-- Core fields for protobuf compatibility (managed by application)
 			ticket_id TEXT,
-			tenant TEXT,
 			created_at TIMESTAMP,
 			updated_at TIMESTAMP,
 			
@@ -290,8 +289,8 @@ func (s *ScyllaDBStorage) createTableIfNotExists(ctx context.Context, tableName 
 			templateid BIGINT,
 			emailreadconfigid BIGINT,
 			
-			PRIMARY KEY (tenant, ticket_id)
-		) WITH CLUSTERING ORDER BY (ticket_id ASC)`, s.keyspace, tableName)
+			PRIMARY KEY (ticket_id)
+		)`, s.keyspace, tableName)
 
 	if err := s.session.Query(createTableQuery).Exec(); err != nil {
 		return fmt.Errorf("failed to create table %s: %w", tableName, err)
@@ -349,12 +348,11 @@ func (s *ScyllaDBStorage) createIndexes(ctx context.Context, tableName string) e
 }
 
 // protobufToScyllaDBRow converts a TicketData protobuf to ScyllaDB row data
-func protobufToScyllaDBRow(ticketData *ticketpb.TicketData, tenant string, isUpdate bool) (map[string]interface{}, error) {
+func protobufToScyllaDBRow(ticketData *ticketpb.TicketData, isUpdate bool) (map[string]interface{}, error) {
 	row := make(map[string]interface{})
 
 	// Core fields - these are managed by the application
 	row["ticket_id"] = ticketData.Id
-	row["tenant"] = tenant // Use the tenant parameter passed to the function
 
 	// Handle timestamps
 	if !isUpdate {
@@ -539,9 +537,7 @@ func scyllaDBRowToProtobuf(row map[string]interface{}) *ticketpb.TicketData {
 	if ticketID, ok := row["ticket_id"].(string); ok {
 		ticketData.Id = ticketID
 	}
-	if tenant, ok := row["tenant"].(string); ok {
-		ticketData.Tenant = tenant
-	}
+
 	if createdAt, ok := row["created_at"].(time.Time); ok {
 		ticketData.CreatedAt = createdAt.Format(time.RFC3339)
 	}
@@ -552,7 +548,7 @@ func scyllaDBRowToProtobuf(row map[string]interface{}) *ticketpb.TicketData {
 	// Convert all other fields to protobuf FieldValue
 	for key, value := range row {
 		// Skip core fields that are already handled
-		if key == "id" || key == "ticket_id" || key == "tenant" || key == "created_at" || key == "updated_at" {
+		if key == "id" || key == "ticket_id" || key == "created_at" || key == "updated_at" {
 			continue
 		}
 
@@ -603,14 +599,14 @@ func scyllaDBRowToProtobuf(row map[string]interface{}) *ticketpb.TicketData {
 	return ticketData
 }
 
-// CreateTicket stores a new ticket in the tenant-specific ScyllaDB table
-func (s *ScyllaDBStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
+// CreateTicket stores a new ticket in the ScyllaDB table
+func (s *ScyllaDBStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := s.ensureTenantTable(ctx, tenant); err != nil {
-		return fmt.Errorf("failed to ensure tenant table: %w", err), nil
+	// Ensure table exists
+	if err := s.createTableIfNotExists(ctx, s.baseTableName); err != nil {
+		return fmt.Errorf("failed to ensure table: %w", err), nil
 	}
 
 	// Generate ticket ID if not provided
@@ -618,17 +614,14 @@ func (s *ScyllaDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 		ticketData.Id = s.generateTicketID()
 	}
 
-	// Ensure tenant is set correctly
-	ticketData.Tenant = tenant
-
 	// Convert protobuf to ScyllaDB row (isUpdate = false for create)
-	row, err := protobufToScyllaDBRow(ticketData, tenant, false)
+	row, err := protobufToScyllaDBRow(ticketData, false)
 	if err != nil {
 		return fmt.Errorf("failed to convert protobuf to row: %w", err), nil
 	}
 
-	// Get tenant-specific table name
-	tableName := s.getTenantTableName(tenant)
+	// Use base table name
+	tableName := s.baseTableName
 
 	// Build INSERT query dynamically
 	columns := make([]string, 0, len(row))
@@ -653,7 +646,7 @@ func (s *ScyllaDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 		return fmt.Errorf("failed to create ticket in table %s: %w", tableName, err), nil
 	}
 
-	log.Printf("Created ticket %s for tenant %s in table %s", ticketData.Id, tenant, tableName)
+	log.Printf("Created ticket %s in table %s", ticketData.Id, tableName)
 
 	result := map[string]interface{}{
 		"id":        row["id"],
@@ -663,35 +656,35 @@ func (s *ScyllaDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticke
 	return nil, result
 }
 
-// GetTicket retrieves a single ticket by ID from the tenant-specific ScyllaDB table
-func (s *ScyllaDBStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
+// GetTicket retrieves a single ticket by ID from the ScyllaDB table
+func (s *ScyllaDBStorage) GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := s.ensureTenantTable(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
+	// Ensure table exists
+	if err := s.createTableIfNotExists(ctx, s.baseTableName); err != nil {
+		log.Printf("ERROR: Failed to ensure table: %v", err)
 		return nil, false
 	}
 
-	// Get tenant-specific table name
-	tableName := s.getTenantTableName(tenant)
+	// Use base table name
+	tableName := s.baseTableName
 
 	// Build SELECT query
 	selectCQL := fmt.Sprintf(
-		"SELECT * FROM %s.%s WHERE tenant = ? AND ticket_id = ?",
+		"SELECT * FROM %s.%s WHERE ticket_id = ?",
 		s.keyspace, tableName,
 	)
 
 	// Execute query
-	iter := s.session.Query(selectCQL, tenant, id).Iter()
+	iter := s.session.Query(selectCQL, id).Iter()
 	defer iter.Close()
 
 	// Scan the row safely
 	if rowMap, found := scanRowSafely(iter); found {
 		// Convert to protobuf
 		ticketData := scyllaDBRowToProtobuf(rowMap)
-		log.Printf("Found ticket %s for tenant %s", id, tenant)
+		log.Printf("Found ticket %s", id)
 		return ticketData, true
 	}
 
@@ -699,30 +692,29 @@ func (s *ScyllaDBStorage) GetTicket(tenant, id string, store jetstream.KeyValue)
 		log.Printf("ERROR: Failed to close iterator: %v", err)
 	}
 
-	log.Printf("Ticket %s not found for tenant %s", id, tenant)
+	log.Printf("Ticket %s not found", id)
 	return nil, false
 }
 
-// UpdateTicket updates an existing ticket in the tenant-specific ScyllaDB table
-func (s *ScyllaDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
+// UpdateTicket updates an existing ticket in the ScyllaDB table
+func (s *ScyllaDBStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := s.ensureTenantTable(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
+	// Ensure table exists
+	if err := s.createTableIfNotExists(ctx, s.baseTableName); err != nil {
+		log.Printf("ERROR: Failed to ensure table: %v", err)
 		return false
 	}
 
 	// Convert protobuf to ScyllaDB row (isUpdate = true for update)
-	row, err := protobufToScyllaDBRow(ticketData, tenant, true)
+	row, err := protobufToScyllaDBRow(ticketData, true)
 	if err != nil {
 		log.Printf("ERROR: Failed to convert protobuf to row: %v", err)
 		return false
 	}
 
 	// Remove primary key fields from update
-	delete(row, "tenant")
 	delete(row, "ticket_id")
 	delete(row, "id")
 
@@ -731,8 +723,8 @@ func (s *ScyllaDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 		return true
 	}
 
-	// Get tenant-specific table name
-	tableName := s.getTenantTableName(tenant)
+	// Use base table name
+	tableName := s.baseTableName
 
 	// Build UPDATE query dynamically
 	setClauses := make([]string, 0, len(row))
@@ -744,10 +736,10 @@ func (s *ScyllaDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 	}
 
 	// Add WHERE clause values
-	values = append(values, tenant, ticketData.Id)
+	values = append(values, ticketData.Id)
 
 	updateCQL := fmt.Sprintf(
-		"UPDATE %s.%s SET %s WHERE tenant = ? AND ticket_id = ?",
+		"UPDATE %s.%s SET %s WHERE ticket_id = ?",
 		s.keyspace,
 		tableName,
 		strings.Join(setClauses, ", "),
@@ -758,14 +750,14 @@ func (s *ScyllaDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticke
 		return false
 	}
 
-	log.Printf("Updated ticket %s for tenant %s in table %s", ticketData.Id, tenant, tableName)
+	log.Printf("Updated ticket %s in table %s", ticketData.Id, tableName)
 	return true
 }
 
-// DeleteTicket removes a ticket from the tenant-specific ScyllaDB table
-func (s *ScyllaDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+// DeleteTicket removes a ticket from the ScyllaDB table
+func (s *ScyllaDBStorage) DeleteTicket(id string) (*ticketpb.TicketData, bool) {
 	// First get the ticket to return it
-	ticketData, exists := s.GetTicket(tenant, id, nil)
+	ticketData, exists := s.GetTicket(id, nil)
 	if !exists {
 		return nil, false
 	}
@@ -773,51 +765,51 @@ func (s *ScyllaDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData,
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := s.ensureTenantTable(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
+	// Ensure table exists
+	if err := s.createTableIfNotExists(ctx, s.baseTableName); err != nil {
+		log.Printf("ERROR: Failed to ensure table: %v", err)
 		return nil, false
 	}
 
-	// Get tenant-specific table name
-	tableName := s.getTenantTableName(tenant)
+	// Use base table name
+	tableName := s.baseTableName
 
 	// Build DELETE query
 	deleteCQL := fmt.Sprintf(
-		"DELETE FROM %s.%s WHERE tenant = ? AND ticket_id = ?",
+		"DELETE FROM %s.%s WHERE ticket_id = ?",
 		s.keyspace, tableName,
 	)
 
-	if err := s.session.Query(deleteCQL, tenant, id).Exec(); err != nil {
+	if err := s.session.Query(deleteCQL, id).Exec(); err != nil {
 		log.Printf("ERROR: Failed to delete ticket %s from table %s: %v", id, tableName, err)
 		return nil, false
 	}
 
-	log.Printf("Deleted ticket %s for tenant %s from table %s", id, tenant, tableName)
+	log.Printf("Deleted ticket %s from table %s", id, tableName)
 	return ticketData, true
 }
 
-// ListTickets retrieves all tickets for a tenant from the ScyllaDB table
-func (s *ScyllaDBStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
+// ListTickets retrieves all tickets from the ScyllaDB table
+func (s *ScyllaDBStorage) ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := s.ensureTenantTable(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	// Ensure table exists
+	if err := s.createTableIfNotExists(ctx, s.baseTableName); err != nil {
+		return nil, fmt.Errorf("failed to ensure table: %w", err)
 	}
 
-	// Get tenant-specific table name
-	tableName := s.getTenantTableName(tenant)
+	// Use base table name
+	tableName := s.baseTableName
 
 	// Build SELECT query
 	selectCQL := fmt.Sprintf(
-		"SELECT * FROM %s.%s WHERE tenant = ?",
+		"SELECT * FROM %s.%s",
 		s.keyspace, tableName,
 	)
 
 	// Execute query
-	iter := s.session.Query(selectCQL, tenant).Iter()
+	iter := s.session.Query(selectCQL).Iter()
 	defer iter.Close()
 
 	var tickets []*ticketpb.TicketData
@@ -837,39 +829,39 @@ func (s *ScyllaDBStorage) ListTickets(tenant string, store jetstream.KeyValue) (
 		return nil, fmt.Errorf("error closing iterator: %w", err)
 	}
 
-	log.Printf("Found %d tickets for tenant %s", len(tickets), tenant)
+	log.Printf("Found %d tickets", len(tickets))
 	return tickets, nil
 }
 
 // SearchTickets searches for tickets based on conditions
-func (s *ScyllaDBStorage) SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
-	return s.SearchTicketsWithProjection(tenant, request)
+func (s *ScyllaDBStorage) SearchTickets(request SearchRequest) ([]*ticketpb.TicketData, error) {
+	return s.SearchTicketsWithProjection(request)
 }
 
 // SearchTicketsWithProjection searches for tickets with optional field projection
-func (s *ScyllaDBStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
+func (s *ScyllaDBStorage) SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := s.ensureTenantTable(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
+	// Ensure table exists
+	if err := s.createTableIfNotExists(ctx, s.baseTableName); err != nil {
+		return nil, fmt.Errorf("failed to ensure table: %w", err)
 	}
 
-	// Get tenant-specific table name
-	tableName := s.getTenantTableName(tenant)
+	// Use base table name
+	tableName := s.baseTableName
 
 	// Build SELECT clause with projection
 	selectClause := "*"
 	if len(request.ProjectedFields) > 0 {
 		// Always include primary key fields and core fields
-		projectedFields := []string{"tenant", "ticket_id", "id", "created_at", "updated_at"}
+		projectedFields := []string{"ticket_id", "id", "created_at", "updated_at"}
 		projectedFields = append(projectedFields, request.ProjectedFields...)
 		selectClause = strings.Join(projectedFields, ", ")
 	}
 
 	// Build WHERE clause
-	whereClause, values := s.buildWhereClause(request.Conditions, tenant)
+	whereClause, values := s.buildWhereClause(request.Conditions)
 
 	// Build ORDER BY clause - only use if sorting by clustering column (ticket_id)
 	orderByClause := ""
@@ -925,18 +917,14 @@ func (s *ScyllaDBStorage) SearchTicketsWithProjection(tenant string, request Sea
 		tickets = s.applySortingClientSide(tickets, request.SortFields)
 	}
 
-	log.Printf("Found %d tickets for tenant %s matching search criteria", len(tickets), tenant)
+	log.Printf("Found %d tickets matching search criteria", len(tickets))
 	return tickets, nil
 }
 
 // buildWhereClause builds a WHERE clause from search conditions
-func (s *ScyllaDBStorage) buildWhereClause(conditions []SearchCondition, tenant string) (string, []interface{}) {
+func (s *ScyllaDBStorage) buildWhereClause(conditions []SearchCondition) (string, []interface{}) {
 	var clauses []string
 	var values []interface{}
-
-	// Always include tenant condition
-	clauses = append(clauses, "tenant = ?")
-	values = append(values, tenant)
 
 	for _, condition := range conditions {
 		field := strings.ToLower(condition.Operand)

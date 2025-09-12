@@ -27,12 +27,12 @@ type SearchRequest struct {
 
 // TicketStorage defines the interface for ticket storage operations
 type TicketStorage interface {
-	CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{})
-	GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool)
-	UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool
-	DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool)
-	ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error)
-	SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error)
-	SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error)
+	CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{})
+	GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool)
+	UpdateTicket(ticketData *ticketpb.TicketData) bool
+	DeleteTicket(id string) (*ticketpb.TicketData, bool)
+	ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error)
+	SearchTickets(request SearchRequest) ([]*ticketpb.TicketData, error)
+	SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error)
 	Close() error
 }

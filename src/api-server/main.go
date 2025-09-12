@@ -80,24 +80,8 @@ type APIHandler struct {
 
 func tenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		tenantID := r.Header.Get("X-Tenant-ID")
-		if tenantID == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(ErrorResponse{
-				Error:   "missing_tenant_id",
-				Message: "X-Tenant-ID header is required",
-			})
-			return
-		}
-
-		ctx := context.WithValue(r.Context(), TenantContextKey, tenantID)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		// No tenant validation needed anymore - just pass through
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -109,8 +93,8 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 
-		log.Printf("method=%s path=%s correlation_id=%s duration=%v tenant=%s",
-			r.Method, r.URL.Path, correlationID, time.Since(start), r.Header.Get("X-Tenant-ID"))
+		log.Printf("method=%s path=%s correlation_id=%s duration=%v",
+			r.Method, r.URL.Path, correlationID, time.Since(start))
 	})
 }
 
@@ -118,7 +102,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Tenant-ID")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
@@ -130,8 +114,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
-	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
-
 	// Accept any JSON data for dynamic field handling
 	var ticketData map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&ticketData); err != nil {
@@ -143,7 +125,6 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 
 	requestData := map[string]interface{}{
 		"action": "create",
-		"tenant": tenant,
 		"data":   ticketData,
 	}
 
@@ -162,11 +143,8 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
-	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
-
 	requestData := map[string]interface{}{
 		"action": "list",
-		"tenant": tenant,
 	}
 
 	start := time.Now()
@@ -195,13 +173,11 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
-	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
 	requestData := map[string]interface{}{
 		"action":    "get",
-		"tenant":    tenant,
 		"ticket_id": ticketID,
 	}
 
@@ -241,7 +217,6 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
-	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
@@ -256,7 +231,6 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 
 	requestData := map[string]interface{}{
 		"action":    "update",
-		"tenant":    tenant,
 		"ticket_id": ticketID,
 		"data":      updateData,
 	}
@@ -285,13 +259,11 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
-	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
 	requestData := map[string]interface{}{
 		"action":    "delete",
-		"tenant":    tenant,
 		"ticket_id": ticketID,
 	}
 
@@ -318,7 +290,6 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
-	tenant := strings.ToLower(r.Context().Value(TenantContextKey).(string))
 
 	start := time.Now()
 
@@ -349,12 +320,11 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 
 	// Log field projection for debugging
 	if len(searchRequest.ProjectedFields) > 0 {
-		log.Printf("Search request with %d projected fields: %v (core fields id, tenant, created_at, updated_at will be included automatically)", len(searchRequest.ProjectedFields), searchRequest.ProjectedFields)
+		log.Printf("Search request with %d projected fields: %v (core fields id, created_at, updated_at will be included automatically)", len(searchRequest.ProjectedFields), searchRequest.ProjectedFields)
 	}
 
 	requestData := map[string]interface{}{
 		"action": "search",
-		"tenant": tenant,
 		"data": map[string]interface{}{
 			"conditions":       searchRequest.Conditions,
 			"projected_fields": searchRequest.ProjectedFields,

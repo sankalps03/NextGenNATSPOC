@@ -403,7 +403,7 @@ func (p *PostgreSQLEAVStorage) convertEAVRowsToTicket(rows []map[string]interfac
 }
 
 // CreateTicket stores a new ticket in the PostgreSQL EAV table
-func (p *PostgreSQLEAVStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
+func (p *PostgreSQLEAVStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -476,7 +476,7 @@ func (p *PostgreSQLEAVStorage) CreateTicket(tenant string, ticketData *ticketpb.
 }
 
 // GetTicket retrieves a ticket by ID from the PostgreSQL EAV table
-func (p *PostgreSQLEAVStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
+func (p *PostgreSQLEAVStorage) GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -545,7 +545,7 @@ func (p *PostgreSQLEAVStorage) GetTicket(tenant, id string, store jetstream.KeyV
 }
 
 // UpdateTicket updates an existing ticket in the PostgreSQL EAV table
-func (p *PostgreSQLEAVStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
+func (p *PostgreSQLEAVStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -611,12 +611,12 @@ func (p *PostgreSQLEAVStorage) UpdateTicket(tenant string, ticketData *ticketpb.
 }
 
 // DeleteTicket removes a ticket from the PostgreSQL EAV table
-func (p *PostgreSQLEAVStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+func (p *PostgreSQLEAVStorage) DeleteTicket(id string) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// First, get the ticket data before deletion
-	ticketData, exists := p.GetTicket(tenant, id, nil)
+	ticketData, exists := p.GetTicket(id, nil)
 	if !exists {
 		return nil, false
 	}
@@ -644,7 +644,7 @@ func (p *PostgreSQLEAVStorage) DeleteTicket(tenant, id string) (*ticketpb.Ticket
 }
 
 // ListTickets retrieves all tickets from the PostgreSQL EAV table
-func (p *PostgreSQLEAVStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
+func (p *PostgreSQLEAVStorage) ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -657,7 +657,7 @@ func (p *PostgreSQLEAVStorage) ListTickets(tenant string, store jetstream.KeyVal
 
 	rows, err := p.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query EAV rows for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("failed to query EAV rows: %w", err)
 	}
 	defer rows.Close()
 
@@ -713,12 +713,12 @@ func (p *PostgreSQLEAVStorage) ListTickets(tenant string, store jetstream.KeyVal
 }
 
 // SearchTickets searches for tickets based on conditions in the PostgreSQL EAV table
-func (p *PostgreSQLEAVStorage) SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
-	return p.SearchTicketsWithProjection(tenant, request)
+func (p *PostgreSQLEAVStorage) SearchTickets(request SearchRequest) ([]*ticketpb.TicketData, error) {
+	return p.SearchTicketsWithProjection(request)
 }
 
 // SearchTicketsWithProjection searches for tickets with optional field projection using efficient CTE and LEFT JOINs
-func (p *PostgreSQLEAVStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
+func (p *PostgreSQLEAVStorage) SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -1078,7 +1078,6 @@ func (p *PostgreSQLEAVStorage) applyFieldProjection(ticketData *ticketpb.TicketD
 
 	projectedTicket := &ticketpb.TicketData{
 		Id:     ticketData.Id,
-		Tenant: ticketData.Tenant,
 		Fields: make(map[string]*ticketpb.FieldValue),
 	}
 

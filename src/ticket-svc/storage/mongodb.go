@@ -6,7 +6,6 @@ import (
 	"log"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -17,27 +16,25 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// MongoDBStorage implements tenant-aware ticket storage using MongoDB
-// Each tenant gets its own collection for complete data isolation
+// MongoDBStorage implements ticket storage using MongoDB
+// Uses a single collection for all tickets
 type MongoDBStorage struct {
-	client             *mongo.Client
-	database           *mongo.Database
-	databaseName       string
-	baseCollectionName string
-	tenantCollections  sync.Map     // tenant -> collectionName mapping for performance
-	collectionMutex    sync.RWMutex // synchronizes collection creation operations
+	client         *mongo.Client
+	database       *mongo.Database
+	databaseName   string
+	collectionName string
 }
 
 // NewMongoDBStorage creates a new MongoDB storage instance
-func NewMongoDBStorage(ctx context.Context, baseCollectionName, connectionString, databaseName string) (*MongoDBStorage, error) {
+func NewMongoDBStorage(ctx context.Context, collectionName, connectionString, databaseName string) (*MongoDBStorage, error) {
 	if connectionString == "" {
 		connectionString = "mongodb://localhost:27017"
 	}
 	if databaseName == "" {
 		databaseName = "tickets"
 	}
-	if baseCollectionName == "" {
-		baseCollectionName = "tickets"
+	if collectionName == "" {
+		collectionName = "tickets"
 	}
 
 	log.Printf("Connecting to MongoDB at %s, database: %s", maskConnectionString(connectionString), databaseName)
@@ -70,11 +67,15 @@ func NewMongoDBStorage(ctx context.Context, baseCollectionName, connectionString
 	database := client.Database(databaseName)
 
 	storage := &MongoDBStorage{
-		client:             client,
-		database:           database,
-		databaseName:       databaseName,
-		baseCollectionName: baseCollectionName,
-		tenantCollections:  sync.Map{},
+		client:         client,
+		database:       database,
+		databaseName:   databaseName,
+		collectionName: collectionName,
+	}
+
+	// Ensure the collection exists and has proper indexes
+	if err := storage.ensureCollectionExists(ctx); err != nil {
+		return nil, fmt.Errorf("failed to ensure collection exists: %w", err)
 	}
 
 	return storage, nil
@@ -106,34 +107,13 @@ func (m *MongoDBStorage) generateTicketID() string {
 	return fmt.Sprintf("TKT-%d", time.Now().UnixNano()/1000000)
 }
 
-// getTenantCollectionName returns the collection name for a specific tenant
-func (m *MongoDBStorage) getTenantCollectionName(tenant string) string {
-	// Use a consistent naming pattern: baseCollectionName_tenant
-	return fmt.Sprintf("%s_%s", m.baseCollectionName, strings.ToLower(strings.ReplaceAll(tenant, "-", "_")))
-}
-
-// ensureTenantCollection ensures that a collection exists for the given tenant
-func (m *MongoDBStorage) ensureTenantCollection(ctx context.Context, tenant string) error {
-	// Check if we already know about this collection
-	if _, exists := m.tenantCollections.Load(tenant); exists {
-		return nil
-	}
-
-	m.collectionMutex.Lock()
-	defer m.collectionMutex.Unlock()
-
-	// Double-check after acquiring lock
-	if _, exists := m.tenantCollections.Load(tenant); exists {
-		return nil
-	}
-
-	collectionName := m.getTenantCollectionName(tenant)
-
+// ensureCollectionExists ensures that the tickets collection exists
+func (m *MongoDBStorage) ensureCollectionExists(ctx context.Context) error {
 	// Check if collection exists with extended timeout
 	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	collections, err := m.database.ListCollectionNames(listCtx, bson.M{"name": collectionName})
+	collections, err := m.database.ListCollectionNames(listCtx, bson.M{"name": m.collectionName})
 	if err != nil {
 		if strings.Contains(err.Error(), "Unauthorized") || strings.Contains(err.Error(), "authentication") {
 			return fmt.Errorf("MongoDB authentication failed - check username/password in connection string: %w", err)
@@ -143,7 +123,7 @@ func (m *MongoDBStorage) ensureTenantCollection(ctx context.Context, tenant stri
 
 	collectionExists := false
 	for _, name := range collections {
-		if name == collectionName {
+		if name == m.collectionName {
 			collectionExists = true
 			break
 		}
@@ -154,29 +134,27 @@ func (m *MongoDBStorage) ensureTenantCollection(ctx context.Context, tenant stri
 		createCtx, createCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer createCancel()
 
-		if err := m.database.CreateCollection(createCtx, collectionName); err != nil {
+		if err := m.database.CreateCollection(createCtx, m.collectionName); err != nil {
 			if strings.Contains(err.Error(), "Unauthorized") || strings.Contains(err.Error(), "authentication") {
 				return fmt.Errorf("MongoDB authentication failed during collection creation - check username/password: %w", err)
 			}
-			return fmt.Errorf("failed to create collection %s (check MongoDB permissions): %w", collectionName, err)
+			return fmt.Errorf("failed to create collection %s (check MongoDB permissions): %w", m.collectionName, err)
 		}
-		log.Printf("Created new MongoDB collection for tenant %s: %s", tenant, collectionName)
+		log.Printf("Created new MongoDB collection: %s", m.collectionName)
 	}
 
 	// Create indexes
-	if err := m.createIndexes(ctx, collectionName); err != nil {
-		return fmt.Errorf("failed to create indexes for tenant %s: %w", tenant, err)
+	if err := m.createIndexes(ctx); err != nil {
+		return fmt.Errorf("failed to create indexes: %w", err)
 	}
 
-	// Store in map to avoid future checks
-	m.tenantCollections.Store(tenant, collectionName)
 	return nil
 }
 
 // createIndexes creates clustered compound indexes grouped by business domain
 // This replaces individual field indexes to reduce write burden and improve query performance
-func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName string) error {
-	collection := m.database.Collection(collectionName)
+func (m *MongoDBStorage) createIndexes(ctx context.Context) error {
+	collection := m.database.Collection(m.collectionName)
 
 	// Essential primary indexes
 	primaryIndexes := []mongo.IndexModel{
@@ -351,23 +329,22 @@ func (m *MongoDBStorage) createIndexes(ctx context.Context, collectionName strin
 
 		batch := allIndexes[i:end]
 		if _, err := collection.Indexes().CreateMany(ctx, batch); err != nil {
-			log.Printf("Warning: Failed to create clustered index batch %d-%d on %s: %v", i, end-1, collectionName, err)
+			log.Printf("Warning: Failed to create clustered index batch %d-%d on %s: %v", i, end-1, m.collectionName, err)
 		} else {
-			log.Printf("Created clustered indexes batch %d-%d on collection: %s", i, end-1, collectionName)
+			log.Printf("Created clustered indexes batch %d-%d on collection: %s", i, end-1, m.collectionName)
 		}
 	}
 
-	log.Printf("Successfully created %d clustered indexes on collection: %s", len(allIndexes), collectionName)
+	log.Printf("Successfully created %d clustered indexes on collection: %s", len(allIndexes), m.collectionName)
 	return nil
 }
 
 // protobufToMongoDBDocument converts a TicketData protobuf to MongoDB document
-func protobufToMongoDBDocument(ticketData *ticketpb.TicketData, tenant string, isUpdate bool) (bson.M, error) {
+func protobufToMongoDBDocument(ticketData *ticketpb.TicketData, isUpdate bool) (bson.M, error) {
 	doc := bson.M{}
 
 	// Core fields - these are managed by the application
 	doc["ticket_id"] = ticketData.Id
-	doc["tenant"] = tenant // Use the tenant parameter passed to the function
 
 	// Handle timestamps
 	if !isUpdate {
@@ -508,9 +485,6 @@ func mongoDBDocumentToProtobuf(doc bson.M) *ticketpb.TicketData {
 	if ticketID, ok := doc["ticket_id"].(string); ok {
 		ticketData.Id = ticketID
 	}
-	if tenant, ok := doc["tenant"].(string); ok {
-		ticketData.Tenant = tenant
-	}
 	if createdAt, ok := doc["created_at"].(primitive.DateTime); ok {
 		ticketData.CreatedAt = time.Unix(int64(createdAt)/1000, 0).Format(time.RFC3339)
 	} else if createdAt, ok := doc["created_at"].(time.Time); ok {
@@ -525,7 +499,7 @@ func mongoDBDocumentToProtobuf(doc bson.M) *ticketpb.TicketData {
 	// Convert all other fields to protobuf FieldValue
 	for key, value := range doc {
 		// Skip core fields and MongoDB internal fields
-		if key == "ticket_id" || key == "tenant" || key == "created_at" || key == "updated_at" || key == "_id" {
+		if key == "ticket_id" || key == "created_at" || key == "updated_at" || key == "_id" {
 			continue
 		}
 
@@ -577,41 +551,31 @@ func interfaceToFieldValue(value interface{}) *ticketpb.FieldValue {
 	}
 }
 
-// CreateTicket stores a new ticket in the tenant-specific MongoDB collection
-func (m *MongoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
+// CreateTicket stores a new ticket in the MongoDB collection
+func (m *MongoDBStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		return fmt.Errorf("failed to ensure tenant collection: %w", err), nil
-	}
 
 	// Generate ticket ID if not provided
 	if ticketData.Id == "" {
 		ticketData.Id = m.generateTicketID()
 	}
 
-	// Ensure tenant is set correctly
-	ticketData.Tenant = tenant
-
 	// Convert protobuf to MongoDB document (isUpdate = false for create)
-	doc, err := protobufToMongoDBDocument(ticketData, tenant, false)
+	doc, err := protobufToMongoDBDocument(ticketData, false)
 	if err != nil {
 		return fmt.Errorf("failed to convert protobuf to document: %w", err), nil
 	}
 
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	collection := m.database.Collection(m.collectionName)
 
 	// Insert the document
 	result, err := collection.InsertOne(ctx, doc)
 	if err != nil {
-		return fmt.Errorf("failed to create ticket in collection %s: %w", collectionName, err), nil
+		return fmt.Errorf("failed to create ticket in collection %s: %w", m.collectionName, err), nil
 	}
 
-	log.Printf("Created ticket %s for tenant %s in collection %s", ticketData.Id, tenant, collectionName)
+	log.Printf("Created ticket %s in collection %s", ticketData.Id, m.collectionName)
 
 	resultMap := map[string]interface{}{
 		"_id":       result.InsertedID,
@@ -621,24 +585,14 @@ func (m *MongoDBStorage) CreateTicket(tenant string, ticketData *ticketpb.Ticket
 	return nil, resultMap
 }
 
-// GetTicket retrieves a single ticket by ID from the tenant-specific MongoDB collection
-func (m *MongoDBStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
+// GetTicket retrieves a single ticket by ID from the MongoDB collection
+func (m *MongoDBStorage) GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant collection for %s: %v", tenant, err)
-		return nil, false
-	}
-
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	collection := m.database.Collection(m.collectionName)
 
 	// Build filter
 	filter := bson.M{
-		"tenant":    tenant,
 		"ticket_id": id,
 	}
 
@@ -647,36 +601,27 @@ func (m *MongoDBStorage) GetTicket(tenant, id string, store jetstream.KeyValue) 
 	err := collection.FindOne(ctx, filter).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			log.Printf("Ticket %s not found for tenant %s", id, tenant)
+			log.Printf("Ticket %s not found", id)
 			return nil, false
 		}
-		log.Printf("ERROR: Failed to get ticket %s for tenant %s: %v", id, tenant, err)
+		log.Printf("ERROR: Failed to get ticket %s: %v", id, err)
 		return nil, false
 	}
 
 	// Convert MongoDB document back to protobuf
 	ticketData := mongoDBDocumentToProtobuf(doc)
 
-	log.Printf("Retrieved ticket %s for tenant %s from collection %s", id, tenant, collectionName)
+	log.Printf("Retrieved ticket %s from collection %s", id, m.collectionName)
 	return ticketData, true
 }
 
-// UpdateTicket updates an existing ticket in the tenant-specific MongoDB collection
-func (m *MongoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
+// UpdateTicket updates an existing ticket in the MongoDB collection
+func (m *MongoDBStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant collection for %s: %v", tenant, err)
-		return false
-	}
-
-	// Ensure tenant is set correctly
-	ticketData.Tenant = tenant
-
 	// Convert protobuf to MongoDB document (isUpdate = true for update)
-	doc, err := protobufToMongoDBDocument(ticketData, tenant, true)
+	doc, err := protobufToMongoDBDocument(ticketData, true)
 	if err != nil {
 		log.Printf("ERROR: Failed to convert protobuf to document: %v", err)
 		return false
@@ -685,13 +630,10 @@ func (m *MongoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticket
 	// Remove _id from update document as it cannot be updated
 	delete(doc, "_id")
 
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	collection := m.database.Collection(m.collectionName)
 
 	// Build filter
 	filter := bson.M{
-		"tenant":    tenant,
 		"ticket_id": ticketData.Id,
 	}
 
@@ -703,37 +645,28 @@ func (m *MongoDBStorage) UpdateTicket(tenant string, ticketData *ticketpb.Ticket
 	// Update the document
 	result, err := collection.UpdateOne(ctx, filter, update)
 	if err != nil {
-		log.Printf("ERROR: Failed to update ticket %s for tenant %s: %v", ticketData.Id, tenant, err)
+		log.Printf("ERROR: Failed to update ticket %s: %v", ticketData.Id, err)
 		return false
 	}
 
 	if result.MatchedCount == 0 {
-		log.Printf("WARNING: No ticket found to update with ID %s for tenant %s", ticketData.Id, tenant)
+		log.Printf("WARNING: No ticket found to update with ID %s", ticketData.Id)
 		return false
 	}
 
-	log.Printf("Updated ticket %s for tenant %s in collection %s", ticketData.Id, tenant, collectionName)
+	log.Printf("Updated ticket %s in collection %s", ticketData.Id, m.collectionName)
 	return true
 }
 
-// DeleteTicket removes a ticket from the tenant-specific MongoDB collection
-func (m *MongoDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+// DeleteTicket removes a ticket from the MongoDB collection
+func (m *MongoDBStorage) DeleteTicket(id string) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant collection for %s: %v", tenant, err)
-		return nil, false
-	}
-
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	collection := m.database.Collection(m.collectionName)
 
 	// Build filter
 	filter := bson.M{
-		"tenant":    tenant,
 		"ticket_id": id,
 	}
 
@@ -742,41 +675,34 @@ func (m *MongoDBStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, 
 	err := collection.FindOneAndDelete(ctx, filter).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			log.Printf("Ticket %s not found for deletion for tenant %s", id, tenant)
+			log.Printf("Ticket %s not found for deletion", id)
 			return nil, false
 		}
-		log.Printf("ERROR: Failed to delete ticket %s for tenant %s: %v", id, tenant, err)
+		log.Printf("ERROR: Failed to delete ticket %s: %v", id, err)
 		return nil, false
 	}
 
 	// Convert MongoDB document back to protobuf
 	ticketData := mongoDBDocumentToProtobuf(doc)
 
-	log.Printf("Deleted ticket %s for tenant %s from collection %s", id, tenant, collectionName)
+	log.Printf("Deleted ticket %s from collection %s", id, m.collectionName)
 	return ticketData, true
 }
 
-// ListTickets retrieves all tickets for a tenant from the MongoDB collection
-func (m *MongoDBStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
+// ListTickets retrieves all tickets from the MongoDB collection
+func (m *MongoDBStorage) ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
-	}
+	collection := m.database.Collection(m.collectionName)
 
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	// Build filter (empty filter to get all tickets)
+	filter := bson.M{}
 
-	// Build filter for tenant
-	filter := bson.M{"tenant": tenant}
-
-	// Find all documents for the tenant
+	// Find all documents
 	cursor, err := collection.Find(ctx, filter)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tickets for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("failed to list tickets: %w", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -784,7 +710,7 @@ func (m *MongoDBStorage) ListTickets(tenant string, store jetstream.KeyValue) ([
 	for cursor.Next(ctx) {
 		var doc bson.M
 		if err := cursor.Decode(&doc); err != nil {
-			log.Printf("WARNING: Failed to decode document for tenant %s: %v", tenant, err)
+			log.Printf("WARNING: Failed to decode document: %v", err)
 			continue
 		}
 
@@ -793,16 +719,16 @@ func (m *MongoDBStorage) ListTickets(tenant string, store jetstream.KeyValue) ([
 	}
 
 	if err := cursor.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error while listing tickets for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("cursor error while listing tickets: %w", err)
 	}
 
-	log.Printf("Listed %d tickets for tenant %s from collection %s", len(tickets), tenant, collectionName)
+	log.Printf("Listed %d tickets from collection %s", len(tickets), m.collectionName)
 	return tickets, nil
 }
 
 // buildMongoDBFilter converts search conditions to MongoDB filter
-func (m *MongoDBStorage) buildMongoDBFilter(tenant string, conditions []SearchCondition) bson.M {
-	filter := bson.M{"tenant": tenant}
+func (m *MongoDBStorage) buildMongoDBFilter(conditions []SearchCondition) bson.M {
+	filter := bson.M{}
 
 	if len(conditions) == 0 {
 		return filter
@@ -888,22 +814,15 @@ func (m *MongoDBStorage) buildMongoDBSort(sortFields []SortField) bson.D {
 	return sort
 }
 
-// SearchTickets performs a search query on the tenant-specific MongoDB collection
-func (m *MongoDBStorage) SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
+// SearchTickets performs a search query on the MongoDB collection
+func (m *MongoDBStorage) SearchTickets(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
-	}
-
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	collection := m.database.Collection(m.collectionName)
 
 	// Build filter from search conditions
-	filter := m.buildMongoDBFilter(tenant, request.Conditions)
+	filter := m.buildMongoDBFilter(request.Conditions)
 
 	// Build sort options
 	sortOptions := m.buildMongoDBSort(request.SortFields)
@@ -914,7 +833,7 @@ func (m *MongoDBStorage) SearchTickets(tenant string, request SearchRequest) ([]
 	// Execute the query
 	cursor, err := collection.Find(ctx, filter, findOptions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search tickets for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("failed to search tickets: %w", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -922,7 +841,7 @@ func (m *MongoDBStorage) SearchTickets(tenant string, request SearchRequest) ([]
 	for cursor.Next(ctx) {
 		var doc bson.M
 		if err := cursor.Decode(&doc); err != nil {
-			log.Printf("WARNING: Failed to decode document for tenant %s: %v", tenant, err)
+			log.Printf("WARNING: Failed to decode document: %v", err)
 			continue
 		}
 
@@ -931,29 +850,22 @@ func (m *MongoDBStorage) SearchTickets(tenant string, request SearchRequest) ([]
 	}
 
 	if err := cursor.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error while searching tickets for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("cursor error while searching tickets: %w", err)
 	}
 
-	log.Printf("Found %d tickets for tenant %s in collection %s", len(tickets), tenant, collectionName)
+	log.Printf("Found %d tickets in collection %s", len(tickets), m.collectionName)
 	return tickets, nil
 }
 
-// SearchTicketsWithProjection performs a search query with field projection on the tenant-specific MongoDB collection
-func (m *MongoDBStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
+// SearchTicketsWithProjection performs a search query with field projection on the MongoDB collection
+func (m *MongoDBStorage) SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant collection exists
-	if err := m.ensureTenantCollection(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant collection: %w", err)
-	}
-
-	// Get tenant-specific collection name
-	collectionName := m.getTenantCollectionName(tenant)
-	collection := m.database.Collection(collectionName)
+	collection := m.database.Collection(m.collectionName)
 
 	// Build filter from search conditions
-	filter := m.buildMongoDBFilter(tenant, request.Conditions)
+	filter := m.buildMongoDBFilter(request.Conditions)
 
 	// Build sort options
 	sortOptions := m.buildMongoDBSort(request.SortFields)
@@ -968,7 +880,6 @@ func (m *MongoDBStorage) SearchTicketsWithProjection(tenant string, request Sear
 		// Always include core fields
 		projection["_id"] = 1
 		projection["ticket_id"] = 1
-		projection["tenant"] = 1
 		projection["created_at"] = 1
 		projection["updated_at"] = 1
 
@@ -983,7 +894,7 @@ func (m *MongoDBStorage) SearchTicketsWithProjection(tenant string, request Sear
 	// Execute the query
 	cursor, err := collection.Find(ctx, filter, findOptions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search tickets with projection for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("failed to search tickets with projection: %w", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -991,7 +902,7 @@ func (m *MongoDBStorage) SearchTicketsWithProjection(tenant string, request Sear
 	for cursor.Next(ctx) {
 		var doc bson.M
 		if err := cursor.Decode(&doc); err != nil {
-			log.Printf("WARNING: Failed to decode document for tenant %s: %v", tenant, err)
+			log.Printf("WARNING: Failed to decode document: %v", err)
 			continue
 		}
 
@@ -1000,10 +911,10 @@ func (m *MongoDBStorage) SearchTicketsWithProjection(tenant string, request Sear
 	}
 
 	if err := cursor.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error while searching tickets with projection for tenant %s: %w", tenant, err)
+		return nil, fmt.Errorf("cursor error while searching tickets with projection: %w", err)
 	}
 
-	log.Printf("Found %d tickets with projection for tenant %s in collection %s", len(tickets), tenant, collectionName)
+	log.Printf("Found %d tickets with projection in collection %s", len(tickets), m.collectionName)
 	return tickets, nil
 }
 

@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -17,17 +16,15 @@ import (
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
 )
 
-// PostgreSQLStorage implements tenant-aware ticket storage using PostgreSQL
-// Each tenant gets its own table for complete data isolation
+// PostgreSQLStorage implements ticket storage using PostgreSQL
+// Uses a single table for all tickets
 type PostgreSQLStorage struct {
-	db            *sql.DB
-	baseTableName string
-	tenantTables  sync.Map     // tenant -> tableName mapping for performance
-	tableMutex    sync.RWMutex // synchronizes table creation operations
+	db        *sql.DB
+	tableName string
 }
 
-// NewPostgreSQLStorage creates a new tenant-aware PostgreSQL storage instance
-func NewPostgreSQLStorage(ctx context.Context, baseTableName, connectionString string) (*PostgreSQLStorage, error) {
+// NewPostgreSQLStorage creates a new PostgreSQL storage instance
+func NewPostgreSQLStorage(ctx context.Context, tableName, connectionString string) (*PostgreSQLStorage, error) {
 	// Open database connection
 	db, err := sql.Open("postgres", connectionString)
 	if err != nil {
@@ -47,9 +44,13 @@ func NewPostgreSQLStorage(ctx context.Context, baseTableName, connectionString s
 	log.Printf("PostgreSQL connection established successfully")
 
 	storage := &PostgreSQLStorage{
-		db:            db,
-		baseTableName: baseTableName,
-		tenantTables:  sync.Map{},
+		db:        db,
+		tableName: tableName,
+	}
+
+	// Ensure the table exists
+	if err := storage.ensureTableExists(ctx); err != nil {
+		return nil, fmt.Errorf("failed to ensure table exists: %w", err)
 	}
 
 	return storage, nil
@@ -61,32 +62,8 @@ func (p *PostgreSQLStorage) generateTicketID() string {
 	return fmt.Sprintf("TKT-%d", time.Now().UnixNano()/1000000)
 }
 
-// getTenantTableName generates a tenant-specific table name
-func (p *PostgreSQLStorage) getTenantTableName(tenantID string) string {
-	// Use a consistent naming pattern: baseTableName_tenantID
-	// Replace any special characters in tenant ID to make it SQL-safe
-	safeTenantID := strings.ReplaceAll(tenantID, "-", "_")
-	safeTenantID = strings.ReplaceAll(safeTenantID, ".", "_")
-	return fmt.Sprintf("%s_%s", p.baseTableName, safeTenantID)
-}
-
-// ensureTenantTable ensures that a table exists for the given tenant
-func (p *PostgreSQLStorage) ensureTenantTable(ctx context.Context, tenantID string) error {
-	tableName := p.getTenantTableName(tenantID)
-
-	// Check if we already know this table exists
-	if _, exists := p.tenantTables.Load(tenantID); exists {
-		return nil
-	}
-
-	p.tableMutex.Lock()
-	defer p.tableMutex.Unlock()
-
-	// Double-check after acquiring lock
-	if _, exists := p.tenantTables.Load(tenantID); exists {
-		return nil
-	}
-
+// ensureTableExists ensures that the tickets table exists
+func (p *PostgreSQLStorage) ensureTableExists(ctx context.Context) error {
 	// Check if table exists in database
 	var exists bool
 	checkQuery := `
@@ -96,23 +73,21 @@ func (p *PostgreSQLStorage) ensureTenantTable(ctx context.Context, tenantID stri
 			AND table_name = $1
 		)`
 
-	err := p.db.QueryRowContext(ctx, checkQuery, tableName).Scan(&exists)
+	err := p.db.QueryRowContext(ctx, checkQuery, p.tableName).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("failed to check if table exists: %w", err)
 	}
 
 	if !exists {
 		// Create the table
-		if err := p.createTableIfNotExists(ctx, tableName); err != nil {
-			return fmt.Errorf("failed to create table for tenant %s: %w", tenantID, err)
+		if err := p.createTableIfNotExists(ctx); err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
 		}
-		log.Printf("Created new PostgreSQL table for tenant %s: %s", tenantID, tableName)
+		log.Printf("Created new PostgreSQL table: %s", p.tableName)
 	} else {
-		log.Printf("Found existing PostgreSQL table for tenant %s: %s", tenantID, tableName)
+		log.Printf("Found existing PostgreSQL table: %s", p.tableName)
 	}
 
-	// Store in map to avoid future checks
-	p.tenantTables.Store(tenantID, tableName)
 	return nil
 }
 
@@ -146,105 +121,32 @@ func (p *PostgreSQLStorage) loadSchemaFromFile() (string, error) {
 	return schemaContent, nil
 }
 
-// createTableIfNotExists creates a new PostgreSQL table using the schema from file
+// createTableIfNotExists creates the PostgreSQL table using the schema from file
 // The schema includes clustered indexes grouped by business domain to reduce write burden
 // and improve query performance compared to individual field indexes
-func (p *PostgreSQLStorage) createTableIfNotExists(ctx context.Context, tableName string) error {
+func (p *PostgreSQLStorage) createTableIfNotExists(ctx context.Context) error {
 	// Load schema from file (includes clustered indexing strategy)
 	schemaContent, err := p.loadSchemaFromFile()
 	if err != nil {
 		return fmt.Errorf("failed to load schema file: %w", err)
 	}
 
-	// Parse the schema and adapt it for tenant-specific table
-	adaptedSchema, err := p.adaptSchemaForTenant(schemaContent, tableName)
+	// Execute the schema with clustered indexes
+	_, err = p.db.ExecContext(ctx, schemaContent)
 	if err != nil {
-		return fmt.Errorf("failed to adapt schema for tenant: %w", err)
+		return fmt.Errorf("failed to create table %s with clustered indexes: %w", p.tableName, err)
 	}
 
-	// Execute the adapted schema with clustered indexes
-	_, err = p.db.ExecContext(ctx, adaptedSchema)
-	if err != nil {
-		return fmt.Errorf("failed to create table %s with clustered indexes: %w", tableName, err)
-	}
-
-	log.Printf("Created PostgreSQL table %s with clustered indexing strategy", tableName)
-
-	log.Printf("Successfully created table %s from schema file", tableName)
+	log.Printf("Created PostgreSQL table %s with clustered indexing strategy", p.tableName)
 	return nil
 }
 
-// adaptSchemaForTenant modifies the schema to work with tenant-specific tables
-func (p *PostgreSQLStorage) adaptSchemaForTenant(schemaContent, tableName string) (string, error) {
-	// Split the schema into statements
-	statements := strings.Split(schemaContent, ";")
-	var adaptedStatements []string
-
-	for _, stmt := range statements {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" {
-			continue
-		}
-
-		// Skip DROP statements for safety
-		if strings.HasPrefix(strings.ToUpper(stmt), "DROP") {
-			continue
-		}
-
-		// Replace table name in CREATE TABLE statements
-		if strings.Contains(strings.ToUpper(stmt), "CREATE TABLE") {
-			// Replace "CREATE TABLE tickets" with "CREATE TABLE {tableName}"
-			stmt = strings.ReplaceAll(stmt, "CREATE TABLE tickets", fmt.Sprintf("CREATE TABLE %s", tableName))
-		}
-
-		// Replace table name in INDEX statements
-		if strings.Contains(strings.ToUpper(stmt), "CREATE INDEX") {
-			// Replace "ON tickets" with "ON {tableName}"
-			stmt = strings.ReplaceAll(stmt, "ON tickets(", fmt.Sprintf("ON %s(", tableName))
-			stmt = strings.ReplaceAll(stmt, "ON tickets ", fmt.Sprintf("ON %s ", tableName))
-
-			// Replace index names to be table-specific
-			if strings.Contains(stmt, "idx_tickets_") {
-				stmt = strings.ReplaceAll(stmt, "idx_tickets_", fmt.Sprintf("idx_%s_", tableName))
-			}
-		}
-
-		if strings.Contains(strings.ToUpper(stmt), "CREATE UNIQUE INDEX") {
-			// Replace "ON tickets" with "ON {tableName}"
-			stmt = strings.ReplaceAll(stmt, "ON tickets(", fmt.Sprintf("ON %s(", tableName))
-			stmt = strings.ReplaceAll(stmt, "ON tickets ", fmt.Sprintf("ON %s ", tableName))
-
-			// Replace index names to be table-specific
-			if strings.Contains(stmt, "idx_tickets_") {
-				stmt = strings.ReplaceAll(stmt, "idx_tickets_", fmt.Sprintf("idx_%s_", tableName))
-			}
-		}
-
-		// Replace table name in TRIGGER statements
-		if strings.Contains(strings.ToUpper(stmt), "CREATE TRIGGER") {
-			stmt = strings.ReplaceAll(stmt, "ON tickets", fmt.Sprintf("ON %s", tableName))
-			stmt = strings.ReplaceAll(stmt, "update_tickets_updated_at", fmt.Sprintf("update_%s_updated_at", tableName))
-		}
-
-		// Replace table name in COMMENT statements
-		if strings.Contains(strings.ToUpper(stmt), "COMMENT ON") {
-			stmt = strings.ReplaceAll(stmt, "ON TABLE tickets", fmt.Sprintf("ON TABLE %s", tableName))
-			stmt = strings.ReplaceAll(stmt, "ON COLUMN tickets.", fmt.Sprintf("ON COLUMN %s.", tableName))
-		}
-
-		adaptedStatements = append(adaptedStatements, stmt)
-	}
-
-	return strings.Join(adaptedStatements, ";\n"), nil
-}
-
 // protobufToPostgreSQLRow converts a TicketData protobuf to PostgreSQL row data
-func protobufToPostgreSQLRow(ticketData *ticketpb.TicketData, tenant string, isUpdate bool) (map[string]interface{}, error) {
+func protobufToPostgreSQLRow(ticketData *ticketpb.TicketData, isUpdate bool) (map[string]interface{}, error) {
 	row := make(map[string]interface{})
 
 	// Core fields - these are managed by the application
 	row["ticket_id"] = ticketData.Id
-	row["tenant"] = tenant // Use the tenant parameter passed to the function
 
 	// Handle timestamps
 	if !isUpdate {
@@ -360,9 +262,7 @@ func postgreSQLRowToProtobuf(row map[string]interface{}) *ticketpb.TicketData {
 	if ticketID, ok := row["ticket_id"].(string); ok {
 		ticketData.Id = ticketID
 	}
-	if tenant, ok := row["tenant"].(string); ok {
-		ticketData.Tenant = tenant
-	}
+
 	if createdAt, ok := row["created_at"].(time.Time); ok {
 		ticketData.CreatedAt = createdAt.Format(time.RFC3339)
 	}
@@ -409,32 +309,21 @@ func postgreSQLRowToProtobuf(row map[string]interface{}) *ticketpb.TicketData {
 	return ticketData
 }
 
-// CreateTicket stores a new ticket in the tenant-specific PostgreSQL table
-func (p *PostgreSQLStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
+// CreateTicket stores a new ticket in the PostgreSQL table
+func (p *PostgreSQLStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Ensure tenant table exists
-	if err := p.ensureTenantTable(ctx, tenant); err != nil {
-		return fmt.Errorf("failed to ensure tenant table: %w", err), nil
-	}
 
 	// Generate ticket ID if not provided
 	if ticketData.Id == "" {
 		ticketData.Id = p.generateTicketID()
 	}
 
-	// Ensure tenant is set correctly
-	ticketData.Tenant = tenant
-
 	// Convert protobuf to PostgreSQL row (isUpdate = false for create)
-	row, err := protobufToPostgreSQLRow(ticketData, tenant, false)
+	row, err := protobufToPostgreSQLRow(ticketData, false)
 	if err != nil {
 		return fmt.Errorf("failed to convert protobuf to row: %w", err), nil
 	}
-
-	// Get tenant-specific table name
-	tableName := p.getTenantTableName(tenant)
 
 	// Build INSERT query dynamically
 	columns := make([]string, 0, len(row))
@@ -451,7 +340,7 @@ func (p *PostgreSQLStorage) CreateTicket(tenant string, ticketData *ticketpb.Tic
 
 	insertSQL := fmt.Sprintf(
 		"INSERT INTO %s (%s) VALUES (%s) RETURNING id",
-		tableName,
+		p.tableName,
 		strings.Join(columns, ", "),
 		strings.Join(placeholders, ", "),
 	)
@@ -459,10 +348,10 @@ func (p *PostgreSQLStorage) CreateTicket(tenant string, ticketData *ticketpb.Tic
 	var generatedID int64
 	err = p.db.QueryRowContext(ctx, insertSQL, values...).Scan(&generatedID)
 	if err != nil {
-		return fmt.Errorf("failed to create ticket in table %s: %w", tableName, err), nil
+		return fmt.Errorf("failed to create ticket in table %s: %w", p.tableName, err), nil
 	}
 
-	log.Printf("Created ticket %s for tenant %s in table %s with ID %d", ticketData.Id, tenant, tableName, generatedID)
+	log.Printf("Created ticket %s in table %s with ID %d", ticketData.Id, p.tableName, generatedID)
 
 	result := map[string]interface{}{
 		"id":        generatedID,
@@ -472,25 +361,17 @@ func (p *PostgreSQLStorage) CreateTicket(tenant string, ticketData *ticketpb.Tic
 	return nil, result
 }
 
-// GetTicket retrieves a ticket by tenant and ID from the tenant-specific PostgreSQL table
-func (p *PostgreSQLStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
+// GetTicket retrieves a ticket by ID from the PostgreSQL table
+func (p *PostgreSQLStorage) GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := p.ensureTenantTable(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
-		return nil, false
-	}
-
-	tableName := p.getTenantTableName(tenant)
-
 	// Query for the ticket
-	query := fmt.Sprintf("SELECT * FROM %s WHERE ticket_id = $1", tableName)
+	query := fmt.Sprintf("SELECT * FROM %s WHERE ticket_id = $1", p.tableName)
 
 	rows, err := p.db.QueryContext(ctx, query, id)
 	if err != nil {
-		log.Printf("ERROR: Failed to query ticket %s from table %s: %v", id, tableName, err)
+		log.Printf("ERROR: Failed to query ticket %s from table %s: %v", id, p.tableName, err)
 		return nil, false
 	}
 	defer rows.Close()
@@ -528,29 +409,21 @@ func (p *PostgreSQLStorage) GetTicket(tenant, id string, store jetstream.KeyValu
 	// Convert to protobuf
 	ticketData := postgreSQLRowToProtobuf(rowMap)
 
-	log.Printf("Retrieved ticket %s for tenant %s from table %s", id, tenant, tableName)
+	log.Printf("Retrieved ticket %s from table %s", id, p.tableName)
 	return ticketData, true
 }
 
-// UpdateTicket updates an existing ticket in the tenant-specific PostgreSQL table
-func (p *PostgreSQLStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
+// UpdateTicket updates an existing ticket in the PostgreSQL table
+func (p *PostgreSQLStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Ensure tenant table exists
-	if err := p.ensureTenantTable(ctx, tenant); err != nil {
-		log.Printf("ERROR: Failed to ensure tenant table for %s: %v", tenant, err)
-		return false
-	}
-
 	// Convert protobuf to PostgreSQL row (isUpdate = true for update)
-	row, err := protobufToPostgreSQLRow(ticketData, tenant, true)
+	row, err := protobufToPostgreSQLRow(ticketData, true)
 	if err != nil {
 		log.Printf("ERROR: Failed to convert protobuf to row: %v", err)
 		return false
 	}
-
-	tableName := p.getTenantTableName(tenant)
 
 	// Build UPDATE query dynamically
 	setParts := make([]string, 0, len(row))
@@ -558,7 +431,7 @@ func (p *PostgreSQLStorage) UpdateTicket(tenant string, ticketData *ticketpb.Tic
 
 	i := 1
 	for column, value := range row {
-		if column == "ticket_id" || column == "created_at" || column == "tenant" {
+		if column == "ticket_id" || column == "created_at" {
 			continue // Don't update these immutable fields
 		}
 		setParts = append(setParts, fmt.Sprintf("%s = $%d", column, i))
@@ -571,14 +444,14 @@ func (p *PostgreSQLStorage) UpdateTicket(tenant string, ticketData *ticketpb.Tic
 
 	updateSQL := fmt.Sprintf(
 		"UPDATE %s SET %s WHERE ticket_id = $%d",
-		tableName,
+		p.tableName,
 		strings.Join(setParts, ", "),
 		i,
 	)
 
 	result, err := p.db.ExecContext(ctx, updateSQL, values...)
 	if err != nil {
-		log.Printf("ERROR: Failed to update ticket in table %s: %v", tableName, err)
+		log.Printf("ERROR: Failed to update ticket in table %s: %v", p.tableName, err)
 		return false
 	}
 
@@ -589,33 +462,31 @@ func (p *PostgreSQLStorage) UpdateTicket(tenant string, ticketData *ticketpb.Tic
 	}
 
 	if rowsAffected == 0 {
-		log.Printf("No ticket found with ID %s in table %s", ticketData.Id, tableName)
+		log.Printf("No ticket found with ID %s in table %s", ticketData.Id, p.tableName)
 		return false
 	}
 
-	log.Printf("Updated ticket %s for tenant %s in table %s", ticketData.Id, tenant, tableName)
+	log.Printf("Updated ticket %s in table %s", ticketData.Id, p.tableName)
 	return true
 }
 
-// DeleteTicket removes a ticket from the tenant-specific PostgreSQL table
-func (p *PostgreSQLStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+// DeleteTicket removes a ticket from the PostgreSQL table
+func (p *PostgreSQLStorage) DeleteTicket(id string) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// First, get the ticket to return it
-	ticketData, exists := p.GetTicket(tenant, id, nil)
+	ticketData, exists := p.GetTicket(id, nil)
 	if !exists {
 		return nil, false
 	}
 
-	tableName := p.getTenantTableName(tenant)
-
 	// Delete the ticket
-	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE ticket_id = $1", tableName)
+	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE ticket_id = $1", p.tableName)
 
 	result, err := p.db.ExecContext(ctx, deleteSQL, id)
 	if err != nil {
-		log.Printf("ERROR: Failed to delete ticket %s from table %s: %v", id, tableName, err)
+		log.Printf("ERROR: Failed to delete ticket %s from table %s: %v", id, p.tableName, err)
 		return nil, false
 	}
 
@@ -629,28 +500,20 @@ func (p *PostgreSQLStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketDat
 		return nil, false
 	}
 
-	log.Printf("Deleted ticket %s for tenant %s from table %s", id, tenant, tableName)
+	log.Printf("Deleted ticket %s from table %s", id, p.tableName)
 	return ticketData, true
 }
 
-// ListTickets retrieves all tickets for a tenant from the tenant-specific PostgreSQL table
-func (p *PostgreSQLStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
+// ListTickets retrieves all tickets from the PostgreSQL table
+func (p *PostgreSQLStorage) ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// Query all tickets
+	query := fmt.Sprintf("SELECT * FROM %s ORDER BY created_at DESC", p.tableName)
 
-	// Ensure tenant table exists
-	if err := p.ensureTenantTable(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
-	}
-
-	tableName := p.getTenantTableName(tenant)
-
-	// Query all tickets for the tenant
-	query := fmt.Sprintf("SELECT * FROM %s WHERE tenant = $1 ORDER BY created_at DESC", tableName)
-
-	rows, err := p.db.QueryContext(ctx, query, tenant)
+	rows, err := p.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query tickets from table %s: %w", tableName, err)
+		return nil, fmt.Errorf("failed to query tickets from table %s: %w", p.tableName, err)
 	}
 	defer rows.Close()
 
@@ -691,23 +554,17 @@ func (p *PostgreSQLStorage) ListTickets(tenant string, store jetstream.KeyValue)
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	log.Printf("Retrieved %d tickets for tenant %s from table %s", len(tickets), tenant, tableName)
+	log.Printf("Retrieved %d tickets from table %s", len(tickets), p.tableName)
 	return tickets, nil
 }
 
 // buildWhereClause builds a WHERE clause from search conditions
-func (p *PostgreSQLStorage) buildWhereClause(conditions []SearchCondition, tenant string) (string, []interface{}, error) {
+func (p *PostgreSQLStorage) buildWhereClause(conditions []SearchCondition) (string, []interface{}, error) {
 	var whereParts []string
 	var values []interface{}
 	paramIndex := 1
-
-	// Always add tenant filter first
-	whereParts = append(whereParts, fmt.Sprintf("tenant = $%d", paramIndex))
-	values = append(values, tenant)
-	paramIndex++
-
 	if len(conditions) == 0 {
-		return strings.Join(whereParts, " AND "), values, nil
+		return "", values, nil
 	}
 
 	for _, condition := range conditions {
@@ -783,27 +640,19 @@ func (p *PostgreSQLStorage) buildOrderByClause(sortFields []SortField) string {
 }
 
 // SearchTickets searches for tickets based on conditions
-func (p *PostgreSQLStorage) SearchTickets(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
-	return p.SearchTicketsWithProjection(tenant, request)
+func (p *PostgreSQLStorage) SearchTickets(request SearchRequest) ([]*ticketpb.TicketData, error) {
+	return p.SearchTicketsWithProjection(request)
 }
 
 // SearchTicketsWithProjection searches for tickets with optional field projection
-func (p *PostgreSQLStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
+func (p *PostgreSQLStorage) SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
-	// Ensure tenant table exists
-	if err := p.ensureTenantTable(ctx, tenant); err != nil {
-		return nil, fmt.Errorf("failed to ensure tenant table: %w", err)
-	}
-
-	tableName := p.getTenantTableName(tenant)
-
 	// Build SELECT clause
 	selectClause := "*"
 	if len(request.ProjectedFields) > 0 {
 		// Always include core fields for protobuf compatibility
-		coreFields := []string{"id", "ticket_id", "tenant", "created_at", "updated_at"}
+		coreFields := []string{"id", "ticket_id", "created_at", "updated_at"}
 		allFields := append(coreFields, request.ProjectedFields...)
 
 		// Remove duplicates
@@ -820,7 +669,7 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(tenant string, request S
 	}
 
 	// Build WHERE clause
-	whereClause, values, err := p.buildWhereClause(request.Conditions, tenant)
+	whereClause, values, err := p.buildWhereClause(request.Conditions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build WHERE clause: %w", err)
 	}
@@ -829,7 +678,12 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(tenant string, request S
 	orderByClause := p.buildOrderByClause(request.SortFields)
 
 	// Build complete query
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s %s", selectClause, tableName, whereClause, orderByClause)
+	var query string
+	if whereClause != "" {
+		query = fmt.Sprintf("SELECT %s FROM %s WHERE %s %s", selectClause, p.tableName, whereClause, orderByClause)
+	} else {
+		query = fmt.Sprintf("SELECT %s FROM %s %s", selectClause, p.tableName, orderByClause)
+	}
 
 	// Execute query
 	rows, err := p.db.QueryContext(ctx, query, values...)
@@ -875,7 +729,7 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(tenant string, request S
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	log.Printf("Found %d tickets for tenant %s matching search criteria", len(tickets), tenant)
+	log.Printf("Found %d tickets matching search criteria", len(tickets))
 	return tickets, nil
 }
 

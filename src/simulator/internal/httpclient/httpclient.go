@@ -232,10 +232,7 @@ func (c *HTTPClient) doRequestWithTenant(ctx context.Context, method, url string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	// Use specific tenant ID
-	if tenantID != "" {
-		req.Header.Set("X-Tenant-ID", tenantID)
-	}
+	// No tenant ID needed anymore
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -330,11 +327,7 @@ func (c *HTTPClient) doRequest(ctx context.Context, method, url string, body io.
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	// Use random tenant ID for each request
-	tenantID := c.getRandomTenantID()
-	if tenantID != "" {
-		req.Header.Set("X-Tenant-ID", tenantID)
-	}
+	// No tenant ID needed anymore
 
 	resp, err := c.client.Do(req)
 	if err != nil {

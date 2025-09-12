@@ -8,12 +8,11 @@ option go_package = "github.com/platform/ticket-svc/pb/proto;ticketpb";
 message  TicketData {
   // Core required fields
   string id = 1;
-  string tenant = 2;
-  string created_at = 3;
-  string updated_at = 4;
-  
+  string created_at = 2;
+  string updated_at = 3;
+
   // Dynamic fields stored as key-value pairs
-  map<string, FieldValue> fields = 5;
+  map<string, FieldValue> fields = 4;
 }
 
 // FieldValue represents a dynamic field value with type information

@@ -125,9 +125,6 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 				"id": map[string]interface{}{
 					"type": "keyword",
 				},
-				"tenant": map[string]interface{}{
-					"type": "keyword",
-				},
 				"created_at": map[string]interface{}{
 					"type": "date",
 				},
@@ -327,7 +324,7 @@ func (storage *OpenSearchStorage) createIndexIfNotExists(ctx context.Context) er
 	return nil
 }
 
-func (storage *OpenSearchStorage) CreateTicket(tenant string, ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
+func (storage *OpenSearchStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	doc, kvDocs := storage.ticketToDocument(ticketData)
 
 	body, err := json.Marshal(doc)
@@ -356,7 +353,7 @@ func (storage *OpenSearchStorage) CreateTicket(tenant string, ticketData *ticket
 	return nil, kvDocs
 }
 
-func (storage *OpenSearchStorage) GetTicket(tenant, id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
+func (storage *OpenSearchStorage) GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	url := fmt.Sprintf("%s/%s/_doc/%s", storage.endpoint, storage.indexName, id)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -392,19 +389,13 @@ func (storage *OpenSearchStorage) GetTicket(tenant, id string, store jetstream.K
 		return nil, false
 	}
 
-	// Check tenant
-	docTenant, _ := source["tenant"].(string)
-	if docTenant != tenant {
-		return nil, false
-	}
-
 	var entries jetstream.KeyValueEntry
 
 	err = nil
 
 	if store != nil {
 
-		entries, err = store.Get(context.Background(), fmt.Sprintf("%s-%s", docTenant, id))
+		entries, err = store.Get(context.Background(), id)
 	}
 
 	if err == nil && entries != nil {
@@ -422,10 +413,10 @@ func (storage *OpenSearchStorage) GetTicket(tenant, id string, store jetstream.K
 	return storage.documentToTicket(source), true
 }
 
-func (storage *OpenSearchStorage) UpdateTicket(tenant string, ticketData *ticketpb.TicketData) bool {
-	// Verify ticket exists and belongs to tenant
-	existing, found := storage.GetTicket(tenant, ticketData.Id, nil)
-	if !found || existing.Tenant != tenant {
+func (storage *OpenSearchStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
+	// Verify ticket exists
+	_, found := storage.GetTicket(ticketData.Id, nil)
+	if !found {
 		return false
 	}
 
@@ -455,9 +446,9 @@ func (storage *OpenSearchStorage) UpdateTicket(tenant string, ticketData *ticket
 	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated
 }
 
-func (storage *OpenSearchStorage) DeleteTicket(tenant, id string) (*ticketpb.TicketData, bool) {
+func (storage *OpenSearchStorage) DeleteTicket(id string) (*ticketpb.TicketData, bool) {
 	// Get ticket first to return it
-	ticket, found := storage.GetTicket(tenant, id, nil)
+	ticket, found := storage.GetTicket(id, nil)
 	if !found {
 		return nil, false
 	}
@@ -483,12 +474,10 @@ func (storage *OpenSearchStorage) DeleteTicket(tenant, id string) (*ticketpb.Tic
 	return ticket, true
 }
 
-func (storage *OpenSearchStorage) ListTickets(tenant string, store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
+func (storage *OpenSearchStorage) ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	query := map[string]interface{}{
 		"query": map[string]interface{}{
-			"term": map[string]interface{}{
-				"tenant": tenant,
-			},
+			"match_all": map[string]interface{}{},
 		},
 		"size": 10000, // Max results
 	}
@@ -548,7 +537,7 @@ func (storage *OpenSearchStorage) ListTickets(tenant string, store jetstream.Key
 
 		if store != nil {
 
-			entries, err = store.Get(context.Background(), fmt.Sprintf("%s-%s", source["tenant"], source["id"]))
+			entries, err = store.Get(context.Background(), source["id"].(string))
 		}
 
 		if err == nil && entries != nil {
@@ -561,11 +550,11 @@ func (storage *OpenSearchStorage) ListTickets(tenant string, store jetstream.Key
 	return tickets, nil
 }
 
-func (storage *OpenSearchStorage) SearchTickets(tenant string, searchRequest SearchRequest) ([]*ticketpb.TicketData, error) {
+func (storage *OpenSearchStorage) SearchTickets(searchRequest SearchRequest) ([]*ticketpb.TicketData, error) {
 
 	conditions := searchRequest.Conditions
 
-	query := storage.buildSearchQuery(tenant, conditions)
+	query := storage.buildSearchQuery(conditions)
 
 	// Add sorting if specified
 	if len(searchRequest.SortFields) > 0 {
@@ -636,17 +625,17 @@ func (storage *OpenSearchStorage) SearchTickets(tenant string, searchRequest Sea
 	return tickets, nil
 }
 
-func (storage *OpenSearchStorage) SearchTicketsWithProjection(tenant string, request SearchRequest) ([]*ticketpb.TicketData, error) {
-	query := storage.buildSearchQuery(tenant, request.Conditions)
+func (storage *OpenSearchStorage) SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error) {
+	query := storage.buildSearchQuery(request.Conditions)
 
 	// Add field projection if specified
 	if len(request.ProjectedFields) > 0 {
 		// Start with system fields
-		projectedFields := []string{"id", "tenant", "created_at", "updated_at"}
+		projectedFields := []string{"id", "created_at", "updated_at"}
 
 		// Add custom fields with proper prefixing
 		for _, field := range request.ProjectedFields {
-			if field == "id" || field == "tenant" || field == "created_at" || field == "updated_at" {
+			if field == "id" || field == "created_at" || field == "updated_at" {
 				// System field, already included
 				continue
 			} else {
@@ -727,19 +716,13 @@ func (storage *OpenSearchStorage) SearchTicketsWithProjection(tenant string, req
 	return tickets, nil
 }
 
-func (storage *OpenSearchStorage) buildSearchQuery(tenant string, conditions []SearchCondition) map[string]interface{} {
-	must := []map[string]interface{}{
-		{
-			"term": map[string]interface{}{
-				"tenant": tenant,
-			},
-		},
-	}
+func (storage *OpenSearchStorage) buildSearchQuery(conditions []SearchCondition) map[string]interface{} {
+	must := []map[string]interface{}{}
 
 	for _, cond := range conditions {
 		fieldPath := cond.Operand
 		// Handle nested fields
-		if !strings.HasPrefix(fieldPath, "fields.") && fieldPath != "id" && fieldPath != "tenant" &&
+		if !strings.HasPrefix(fieldPath, "fields.") && fieldPath != "id" &&
 			fieldPath != "created_at" && fieldPath != "updated_at" {
 			fieldPath = "fields." + fieldPath
 		}
@@ -826,7 +809,7 @@ func (storage *OpenSearchStorage) buildSortQuery(sortFields []SortField) []map[s
 	for _, sortField := range sortFields {
 		fieldPath := sortField.Field
 		// Handle nested fields
-		if !strings.HasPrefix(fieldPath, "fields.") && fieldPath != "id" && fieldPath != "tenant" &&
+		if !strings.HasPrefix(fieldPath, "fields.") && fieldPath != "id" &&
 			fieldPath != "created_at" && fieldPath != "updated_at" {
 			fieldPath = "fields." + fieldPath
 		}
@@ -849,7 +832,6 @@ func (storage *OpenSearchStorage) buildSortQuery(sortFields []SortField) []map[s
 func (storage *OpenSearchStorage) ticketToDocument(ticket *ticketpb.TicketData) (map[string]interface{}, map[string]interface{}) {
 	result := map[string]interface{}{
 		"id":         ticket.Id,
-		"tenant":     ticket.Tenant,
 		"created_at": ticket.CreatedAt,
 		"updated_at": ticket.UpdatedAt,
 	}
@@ -881,9 +863,7 @@ func (storage *OpenSearchStorage) documentToTicket(doc map[string]interface{}) *
 	if id, ok := doc["id"].(string); ok {
 		ticket.Id = id
 	}
-	if tenant, ok := doc["tenant"].(string); ok {
-		ticket.Tenant = tenant
-	}
+
 	if createdAt, ok := doc["created_at"].(string); ok {
 		ticket.CreatedAt = createdAt
 	}

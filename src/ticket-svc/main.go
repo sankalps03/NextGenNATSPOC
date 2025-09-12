@@ -22,7 +22,6 @@ import (
 
 type Meta struct {
 	EventId    string `json:"event_id"`
-	Tenant     string `json:"tenant"`
 	OccurredAt string `json:"occurred_at"`
 	Schema     string `json:"schema"`
 }
@@ -73,7 +72,6 @@ type TicketService struct {
 
 type ServiceRequest struct {
 	Action   string      `json:"action"`
-	Tenant   string      `json:"tenant"`
 	TicketID string      `json:"ticket_id,omitempty"`
 	Data     interface{} `json:"data,omitempty"`
 }
@@ -184,7 +182,6 @@ func convertFieldValueToInterface(fieldValue *ticketpb.FieldValue) interface{} {
 func ticketToJSON(ticket *ticketpb.TicketData) map[string]interface{} {
 	result := map[string]interface{}{
 		"id":         ticket.Id,
-		"tenant":     ticket.Tenant,
 		"created_at": ticket.CreatedAt,
 		"updated_at": ticket.UpdatedAt,
 	}
@@ -340,7 +337,6 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 	// Create protobuf TicketData with dynamic fields
 	ticketData := &ticketpb.TicketData{
 		Id:        uuid.New().String(),
-		Tenant:    req.Tenant,
 		CreatedAt: now,
 		UpdatedAt: now,
 		Fields:    fields,
@@ -351,14 +347,14 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 
 	var kvDocs map[string]interface{}
 
-	if err, kvDocs = ts.storage.CreateTicket(req.Tenant, ticketData); err != nil {
+	if err, kvDocs = ts.storage.CreateTicket(ticketData); err != nil {
 		return nil, fmt.Errorf("failed to create ticket: %w", err)
 	}
 	dbLatency := time.Since(dbStart)
 
 	// Store ticket document in KV store if using OpenSearch storage
 	if ts.kvStore != nil {
-		kvKey := fmt.Sprintf("%s-%s", req.Tenant, ticketData.Id)
+		kvKey := ticketData.Id
 
 		// Serialize the entire ticket document as JSON
 		ticketDoc, err := json.Marshal(kvDocs)
@@ -382,7 +378,7 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, error) {
 	// Measure database latency
 	dbStart := time.Now()
-	tickets, err := ts.storage.ListTickets(req.Tenant, ts.kvStore)
+	tickets, err := ts.storage.ListTickets(ts.kvStore)
 	dbLatency := time.Since(dbStart)
 
 	if err != nil {
@@ -398,13 +394,12 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 	// Prepare response data
 	responseData := map[string]interface{}{
 		"result":      jsonTickets,
-		"tenant":      req.Tenant,
 		"total_count": len(tickets),
 	}
 
 	// Store in object store if available
 	if ts.objStore != nil {
-		objectID, size, err := ts.storeInObjectStore(responseData, fmt.Sprintf("list-%s", req.Tenant))
+		objectID, size, err := ts.storeInObjectStore(responseData, "list-tickets")
 		if err != nil {
 			log.Printf("Failed to store in object store: %v", err)
 			// Fallback to direct response if object store fails
@@ -437,7 +432,7 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error) {
 	// Measure database latency
 	dbStart := time.Now()
-	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID, ts.kvStore)
+	ticketData, found := ts.storage.GetTicket(req.TicketID, ts.kvStore)
 	dbLatency := time.Since(dbStart)
 
 	if !found {
@@ -449,7 +444,6 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 
 	responseData := map[string]interface{}{
 		"result":      jsonTicket,
-		"tenant":      req.Tenant,
 		"total_count": 1,
 	}
 
@@ -487,7 +481,7 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, error) {
 	// Measure database latency for get operation
 	dbStart := time.Now()
-	ticketData, found := ts.storage.GetTicket(req.Tenant, req.TicketID, ts.kvStore)
+	ticketData, found := ts.storage.GetTicket(req.TicketID, ts.kvStore)
 	getLatency := time.Since(dbStart)
 
 	if !found {
@@ -530,7 +524,7 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 
 		// Measure database latency for update operation
 		updateStart := time.Now()
-		ts.storage.UpdateTicket(req.Tenant, ticketData)
+		ts.storage.UpdateTicket(ticketData)
 		updateLatency = time.Since(updateStart)
 	}
 
@@ -546,7 +540,7 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, error) {
 	// Measure database latency
 	dbStart := time.Now()
-	_, found := ts.storage.DeleteTicket(req.Tenant, req.TicketID)
+	_, found := ts.storage.DeleteTicket(req.TicketID)
 	dbLatency := time.Since(dbStart)
 
 	if !found {
@@ -579,11 +573,11 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 
 	// Use projection-aware search if projected fields are specified
 	if len(searchRequest.ProjectedFields) > 0 {
-		tickets, err = ts.storage.SearchTicketsWithProjection(req.Tenant, searchRequest)
+		tickets, err = ts.storage.SearchTicketsWithProjection(searchRequest)
 		log.Printf("Using projection-aware search with %d projected fields", len(searchRequest.ProjectedFields))
 	} else {
 		// Fallback to original search for backward compatibility
-		tickets, err = ts.storage.SearchTickets(req.Tenant, searchRequest)
+		tickets, err = ts.storage.SearchTickets(searchRequest)
 		log.Printf("Using standard search (no projection)")
 	}
 	dbLatency := time.Since(dbStart)
@@ -597,7 +591,6 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	for _, ticket := range tickets {
 		ticketMap := make(map[string]interface{})
 		ticketMap["id"] = ticket.Id
-		ticketMap["tenant"] = ticket.Tenant
 		ticketMap["created_at"] = ticket.CreatedAt
 		ticketMap["updated_at"] = ticket.UpdatedAt
 
@@ -608,7 +601,7 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 
 		if ts.kvStore != nil {
 
-			entries, err := ts.kvStore.Get(context.Background(), fmt.Sprintf("%s-%s", ticket.Tenant, ticket.Id))
+			entries, err := ts.kvStore.Get(context.Background(), ticket.Id)
 
 			if err == nil && entries != nil {
 
@@ -649,13 +642,12 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	// Prepare response data
 	responseData := map[string]interface{}{
 		"result":      responseTickets,
-		"tenant":      req.Tenant,
 		"total_count": len(tickets),
 	}
 
 	// Store in object store if available
 	if ts.objStore != nil {
-		objectID, size, err := ts.storeInObjectStore(responseData, fmt.Sprintf("search-%s", req.Tenant))
+		objectID, size, err := ts.storeInObjectStore(responseData, "search-tickets")
 		if err != nil {
 			log.Printf("Failed to store in object store: %v", err)
 			// Fallback to direct response if object store fails
@@ -735,11 +727,10 @@ func (nm *NATSManager) PublishEvent(ctx context.Context, subject string, payload
 	return err
 }
 
-func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketCreated(ctx context.Context, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
-			Tenant:     tenant,
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.create@v1",
 		},
@@ -753,7 +744,6 @@ func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string
 
 	subject := "ticket.create"
 	headers := map[string]string{
-		"tenant":       tenant,
 		"schema":       "ticket.create@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
@@ -762,11 +752,10 @@ func (ts *TicketService) publishTicketCreated(ctx context.Context, tenant string
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketUpdated(ctx context.Context, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
-			Tenant:     tenant,
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.update@v1",
 		},
@@ -780,7 +769,6 @@ func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string
 
 	subject := "ticket.update"
 	headers := map[string]string{
-		"tenant":       tenant,
 		"schema":       "ticket.update@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
@@ -789,11 +777,10 @@ func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenant string
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketDeleted(ctx context.Context, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
-			Tenant:     tenant,
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.delete@v1",
 		},
@@ -807,7 +794,6 @@ func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string
 
 	subject := "ticket.delete"
 	headers := map[string]string{
-		"tenant":       tenant,
 		"schema":       "ticket.delete@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
@@ -816,11 +802,10 @@ func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenant string
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketRead(ctx context.Context, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
-			Tenant:     tenant,
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.read@v1",
 		},
@@ -834,7 +819,6 @@ func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, t
 
 	subject := "ticket.read"
 	headers := map[string]string{
-		"tenant":       tenant,
 		"schema":       "ticket.read@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
@@ -843,11 +827,10 @@ func (ts *TicketService) publishTicketRead(ctx context.Context, tenant string, t
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenant string, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishNotificationRequested(ctx context.Context, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
-			Tenant:     tenant,
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "notification.event@v1",
 		},
@@ -861,7 +844,6 @@ func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenan
 
 	subject := "notification.event"
 	headers := map[string]string{
-		"tenant":       tenant,
 		"schema":       "notification.event@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
@@ -870,18 +852,16 @@ func (ts *TicketService) publishNotificationRequested(ctx context.Context, tenan
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketSearched(ctx context.Context, tenant string, resultCount int, conditions []storage2.SearchCondition) error {
+func (ts *TicketService) publishTicketSearched(ctx context.Context, resultCount int, conditions []storage2.SearchCondition) error {
 
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
-			Tenant:     tenant,
 			OccurredAt: time.Now().Format(time.RFC3339),
 			Schema:     "ticket.event.searched@v1",
 		},
 		Data: &ticketpb.TicketData{
 			Id:        "search-" + uuid.New().String(),
-			Tenant:    tenant,
 			CreatedAt: time.Now().Format(time.RFC3339),
 			UpdatedAt: time.Now().Format(time.RFC3339),
 			Fields: map[string]*ticketpb.FieldValue{
@@ -900,9 +880,8 @@ func (ts *TicketService) publishTicketSearched(ctx context.Context, tenant strin
 		return fmt.Errorf("failed to marshal ticket searched event: %w", err)
 	}
 
-	subject := fmt.Sprintf("%s.ticket.ticket.event.searched", tenant)
+	subject := "ticket.event.searched"
 	headers := map[string]string{
-		"tenant":       tenant,
 		"schema":       "ticket.event.searched@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
