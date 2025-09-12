@@ -53,7 +53,7 @@ services:
       -js
       -sd /data
     volumes:
-      - "./nats-data-1:/data"
+      - nats-data-1:/data
 
   nats-server-2:
     image: nats:2.9-alpine
@@ -71,7 +71,7 @@ services:
       -js
       -sd /data
     volumes:
-      - "./nats-data-2:/data"
+      - nats-data-2:/data
 
   nats-server-3:
     image: nats:2.9-alpine
@@ -89,7 +89,7 @@ services:
       -js
       -sd /data
     volumes:
-      - "./nats-data-3:/data"
+      - nats-data-3:/data
 
 #  opensearch:
 #    image: opensearchproject/opensearch:2.11.0
@@ -128,4 +128,7 @@ volumes:
   mongo-data:
   scylla-data:
   postgres-data:
+  nats-data-1:
+  nats-data-2:
+  nats-data-3:
   #opensearch-data1:
