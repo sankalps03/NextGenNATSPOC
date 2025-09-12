@@ -418,13 +418,6 @@ func (p *PostgreSQLEAVStorage) CreateTicket(ticketData *ticketpb.TicketData) (er
 		return fmt.Errorf("failed to convert ticket to EAV rows: %w", err), nil
 	}
 
-	// Begin transaction
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err), nil
-	}
-	defer tx.Rollback()
-
 	var firstInsertedID int64
 
 	// Insert each EAV row
@@ -449,7 +442,7 @@ func (p *PostgreSQLEAVStorage) CreateTicket(ticketData *ticketpb.TicketData) (er
 		)
 
 		var insertedID int64
-		err = tx.QueryRowContext(ctx, insertSQL, values...).Scan(&insertedID)
+		err = p.db.QueryRowContext(ctx, insertSQL, values...).Scan(&insertedID)
 		if err != nil {
 			return fmt.Errorf("failed to insert EAV row %d: %w", i, err), nil
 		}
@@ -457,11 +450,6 @@ func (p *PostgreSQLEAVStorage) CreateTicket(ticketData *ticketpb.TicketData) (er
 		if i == 0 {
 			firstInsertedID = insertedID
 		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err), nil
 	}
 
 	log.Printf("Created ticket %s in EAV table %s with %d rows", ticketData.Id, p.tableName, len(eavRows))
@@ -556,17 +544,9 @@ func (p *PostgreSQLEAVStorage) UpdateTicket(ticketData *ticketpb.TicketData) boo
 		return false
 	}
 
-	// Begin transaction
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("ERROR: Failed to begin transaction: %v", err)
-		return false
-	}
-	defer tx.Rollback()
-
 	// Delete existing EAV rows for this ticket
 	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE entity_id = $1", p.tableName)
-	_, err = tx.ExecContext(ctx, deleteSQL, ticketData.Id)
+	_, err = p.db.ExecContext(ctx, deleteSQL, ticketData.Id)
 	if err != nil {
 		log.Printf("ERROR: Failed to delete existing EAV rows: %v", err)
 		return false
@@ -593,17 +573,11 @@ func (p *PostgreSQLEAVStorage) UpdateTicket(ticketData *ticketpb.TicketData) boo
 			strings.Join(placeholders, ", "),
 		)
 
-		_, err = tx.ExecContext(ctx, insertSQL, values...)
+		_, err = p.db.ExecContext(ctx, insertSQL, values...)
 		if err != nil {
 			log.Printf("ERROR: Failed to insert updated EAV row %d: %v", i, err)
 			return false
 		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("ERROR: Failed to commit update transaction: %v", err)
-		return false
 	}
 
 	log.Printf("Updated ticket %s in EAV table %s with %d rows", ticketData.Id, p.tableName, len(eavRows))
