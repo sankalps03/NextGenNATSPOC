@@ -40,7 +40,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "scylladb", or "mongodb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -1041,9 +1041,10 @@ func promptForStorageType() string {
 		fmt.Println("1. DynamoDB")
 		fmt.Println("2. OpenSearch")
 		fmt.Println("3. PostgreSQL")
-		fmt.Println("4. ScyllaDB")
-		fmt.Println("5. MongoDB")
-		fmt.Print("Enter your choice (1, 2, 3, 4, or 5): ")
+		fmt.Println("4. PostgreSQL EAV")
+		fmt.Println("5. ScyllaDB")
+		fmt.Println("6. MongoDB")
+		fmt.Print("Enter your choice (1, 2, 3, 4, 5, or 6): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1063,13 +1064,16 @@ func promptForStorageType() string {
 			fmt.Println("Selected: PostgreSQL")
 			return "postgresql"
 		case "4":
+			fmt.Println("Selected: PostgreSQL EAV")
+			return "postgresql-eav"
+		case "5":
 			fmt.Println("Selected: ScyllaDB")
 			return "scylladb"
-		case "5":
+		case "6":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, or 5.")
+			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, or 6.")
 		}
 	}
 }
@@ -1140,6 +1144,16 @@ func main() {
 		}
 		storage = postgresStorage
 		log.Printf("Using PostgreSQL storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+	case "postgresql-eav":
+		postgresEAVStorage, err := storage2.NewPostgreSQLEAVStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL EAV storage: %v", err)
+
+			return
+		}
+		storage = postgresEAVStorage
+		log.Printf("Using PostgreSQL EAV storage with connection: %s and base table: %s",
 			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
 	case "scylladb":
 		// Parse hosts from comma-separated string
