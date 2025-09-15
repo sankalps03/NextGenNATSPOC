@@ -563,20 +563,8 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 		return nil, fmt.Errorf("failed to marshal request data: %w", err)
 	}
 
-	// Debug: Log the raw request data
-	log.Printf("DEBUG: Raw request data: %s", string(dataBytes))
-
 	if err := json.Unmarshal(dataBytes, &searchRequest); err != nil {
 		return nil, fmt.Errorf("failed to parse search request: %w", err)
-	}
-
-	// Debug: Log the parsed search request
-	log.Printf("DEBUG: Parsed SearchRequest - CategoryFilter: %v, Conditions: %d",
-		searchRequest.CategoryFilter, len(searchRequest.Conditions))
-	if searchRequest.CategoryFilter != nil {
-		log.Printf("DEBUG: CategoryFilter value: %d", *searchRequest.CategoryFilter)
-	} else {
-		log.Printf("DEBUG: CategoryFilter is nil")
 	}
 
 	// Measure database latency

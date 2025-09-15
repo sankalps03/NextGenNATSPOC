@@ -511,13 +511,8 @@ func (g *Generator) generateSearchRequest() (httpclient.SearchRequest, string) {
 		if g.rand.Float32() < 0.9 {
 			selectedCategory := g.selectRandomCategory()
 			categoryFilter = &selectedCategory
-			g.logger.Debug(fmt.Sprintf("Generated CategoryFilter: %d", selectedCategory))
-		} else {
-			g.logger.Debug("Generated cross-category search (no CategoryFilter)")
 		}
 		// 30% chance for cross-category search (no filter)
-	} else {
-		g.logger.Debug("CategoryFilter disabled in config")
 	}
 
 	return httpclient.SearchRequest{

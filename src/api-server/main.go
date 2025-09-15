@@ -334,9 +334,6 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	// Add CategoryFilter if provided
 	if searchRequest.CategoryFilter != nil {
 		data["category_filter"] = *searchRequest.CategoryFilter
-		log.Printf("DEBUG: API forwarding CategoryFilter: %d", *searchRequest.CategoryFilter)
-	} else {
-		log.Printf("DEBUG: API forwarding search without CategoryFilter")
 	}
 
 	requestData := map[string]interface{}{
