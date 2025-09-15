@@ -293,11 +293,12 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	// Parse search request from request body (supports field projection)
+	// Parse search request from request body (supports field projection and CategoryFilter)
 	var searchRequest struct {
 		Conditions      []map[string]interface{} `json:"conditions"`
 		ProjectedFields []string                 `json:"projected_fields,omitempty"`
-		SortFields      []map[string]interface{} `json:"sort_fields,omitempty"` // fields to sort by
+		SortFields      []map[string]interface{} `json:"sort_fields,omitempty"`     // fields to sort by
+		CategoryFilter  *int64                   `json:"category_filter,omitempty"` // category filter for dynamic column mapping
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&searchRequest); err != nil {
@@ -323,13 +324,24 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Search request with %d projected fields: %v (core fields id, created_at, updated_at will be included automatically)", len(searchRequest.ProjectedFields), searchRequest.ProjectedFields)
 	}
 
+	// Build request data with CategoryFilter support
+	data := map[string]interface{}{
+		"conditions":       searchRequest.Conditions,
+		"projected_fields": searchRequest.ProjectedFields,
+		"sort_fields":      searchRequest.SortFields,
+	}
+
+	// Add CategoryFilter if provided
+	if searchRequest.CategoryFilter != nil {
+		data["category_filter"] = *searchRequest.CategoryFilter
+		log.Printf("DEBUG: API forwarding CategoryFilter: %d", *searchRequest.CategoryFilter)
+	} else {
+		log.Printf("DEBUG: API forwarding search without CategoryFilter")
+	}
+
 	requestData := map[string]interface{}{
 		"action": "search",
-		"data": map[string]interface{}{
-			"conditions":       searchRequest.Conditions,
-			"projected_fields": searchRequest.ProjectedFields,
-			"sort_fields":      searchRequest.SortFields,
-		},
+		"data":   data,
 	}
 
 	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)

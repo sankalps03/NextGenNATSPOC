@@ -69,21 +69,23 @@ type OperationsConfig struct {
 
 // CreateConfig defines ticket creation settings
 type CreateConfig struct {
-	Enabled           bool     `json:"enabled"`
-	ExcludeFields     []string `json:"exclude_fields"`
-	RequiredFields    []string `json:"required_fields"`
-	RandomizeFields   []string `json:"randomize_fields"`
-	DefaultFieldValue string   `json:"default_field_value"`
+	Enabled                  bool     `json:"enabled"`
+	ExcludeFields            []string `json:"exclude_fields"`
+	RequiredFields           []string `json:"required_fields"`
+	RandomizeFields          []string `json:"randomize_fields"`
+	DefaultFieldValue        string   `json:"default_field_value"`
+	UseCategorizedGeneration bool     `json:"use_categorized_generation"`
 }
 
 // SearchConfig defines search operation settings
 type SearchConfig struct {
-	Enabled          bool               `json:"enabled"`
-	SearchConditions []SearchCondition  `json:"search_conditions"`
-	ProjectedFields  []string           `json:"projected_fields"`
-	RandomizeFields  bool               `json:"randomize_fields"`
-	MaxResults       int                `json:"max_results"`
-	ConditionWeights map[string]float64 `json:"condition_weights"`
+	Enabled           bool               `json:"enabled"`
+	SearchConditions  []SearchCondition  `json:"search_conditions"`
+	ProjectedFields   []string           `json:"projected_fields"`
+	RandomizeFields   bool               `json:"randomize_fields"`
+	MaxResults        int                `json:"max_results"`
+	ConditionWeights  map[string]float64 `json:"condition_weights"`
+	UseCategoryFilter bool               `json:"use_category_filter"` // Use CategoryFilter for category-aware searches
 }
 
 // SearchCondition defines a search condition template
@@ -146,19 +148,21 @@ func Load() (*Config, error) {
 
 		Operations: OperationsConfig{
 			Create: CreateConfig{
-				Enabled:           getEnvBool("CREATE_ENABLED", true),
-				ExcludeFields:     getEnvStringSlice("CREATE_EXCLUDE_FIELDS", []string{"id"}),
-				RequiredFields:    getEnvStringSlice("CREATE_REQUIRED_FIELDS", []string{"subject", "description"}),
-				RandomizeFields:   getEnvStringSlice("CREATE_RANDOMIZE_FIELDS", []string{}),
-				DefaultFieldValue: getEnvOrDefault("CREATE_DEFAULT_FIELD_VALUE", ""),
+				Enabled:                  getEnvBool("CREATE_ENABLED", true),
+				ExcludeFields:            getEnvStringSlice("CREATE_EXCLUDE_FIELDS", []string{"id"}),
+				RequiredFields:           getEnvStringSlice("CREATE_REQUIRED_FIELDS", []string{"subject", "description"}),
+				RandomizeFields:          getEnvStringSlice("CREATE_RANDOMIZE_FIELDS", []string{}),
+				DefaultFieldValue:        getEnvOrDefault("CREATE_DEFAULT_FIELD_VALUE", ""),
+				UseCategorizedGeneration: getEnvBool("CREATE_USE_CATEGORIZED_GENERATION", true),
 			},
 			Search: SearchConfig{
-				Enabled:          getEnvBool("SEARCH_ENABLED", true),
-				ProjectedFields:  getEnvStringSlice("SEARCH_PROJECTED_FIELDS", []string{}),
-				RandomizeFields:  getEnvBool("SEARCH_RANDOMIZE_FIELDS", true),
-				MaxResults:       getEnvInt("SEARCH_MAX_RESULTS", 100),
-				SearchConditions: getDefaultSearchConditions(),
-				ConditionWeights: getDefaultConditionWeights(),
+				Enabled:           getEnvBool("SEARCH_ENABLED", true),
+				ProjectedFields:   getEnvStringSlice("SEARCH_PROJECTED_FIELDS", []string{}),
+				RandomizeFields:   getEnvBool("SEARCH_RANDOMIZE_FIELDS", true),
+				MaxResults:        getEnvInt("SEARCH_MAX_RESULTS", 100),
+				SearchConditions:  getDefaultSearchConditions(),
+				ConditionWeights:  getDefaultConditionWeights(),
+				UseCategoryFilter: getEnvBool("SEARCH_USE_CATEGORY_FILTER", true), // Enable CategoryFilter
 			},
 			Get: GetConfig{
 				Enabled:         getEnvBool("GET_ENABLED", true),

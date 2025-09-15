@@ -37,6 +37,7 @@ type APIResponse struct {
 type SearchRequest struct {
 	Conditions      []SearchCondition `json:"conditions"`
 	ProjectedFields []string          `json:"projected_fields,omitempty"`
+	CategoryFilter  *int64            `json:"category_filter,omitempty"` // Optional category filter for dynamic column mapping
 }
 
 // SearchCondition represents a search condition

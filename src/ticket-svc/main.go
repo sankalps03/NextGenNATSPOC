@@ -39,7 +39,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-jsonb", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-jsonb", "postgresql-dynamic", "scylladb", or "mongodb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -563,8 +563,20 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 		return nil, fmt.Errorf("failed to marshal request data: %w", err)
 	}
 
+	// Debug: Log the raw request data
+	log.Printf("DEBUG: Raw request data: %s", string(dataBytes))
+
 	if err := json.Unmarshal(dataBytes, &searchRequest); err != nil {
 		return nil, fmt.Errorf("failed to parse search request: %w", err)
+	}
+
+	// Debug: Log the parsed search request
+	log.Printf("DEBUG: Parsed SearchRequest - CategoryFilter: %v, Conditions: %d",
+		searchRequest.CategoryFilter, len(searchRequest.Conditions))
+	if searchRequest.CategoryFilter != nil {
+		log.Printf("DEBUG: CategoryFilter value: %d", *searchRequest.CategoryFilter)
+	} else {
+		log.Printf("DEBUG: CategoryFilter is nil")
 	}
 
 	// Measure database latency
@@ -1038,9 +1050,11 @@ func promptForStorageType() string {
 		fmt.Println("3. PostgreSQL")
 		fmt.Println("4. PostgreSQL EAV")
 		fmt.Println("5. PostgreSQL Hstore")
-		fmt.Println("6. ScyllaDB")
-		fmt.Println("7. MongoDB")
-		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6 or 7): ")
+		fmt.Println("6. PostgreSQL JSONB")
+		fmt.Println("7. PostgreSQL Dynamic Columns")
+		fmt.Println("8. ScyllaDB")
+		fmt.Println("9. MongoDB")
+		fmt.Print("Enter your choice (1-9): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1066,13 +1080,19 @@ func promptForStorageType() string {
 			fmt.Println("Selected: PostgreSQL Hstore")
 			return "postgresql-hstore"
 		case "6":
+			fmt.Println("Selected: PostgreSQL JSONB")
+			return "postgresql-jsonb"
+		case "7":
+			fmt.Println("Selected: PostgreSQL Dynamic Columns")
+			return "postgresql-dynamic"
+		case "8":
 			fmt.Println("Selected: ScyllaDB")
 			return "scylladb"
-		case "7":
+		case "9":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, 6, 7, or 8.")
+			fmt.Println("Invalid choice. Please enter 1-9.")
 		}
 	}
 }
@@ -1161,6 +1181,27 @@ func main() {
 		storage = postgresHstoreStorage
 		log.Printf("Using PostgreSQL Hstore storage with connection: %s and base table: %s",
 			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+	case "postgresql-jsonb":
+		postgresJSONBStorage, err := storage2.NewPostgreSQLJSONBStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL JSONB storage: %v", err)
+
+			return
+		}
+		storage = postgresJSONBStorage
+		log.Printf("Using PostgreSQL JSONB storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+	case "postgresql-dynamic":
+		postgresDynamicStorage, err := storage2.NewPostgreSQLDynamicStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL Dynamic Columns storage: %v", err)
+
+			return
+		}
+		storage = postgresDynamicStorage
+		log.Printf("Using PostgreSQL Dynamic Columns storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+		log.Printf("Field mappings loaded into memory for high-performance operations")
 	case "scylladb":
 		// Parse hosts from comma-separated string
 		hosts := strings.Split(config.ScyllaDBHosts, ",")
