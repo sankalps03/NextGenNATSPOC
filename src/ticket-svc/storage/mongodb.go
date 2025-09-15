@@ -512,45 +512,6 @@ func mongoDBDocumentToProtobuf(doc bson.M) *ticketpb.TicketData {
 	return ticketData
 }
 
-// interfaceToFieldValue converts a Go interface{} to a protobuf FieldValue
-func interfaceToFieldValue(value interface{}) *ticketpb.FieldValue {
-	if value == nil {
-		return nil
-	}
-
-	switch v := value.(type) {
-	case string:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_StringValue{StringValue: v}}
-	case int:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)}}
-	case int32:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)}}
-	case int64:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_IntValue{IntValue: v}}
-	case float32:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: float64(v)}}
-	case float64:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: v}}
-	case bool:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_BoolValue{BoolValue: v}}
-	case []byte:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_BytesValue{BytesValue: v}}
-	case []string:
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_StringArray{StringArray: &ticketpb.StringArray{Values: v}}}
-	case primitive.A: // MongoDB array
-		var stringArray []string
-		for _, item := range v {
-			if str, ok := item.(string); ok {
-				stringArray = append(stringArray, str)
-			}
-		}
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_StringArray{StringArray: &ticketpb.StringArray{Values: stringArray}}}
-	default:
-		// Try to convert to string as fallback
-		return &ticketpb.FieldValue{Value: &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)}}
-	}
-}
-
 // CreateTicket stores a new ticket in the MongoDB collection
 func (m *MongoDBStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

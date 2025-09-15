@@ -39,7 +39,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-jsonb", "scylladb", or "mongodb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -1013,6 +1013,22 @@ func createKVBucket(natsManager *NATSManager, bucketName string) (jetstream.KeyV
 	return kv, nil
 }
 
+func createObjectStore(natsManager *NATSManager, storeName string) (jetstream.ObjectStore, error) {
+	objStore, err := natsManager.js.CreateObjectStore(context.Background(), jetstream.ObjectStoreConfig{
+		Bucket: storeName,
+	})
+	if err != nil {
+		// If object store already exists, try to get it
+		objStore, err = natsManager.js.ObjectStore(context.Background(), storeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create or get object store '%s': %w", storeName, err)
+		}
+	}
+
+	log.Printf("NATS Object Store '%s' ready", storeName)
+	return objStore, nil
+}
+
 func promptForStorageType() string {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -1021,9 +1037,10 @@ func promptForStorageType() string {
 		fmt.Println("2. OpenSearch")
 		fmt.Println("3. PostgreSQL")
 		fmt.Println("4. PostgreSQL EAV")
-		fmt.Println("5. ScyllaDB")
-		fmt.Println("6. MongoDB")
-		fmt.Print("Enter your choice (1, 2, 3, 4, 5, or 6): ")
+		fmt.Println("5. PostgreSQL Hstore")
+		fmt.Println("6. ScyllaDB")
+		fmt.Println("7. MongoDB")
+		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6 or 7): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1046,13 +1063,16 @@ func promptForStorageType() string {
 			fmt.Println("Selected: PostgreSQL EAV")
 			return "postgresql-eav"
 		case "5":
+			fmt.Println("Selected: PostgreSQL Hstore")
+			return "postgresql-hstore"
+		case "6":
 			fmt.Println("Selected: ScyllaDB")
 			return "scylladb"
-		case "6":
+		case "7":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, or 6.")
+			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, 6, 7, or 8.")
 		}
 	}
 }
@@ -1085,13 +1105,10 @@ func main() {
 	var kvStore jetstream.KeyValue
 
 	// Get or create object store for retrieving ticket responses
-	objStore, err := natsManager.js.ObjectStore(context.Background(), "ticket-responses")
+	objStore, err := createObjectStore(natsManager, "ticket-responses")
 	if err != nil {
-		log.Printf("WARNING: Failed to connect to object store: %v. Large responses may not be available.", err)
-
-		return
-	} else {
-		log.Println("Connected to NATS Object Store: ticket-responses")
+		log.Printf("WARNING: Failed to create object store: %v. Large responses may not be available.", err)
+		objStore = nil // Set to nil so service can continue without object store
 	}
 
 	switch storageType {
@@ -1133,6 +1150,16 @@ func main() {
 		}
 		storage = postgresEAVStorage
 		log.Printf("Using PostgreSQL EAV storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+	case "postgresql-hstore":
+		postgresHstoreStorage, err := storage2.NewPostgreSQLHstoreStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL Hstore storage: %v", err)
+
+			return
+		}
+		storage = postgresHstoreStorage
+		log.Printf("Using PostgreSQL Hstore storage with connection: %s and base table: %s",
 			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
 	case "scylladb":
 		// Parse hosts from comma-separated string

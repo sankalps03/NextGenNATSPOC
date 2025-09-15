@@ -124,7 +124,7 @@ func Load() (*Config, error) {
 		LogLevel:    getEnvOrDefault("LOG_LEVEL", "info"),
 
 		EPS: EPSConfig{
-			Create: getEnvFloat("EPS_CREATE", 10),
+			Create: getEnvFloat("EPS_CREATE", 100),
 			Search: getEnvFloat("EPS_SEARCH", 2),
 			Get:    getEnvFloat("EPS_GET", 1),
 			Update: getEnvFloat("EPS_UPDATE", 1),
