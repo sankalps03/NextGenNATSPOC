@@ -1,80 +1,144 @@
--- PostgreSQL DocumentDB Hybrid Schema for Ticket Management System
--- Combines fixed schema for common fields with BSON for dynamic fields
--- Created: 2025-09-12
+-- PostgreSQL Hybrid Schema for Ticket Management System
+-- All fixed fields as columns + one custom JSONB field for dynamic data
+-- Created: 2025-09-15
 
 -- Grant necessary permissions to current user/role
+GRANT USAGE ON SCHEMA public TO PUBLIC;
+GRANT CREATE ON SCHEMA public TO PUBLIC;
 
 -- Create uuid extension for generating unique IDs
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Verify installation
-SELECT extname, extversion FROM pg_extension WHERE extname = 'uuid-ossp';
-
 GRANT ALL ON SCHEMA public TO PUBLIC;
 
+ALTER DATABASE postgres SET search_path TO public, documentdb_core, documentdb_api, documentdb_api_catalog, documentdb_api_internal;
+
 -- Drop table if exists (for clean recreation)
-DROP TABLE IF EXISTS ticket_hybrid CASCADE;
+DROP TABLE IF EXISTS tickets CASCADE;
 
--- Create hybrid table with fixed schema + dynamic BSON fields
-CREATE TABLE ticket_hybrid (
-    -- DocumentDB style primary key
-    _id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+-- Create tickets table with all fixed fields + one custom JSONB field
+CREATE TABLE tickets (
+    -- Primary key with auto-increment
+                         id BIGSERIAL PRIMARY KEY,
 
-    -- Core fields for protobuf compatibility (always fixed schema)
-    ticket_id VARCHAR(255) UNIQUE NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Core fields for protobuf compatibility (managed by application)
+                         ticket_id VARCHAR(255) UNIQUE NOT NULL,
+                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    -- Fixed schema: High-frequency query fields (most commonly searched/filtered)
     -- User and assignment fields
-    requesterid BIGINT,
-    technicianid BIGINT,
-    createdbyid BIGINT,
+                         updatedbyid BIGINT,
+                         createdbyid BIGINT,
+                         removedbyid BIGINT,
+                         requesterid BIGINT,
+                         technicianid BIGINT,
+                         closedby BIGINT,
+                         resolvedby BIGINT,
 
-    -- Status and priority (most common filters)
-    statusid BIGINT,
-    priorityid BIGINT,
-    urgencyid BIGINT,
+    -- Timestamp fields (Unix timestamps in milliseconds)
+                         updatedtime BIGINT,
+                         createdtime BIGINT,
+                         removedtime BIGINT,
+                         dueby BIGINT,
+                         firstresponsetime BIGINT,
+                         lastclosedtime BIGINT,
+                         lastopenedtime BIGINT,
+                         lastresolvedtime BIGINT,
+                         lastviolationtime BIGINT,
+                         olddueby BIGINT,
+                         oldresponsedue BIGINT,
+                         resolutionescalationtime BIGINT,
+                         responsedue BIGINT,
+                         responseescalationtime BIGINT,
+                         statuschangedtime BIGINT,
+                         groupchangedtime BIGINT,
+                         lastolaviolationtime BIGINT,
+                         oladueby BIGINT,
+                         oldoladueby BIGINT,
+                         askfeedbackdate BIGINT,
+                         firstfeedbackdate BIGINT,
+                         olaescalationtime BIGINT,
+                         lastucviolationtime BIGINT,
+                         olducdueby BIGINT,
+                         ucdueby BIGINT,
+                         ucescalationtime BIGINT,
+                         lastapproveddate BIGINT,
 
-    -- Timing and SLA fields (frequently queried)
-    createdtime BIGINT,
-    updatedtime BIGINT,
-    dueby BIGINT,
+    -- Text fields
+                         name VARCHAR(255),
+                         oobtype VARCHAR(100),
+                         description TEXT,
+                         originaldescription TEXT,
+                         subject VARCHAR(500),
+                         callfrom VARCHAR(100),
+                         emailreadconfigemail VARCHAR(255),
 
-    -- Organization fields (common filters)
-    companyid BIGINT,
-    groupid BIGINT,
-    departmentid BIGINT,
-    categoryid BIGINT,
+    -- Boolean fields
+                         removed BOOLEAN DEFAULT FALSE,
+                         duetimemanuallyupdated BOOLEAN DEFAULT FALSE,
+                         reopened BOOLEAN DEFAULT FALSE,
+                         responsedueviolated BOOLEAN DEFAULT FALSE,
+                         slaviolated BOOLEAN DEFAULT FALSE,
+                         purchaserequest BOOLEAN DEFAULT FALSE,
+                         spam BOOLEAN DEFAULT FALSE,
+                         viprequest BOOLEAN DEFAULT FALSE,
+                         olaviolated BOOLEAN DEFAULT FALSE,
+                         ucviolated BOOLEAN DEFAULT FALSE,
+                         migrated BOOLEAN DEFAULT FALSE,
 
-    -- Common text fields
-    subject VARCHAR(500),
-    description TEXT,
+    -- Category and classification fields
+                         categoryid BIGINT,
+                         departmentid BIGINT,
+                         groupid BIGINT,
+                         impactid BIGINT,
+                         locationid BIGINT,
+                         priorityid BIGINT,
+                         statusid BIGINT,
+                         urgencyid BIGINT,
+                         violatedslaid BIGINT,
+                         servicecatalogid BIGINT,
+                         sourceid BIGINT,
+                         requesttype BIGINT,
+                         suggestedcategoryid BIGINT,
+                         suggestedgroupid BIGINT,
+                         companyid BIGINT,
+                         vendorid BIGINT,
+                         violateducid BIGINT,
+                         transitionmodelid BIGINT,
+                         messengerconfigid BIGINT,
 
-    -- Common boolean flags
-    removed BOOLEAN DEFAULT FALSE,
-    spam BOOLEAN DEFAULT FALSE,
+    -- Approval and workflow fields
+                         approvalstatus INTEGER,
+                         approvaltype INTEGER,
+                         resolutionduelevel INTEGER,
+                         responseduelevel INTEGER,
+                         supportlevel INTEGER,
+                         oladuelevel INTEGER,
+                         ucduelevel INTEGER,
 
-    -- Dynamic fields stored as BSON (for flexibility)
-    -- All other fields that are less frequently queried or custom fields
-    dynamic_fields documentdb_core.bson DEFAULT '{}',
+    -- Duration and time tracking fields (in milliseconds)
+                         totalonholdduration BIGINT DEFAULT 0,
+                         totalresolutiontime BIGINT DEFAULT 0,
+                         totalslapausetime BIGINT DEFAULT 0,
+                         totalworkingtime BIGINT DEFAULT 0,
+                         totaluconholdduration BIGINT DEFAULT 0,
+                         totalucpausetime BIGINT DEFAULT 0,
+                         totalucworkingtime BIGINT DEFAULT 0,
+                         totalucresolutiontime BIGINT DEFAULT 0,
 
-    -- Additional BSON fields for organized data
-    user_fields documentdb_core.bson DEFAULT '{}',      -- User-related dynamic data
-    timing_fields documentdb_core.bson DEFAULT '{}',    -- Timing/SLA dynamic data
-    workflow_fields documentdb_core.bson DEFAULT '{}',  -- Workflow/approval dynamic data
-    custom_fields documentdb_core.bson DEFAULT '{}',    -- Custom organization fields
+    -- Configuration and template fields
+                         templateid BIGINT,
+                         emailreadconfigid BIGINT,
 
-    -- Metadata for BSON field management
-    schema_version INTEGER DEFAULT 1,
+    -- Single custom field for dynamic data
+                         custom_data documentdb_core.bson DEFAULT '{}'
 
     -- Constraint for ticket ID format
-    CONSTRAINT chk_ticket_id_format CHECK (ticket_id ~ '^TKT-[0-9]+$')
-);
+    );
 
 -- Function to automatically update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
+    RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
     NEW.updatedtime = EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000; -- Unix timestamp in milliseconds
@@ -83,134 +147,78 @@ END;
 $$ language 'plpgsql';
 
 -- Trigger to automatically update updated_at on row updates
-CREATE TRIGGER update_ticket_hybrid_updated_at 
-    BEFORE UPDATE ON ticket_hybrid 
-    FOR EACH ROW 
-    EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_tickets_updated_at
+    BEFORE UPDATE ON tickets
+    FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
 
--- INDEXES for Hybrid Schema
+-- INDEXES for Fixed Schema Fields
 -- Essential individual indexes for primary lookups
-CREATE UNIQUE INDEX idx_ticket_hybrid_ticket_id ON ticket_hybrid(ticket_id);
-CREATE INDEX idx_ticket_hybrid_created_at ON ticket_hybrid(created_at);
-CREATE INDEX idx_ticket_hybrid_createdtime ON ticket_hybrid(createdtime);
+CREATE UNIQUE INDEX idx_tickets_ticket_id ON tickets(ticket_id);
+CREATE INDEX idx_tickets_created_at ON tickets(created_at);
+CREATE INDEX idx_tickets_createdtime ON tickets(createdtime);
 
 -- Fixed schema indexes (high-frequency query fields)
-CREATE INDEX idx_ticket_hybrid_requester_status ON ticket_hybrid(requesterid, statusid);
-CREATE INDEX idx_ticket_hybrid_technician_status ON ticket_hybrid(technicianid, statusid);
-CREATE INDEX idx_ticket_hybrid_priority_status ON ticket_hybrid(priorityid, statusid);
-CREATE INDEX idx_ticket_hybrid_company_category ON ticket_hybrid(companyid, categoryid);
-CREATE INDEX idx_ticket_hybrid_group_department ON ticket_hybrid(groupid, departmentid);
-CREATE INDEX idx_ticket_hybrid_due_status ON ticket_hybrid(dueby, statusid) WHERE dueby IS NOT NULL;
+CREATE INDEX idx_tickets_requester_status ON tickets(requesterid, statusid);
+CREATE INDEX idx_tickets_technician_status ON tickets(technicianid, statusid);
+CREATE INDEX idx_tickets_priority_status ON tickets(priorityid, statusid);
+CREATE INDEX idx_tickets_company_category ON tickets(companyid, categoryid);
+CREATE INDEX idx_tickets_group_department ON tickets(groupid, departmentid);
+CREATE INDEX idx_tickets_due_status ON tickets(dueby, statusid) WHERE dueby IS NOT NULL;
 
--- -- BSON indexes for dynamic fields (enables efficient queries on BSON content)
--- CREATE INDEX idx_ticket_hybrid_dynamic_fields_gin ON ticket_hybrid USING GIN (dynamic_fields);
--- CREATE INDEX idx_ticket_hybrid_user_fields_gin ON ticket_hybrid USING GIN (user_fields);
--- CREATE INDEX idx_ticket_hybrid_timing_fields_gin ON ticket_hybrid USING GIN (timing_fields);
--- CREATE INDEX idx_ticket_hybrid_workflow_fields_gin ON ticket_hybrid USING GIN (workflow_fields);
--- CREATE INDEX idx_ticket_hybrid_custom_fields_gin ON ticket_hybrid USING GIN (custom_fields);
---
--- -- Specialized BSON indexes for common field patterns
--- -- Note: Using text extraction for BSON fields and casting separately
--- CREATE INDEX idx_ticket_hybrid_dynamic_btree ON ticket_hybrid
---     USING btree (((dynamic_fields->>'priority')::int));
--- CREATE INDEX idx_ticket_hybrid_user_btree ON ticket_hybrid
---     USING btree (((user_fields->>'assignee_id')::bigint));
--- CREATE INDEX idx_ticket_hybrid_timing_btree ON ticket_hybrid
---     USING btree (((timing_fields->>'sla_due')::bigint));
---
--- -- Text search index for subject and description
--- CREATE INDEX idx_ticket_hybrid_text_search ON ticket_hybrid USING GIN (to_tsvector('english', COALESCE(subject, '') || ' ' || COALESCE(description, '')));
+-- Specialized indexes for common field patterns
+CREATE INDEX idx_tickets_status_created ON tickets(statusid, createdtime);
+CREATE INDEX idx_tickets_requester_created ON tickets(requesterid, createdtime);
+CREATE INDEX idx_tickets_company_status_priority ON tickets(companyid, statusid, priorityid);
+CREATE INDEX idx_tickets_not_spam_not_removed ON tickets(statusid, priorityid) WHERE NOT spam AND NOT removed;
 
--- Composite indexes for common query patterns
-CREATE INDEX idx_ticket_hybrid_status_created ON ticket_hybrid(statusid, createdtime);
-CREATE INDEX idx_ticket_hybrid_requester_created ON ticket_hybrid(requesterid, createdtime);
-CREATE INDEX idx_ticket_hybrid_company_status_priority ON ticket_hybrid(companyid, statusid, priorityid);
-CREATE INDEX idx_ticket_hybrid_not_spam_not_removed ON ticket_hybrid(statusid, priorityid) WHERE NOT spam AND NOT removed;
+-- Text search index for subject and description
+CREATE INDEX idx_tickets_text_search ON tickets USING GIN (to_tsvector('english', COALESCE(subject, '') || ' ' || COALESCE(description, '')));
 
 -- Comments for documentation
-COMMENT ON TABLE ticket_hybrid IS 'Hybrid tickets table combining fixed schema for common fields with BSON for dynamic fields';
-COMMENT ON COLUMN ticket_hybrid._id IS 'DocumentDB style BSON ObjectId primary key';
-COMMENT ON COLUMN ticket_hybrid.ticket_id IS 'Unique ticket identifier with format TKT-{timestamp}';
-COMMENT ON COLUMN ticket_hybrid.dynamic_fields IS 'BSON field storing general dynamic fields';
-COMMENT ON COLUMN ticket_hybrid.user_fields IS 'BSON field storing user-related dynamic data';
-COMMENT ON COLUMN ticket_hybrid.timing_fields IS 'BSON field storing timing/SLA dynamic data';
-COMMENT ON COLUMN ticket_hybrid.workflow_fields IS 'BSON field storing workflow/approval dynamic data';
-COMMENT ON COLUMN ticket_hybrid.custom_fields IS 'BSON field storing custom organization fields';
-COMMENT ON COLUMN ticket_hybrid.schema_version IS 'Version of the dynamic schema for migration purposes';
-COMMENT ON COLUMN ticket_hybrid.createdtime IS 'Unix timestamp in milliseconds when ticket was created';
-COMMENT ON COLUMN ticket_hybrid.updatedtime IS 'Unix timestamp in milliseconds when ticket was last updated';
-COMMENT ON COLUMN ticket_hybrid.requesterid IS 'ID of user who requested the ticket';
-COMMENT ON COLUMN ticket_hybrid.technicianid IS 'ID of technician assigned to the ticket';
-COMMENT ON COLUMN ticket_hybrid.statusid IS 'Current status of the ticket';
-COMMENT ON COLUMN ticket_hybrid.priorityid IS 'Priority level of the ticket';
-COMMENT ON COLUMN ticket_hybrid.dueby IS 'Unix timestamp when ticket is due for resolution';
+COMMENT ON TABLE tickets IS 'Tickets table with fixed schema fields as columns and custom_data JSONB for dynamic fields';
+COMMENT ON COLUMN tickets.id IS 'Auto-increment primary key';
+COMMENT ON COLUMN tickets.ticket_id IS 'Unique ticket identifier with format TKT-{timestamp}';
+COMMENT ON COLUMN tickets.custom_data IS 'JSONB field storing custom/dynamic fields';
+COMMENT ON COLUMN tickets.createdtime IS 'Unix timestamp in milliseconds when ticket was created';
+COMMENT ON COLUMN tickets.updatedtime IS 'Unix timestamp in milliseconds when ticket was last updated';
+COMMENT ON COLUMN tickets.requesterid IS 'ID of user who requested the ticket';
+COMMENT ON COLUMN tickets.technicianid IS 'ID of technician assigned to the ticket';
+COMMENT ON COLUMN tickets.statusid IS 'Current status of the ticket';
+COMMENT ON COLUMN tickets.priorityid IS 'Priority level of the ticket';
+COMMENT ON COLUMN tickets.dueby IS 'Unix timestamp when ticket is due for resolution';
 
--- Create helper function for BSON field extraction
-CREATE OR REPLACE FUNCTION get_bson_field(
-    bson_data documentdb_core.bson,
-    field_name TEXT,
-    field_type TEXT DEFAULT 'string'
-) RETURNS TEXT AS $$
+-- Helper function to get list of fixed field column names
+CREATE OR REPLACE FUNCTION get_fixed_field_columns()
+    RETURNS TEXT[] AS $$
 BEGIN
-    CASE field_type
-        WHEN 'string' THEN
-            RETURN bson_data->>field_name;
-        WHEN 'number' THEN
-            RETURN bson_data->>field_name;
-        WHEN 'boolean' THEN
-            RETURN bson_data->>field_name;
-        ELSE
-            RETURN bson_data->>field_name;
-    END CASE;
+    RETURN ARRAY[
+        'id', 'ticket_id', 'created_at', 'updated_at',
+        'updatedbyid', 'createdbyid', 'removedbyid', 'requesterid', 'technicianid', 'closedby', 'resolvedby',
+        'updatedtime', 'createdtime', 'removedtime', 'dueby', 'firstresponsetime', 'lastclosedtime',
+        'lastopenedtime', 'lastresolvedtime', 'lastviolationtime', 'olddueby', 'oldresponsedue',
+        'resolutionescalationtime', 'responsedue', 'responseescalationtime', 'statuschangedtime',
+        'groupchangedtime', 'lastolaviolationtime', 'oladueby', 'oldoladueby', 'askfeedbackdate',
+        'firstfeedbackdate', 'olaescalationtime', 'lastucviolationtime', 'olducdueby', 'ucdueby',
+        'ucescalationtime', 'lastapproveddate', 'name', 'oobtype', 'description', 'originaldescription',
+        'subject', 'callfrom', 'emailreadconfigemail', 'removed', 'duetimemanuallyupdated', 'reopened',
+        'responsedueviolated', 'slaviolated', 'purchaserequest', 'spam', 'viprequest', 'olaviolated',
+        'ucviolated', 'migrated', 'categoryid', 'departmentid', 'groupid', 'impactid', 'locationid',
+        'priorityid', 'statusid', 'urgencyid', 'violatedslaid', 'servicecatalogid', 'sourceid',
+        'requesttype', 'suggestedcategoryid', 'suggestedgroupid', 'companyid', 'vendorid',
+        'violateducid', 'transitionmodelid', 'messengerconfigid', 'approvalstatus', 'approvaltype',
+        'resolutionduelevel', 'responseduelevel', 'supportlevel', 'oladuelevel', 'ucduelevel',
+        'totalonholdduration', 'totalresolutiontime', 'totalslapausetime', 'totalworkingtime',
+        'totaluconholdduration', 'totalucpausetime', 'totalucworkingtime', 'totalucresolutiontime',
+        'templateid', 'emailreadconfigid'
+        ];
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- Create helper function for setting BSON fields
-CREATE OR REPLACE FUNCTION set_bson_field(
-    bson_data documentdb_core.bson,
-    field_name TEXT,
-    field_value TEXT,
-    field_type TEXT DEFAULT 'string'
-) RETURNS documentdb_core.bson AS $$
-DECLARE
-    result_bson documentdb_core.bson;
+-- Helper function to check if a field is a fixed column
+CREATE OR REPLACE FUNCTION is_fixed_field(field_name TEXT)
+    RETURNS BOOLEAN AS $$
 BEGIN
-    -- Initialize empty BSON if null
-    IF bson_data IS NULL THEN
-        bson_data := '{}'::documentdb_core.bson;
-    END IF;
-    
-    -- Simplified approach using JSON functions that work with BSON
-    CASE field_type
-        WHEN 'string' THEN
-            result_bson := to_bson(json_build_object(field_name, field_value)::text);
-        WHEN 'number' THEN
-            result_bson := to_bson(json_build_object(field_name, field_value::NUMERIC)::text);
-        WHEN 'boolean' THEN
-            result_bson := to_bson(json_build_object(field_name, field_value::BOOLEAN)::text);
-        ELSE
-            result_bson := to_bson(json_build_object(field_name, field_value)::text);
-    END CASE;
-    
-    RETURN result_bson;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Create helper function for BSON field operations
-CREATE OR REPLACE FUNCTION merge_bson_fields(
-    target_bson documentdb_core.bson,
-    source_bson documentdb_core.bson
-) RETURNS documentdb_core.bson AS $$
-BEGIN
-    IF target_bson IS NULL THEN
-        RETURN COALESCE(source_bson, '{}'::bson);
-    END IF;
-    
-    IF source_bson IS NULL THEN
-        RETURN target_bson;
-    END IF;
-    
-    -- Simplified merge using JSON operations
-    RETURN to_bson((from_bson(target_bson)::jsonb || from_bson(source_bson)::jsonb)::text);
+    RETURN field_name = ANY(get_fixed_field_columns());
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;

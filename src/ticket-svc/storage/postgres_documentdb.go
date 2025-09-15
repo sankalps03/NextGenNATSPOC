@@ -3,44 +3,30 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/nats-io/nats.go/jetstream"
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
-	"go.mongodb.org/mongo-driver/bson"
 )
 
-// PostgreSQLDocumentDBStorage implements ticket storage using PostgreSQL with hybrid approach
-// Combines fixed schema for common fields with BSON for dynamic fields
+// PostgreSQLDocumentDBStorage implements ticket storage with all fixed fields as columns + one BSON custom field
 type PostgreSQLDocumentDBStorage struct {
 	db        *sql.DB
 	tableName string
 }
 
-// FieldMapping defines which fields go to fixed schema vs dynamic BSON
-type FieldMapping struct {
-	// Fixed schema fields (most commonly queried)
-	FixedFields map[string]string // protobuf_field -> db_column
-	// Dynamic fields (stored in BSON)
-	DynamicFields map[string]BSONFieldInfo // protobuf_field -> BSON field info
-}
-
-// BSONFieldInfo defines where and how a field is stored in BSON
-type BSONFieldInfo struct {
-	BSONColumn string // Which BSON column (dynamic_fields, user_fields, etc.)
-	FieldPath  string // Path within the BSON document
-	DataType   string // string, number, boolean
-}
-
-// NewPostgreSQLDocumentDBStorage creates a new PostgreSQL DocumentDB storage instance
+// NewPostgreSQLDocumentDBStorage creates a new PostgreSQL hybrid storage instance
 func NewPostgreSQLDocumentDBStorage(ctx context.Context, tableName, connectionString string) (*PostgreSQLDocumentDBStorage, error) {
+	if tableName == "" {
+		tableName = "tickets"
+	}
+
 	// Open database connection
 	db, err := sql.Open("postgres", connectionString)
 	if err != nil {
@@ -57,7 +43,7 @@ func NewPostgreSQLDocumentDBStorage(ctx context.Context, tableName, connectionSt
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	log.Printf("PostgreSQL DocumentDB connection established successfully")
+	log.Printf("PostgreSQLDocument BD Hybrid V connection established successfully")
 
 	storage := &PostgreSQLDocumentDBStorage{
 		db:        db,
@@ -72,120 +58,62 @@ func NewPostgreSQLDocumentDBStorage(ctx context.Context, tableName, connectionSt
 	return storage, nil
 }
 
-// getFieldMapping returns the mapping of fields to fixed schema vs dynamic BSON
-func (p *PostgreSQLDocumentDBStorage) getFieldMapping() *FieldMapping {
-	return &FieldMapping{
-		// Fixed schema fields (commonly queried/filtered)
-		FixedFields: map[string]string{
-			"requesterid":  "requesterid",
-			"technicianid": "technicianid",
-			"createdbyid":  "createdbyid",
-			"statusid":     "statusid",
-			"priorityid":   "priorityid",
-			"urgencyid":    "urgencyid",
-			"createdtime":  "createdtime",
-			"updatedtime":  "updatedtime",
-			"dueby":        "dueby",
-			"companyid":    "companyid",
-			"groupid":      "groupid",
-			"departmentid": "departmentid",
-			"categoryid":   "categoryid",
-			"subject":      "subject",
-			"description":  "description",
-			"removed":      "removed",
-			"spam":         "spam",
-		},
-		// All other fields go to BSON (less commonly queried)
-		DynamicFields: map[string]BSONFieldInfo{
-			// User fields -> user_fields BSON column
-			"updatedbyid": {BSONColumn: "user_fields", FieldPath: "updatedbyid", DataType: "number"},
-			"removedbyid": {BSONColumn: "user_fields", FieldPath: "removedbyid", DataType: "number"},
-			"closedby":    {BSONColumn: "user_fields", FieldPath: "closedby", DataType: "number"},
-			"resolvedby":  {BSONColumn: "user_fields", FieldPath: "resolvedby", DataType: "number"},
+// getFixedFields returns the set of fields that are stored as columns
+func (p *PostgreSQLDocumentDBStorage) getFixedFields() map[string]bool {
+	return map[string]bool{
+		// Core fields
+		"ticket_id": true, "created_at": true, "updated_at": true,
 
-			// Timing fields -> timing_fields BSON column
-			"removedtime":              {BSONColumn: "timing_fields", FieldPath: "removedtime", DataType: "number"},
-			"firstresponsetime":        {BSONColumn: "timing_fields", FieldPath: "firstresponsetime", DataType: "number"},
-			"lastclosedtime":           {BSONColumn: "timing_fields", FieldPath: "lastclosedtime", DataType: "number"},
-			"lastopenedtime":           {BSONColumn: "timing_fields", FieldPath: "lastopenedtime", DataType: "number"},
-			"lastresolvedtime":         {BSONColumn: "timing_fields", FieldPath: "lastresolvedtime", DataType: "number"},
-			"lastviolationtime":        {BSONColumn: "timing_fields", FieldPath: "lastviolationtime", DataType: "number"},
-			"olddueby":                 {BSONColumn: "timing_fields", FieldPath: "olddueby", DataType: "number"},
-			"oldresponsedue":           {BSONColumn: "timing_fields", FieldPath: "oldresponsedue", DataType: "number"},
-			"resolutionescalationtime": {BSONColumn: "timing_fields", FieldPath: "resolutionescalationtime", DataType: "number"},
-			"responsedue":              {BSONColumn: "timing_fields", FieldPath: "responsedue", DataType: "number"},
-			"responseescalationtime":   {BSONColumn: "timing_fields", FieldPath: "responseescalationtime", DataType: "number"},
-			"statuschangedtime":        {BSONColumn: "timing_fields", FieldPath: "statuschangedtime", DataType: "number"},
-			"groupchangedtime":         {BSONColumn: "timing_fields", FieldPath: "groupchangedtime", DataType: "number"},
-			"lastolaviolationtime":     {BSONColumn: "timing_fields", FieldPath: "lastolaviolationtime", DataType: "number"},
-			"oladueby":                 {BSONColumn: "timing_fields", FieldPath: "oladueby", DataType: "number"},
-			"oldoladueby":              {BSONColumn: "timing_fields", FieldPath: "oldoladueby", DataType: "number"},
-			"askfeedbackdate":          {BSONColumn: "timing_fields", FieldPath: "askfeedbackdate", DataType: "number"},
-			"firstfeedbackdate":        {BSONColumn: "timing_fields", FieldPath: "firstfeedbackdate", DataType: "number"},
-			"olaescalationtime":        {BSONColumn: "timing_fields", FieldPath: "olaescalationtime", DataType: "number"},
-			"lastucviolationtime":      {BSONColumn: "timing_fields", FieldPath: "lastucviolationtime", DataType: "number"},
-			"olducdueby":               {BSONColumn: "timing_fields", FieldPath: "olducdueby", DataType: "number"},
-			"ucdueby":                  {BSONColumn: "timing_fields", FieldPath: "ucdueby", DataType: "number"},
-			"ucescalationtime":         {BSONColumn: "timing_fields", FieldPath: "ucescalationtime", DataType: "number"},
-			"lastapproveddate":         {BSONColumn: "timing_fields", FieldPath: "lastapproveddate", DataType: "number"},
-			"totalonholdduration":      {BSONColumn: "timing_fields", FieldPath: "totalonholdduration", DataType: "number"},
-			"totalresolutiontime":      {BSONColumn: "timing_fields", FieldPath: "totalresolutiontime", DataType: "number"},
-			"totalslapausetime":        {BSONColumn: "timing_fields", FieldPath: "totalslapausetime", DataType: "number"},
-			"totalworkingtime":         {BSONColumn: "timing_fields", FieldPath: "totalworkingtime", DataType: "number"},
-			"totaluconholdduration":    {BSONColumn: "timing_fields", FieldPath: "totaluconholdduration", DataType: "number"},
-			"totalucpausetime":         {BSONColumn: "timing_fields", FieldPath: "totalucpausetime", DataType: "number"},
-			"totalucworkingtime":       {BSONColumn: "timing_fields", FieldPath: "totalucworkingtime", DataType: "number"},
-			"totalucresolutiontime":    {BSONColumn: "timing_fields", FieldPath: "totalucresolutiontime", DataType: "number"},
+		// User and assignment fields
+		"updatedbyid": true, "createdbyid": true, "removedbyid": true, "requesterid": true,
+		"technicianid": true, "closedby": true, "resolvedby": true,
 
-			// Text fields -> dynamic_fields BSON column
-			"name":                 {BSONColumn: "dynamic_fields", FieldPath: "name", DataType: "string"},
-			"oobtype":              {BSONColumn: "dynamic_fields", FieldPath: "oobtype", DataType: "string"},
-			"originaldescription":  {BSONColumn: "dynamic_fields", FieldPath: "originaldescription", DataType: "string"},
-			"callfrom":             {BSONColumn: "dynamic_fields", FieldPath: "callfrom", DataType: "string"},
-			"emailreadconfigemail": {BSONColumn: "dynamic_fields", FieldPath: "emailreadconfigemail", DataType: "string"},
+		// Timestamp fields
+		"updatedtime": true, "createdtime": true, "removedtime": true, "dueby": true,
+		"firstresponsetime": true, "lastclosedtime": true, "lastopenedtime": true,
+		"lastresolvedtime": true, "lastviolationtime": true, "olddueby": true,
+		"oldresponsedue": true, "resolutionescalationtime": true, "responsedue": true,
+		"responseescalationtime": true, "statuschangedtime": true, "groupchangedtime": true,
+		"lastolaviolationtime": true, "oladueby": true, "oldoladueby": true,
+		"askfeedbackdate": true, "firstfeedbackdate": true, "olaescalationtime": true,
+		"lastucviolationtime": true, "olducdueby": true, "ucdueby": true,
+		"ucescalationtime": true, "lastapproveddate": true,
 
-			// Boolean flags -> dynamic_fields BSON column
-			"duetimemanuallyupdated": {BSONColumn: "dynamic_fields", FieldPath: "duetimemanuallyupdated", DataType: "boolean"},
-			"reopened":               {BSONColumn: "dynamic_fields", FieldPath: "reopened", DataType: "boolean"},
-			"responsedueviolated":    {BSONColumn: "dynamic_fields", FieldPath: "responsedueviolated", DataType: "boolean"},
-			"slaviolated":            {BSONColumn: "dynamic_fields", FieldPath: "slaviolated", DataType: "boolean"},
-			"purchaserequest":        {BSONColumn: "dynamic_fields", FieldPath: "purchaserequest", DataType: "boolean"},
-			"viprequest":             {BSONColumn: "dynamic_fields", FieldPath: "viprequest", DataType: "boolean"},
-			"olaviolated":            {BSONColumn: "dynamic_fields", FieldPath: "olaviolated", DataType: "boolean"},
-			"ucviolated":             {BSONColumn: "dynamic_fields", FieldPath: "ucviolated", DataType: "boolean"},
-			"migrated":               {BSONColumn: "dynamic_fields", FieldPath: "migrated", DataType: "boolean"},
+		// Text fields
+		"name": true, "oobtype": true, "description": true, "originaldescription": true,
+		"subject": true, "callfrom": true, "emailreadconfigemail": true,
 
-			// ID/Reference fields -> dynamic_fields BSON column
-			"impactid":            {BSONColumn: "dynamic_fields", FieldPath: "impactid", DataType: "number"},
-			"locationid":          {BSONColumn: "dynamic_fields", FieldPath: "locationid", DataType: "number"},
-			"violatedslaid":       {BSONColumn: "dynamic_fields", FieldPath: "violatedslaid", DataType: "number"},
-			"servicecatalogid":    {BSONColumn: "dynamic_fields", FieldPath: "servicecatalogid", DataType: "number"},
-			"sourceid":            {BSONColumn: "dynamic_fields", FieldPath: "sourceid", DataType: "number"},
-			"requesttype":         {BSONColumn: "dynamic_fields", FieldPath: "requesttype", DataType: "number"},
-			"suggestedcategoryid": {BSONColumn: "dynamic_fields", FieldPath: "suggestedcategoryid", DataType: "number"},
-			"suggestedgroupid":    {BSONColumn: "dynamic_fields", FieldPath: "suggestedgroupid", DataType: "number"},
-			"vendorid":            {BSONColumn: "dynamic_fields", FieldPath: "vendorid", DataType: "number"},
-			"violateducid":        {BSONColumn: "dynamic_fields", FieldPath: "violateducid", DataType: "number"},
-			"transitionmodelid":   {BSONColumn: "dynamic_fields", FieldPath: "transitionmodelid", DataType: "number"},
-			"messengerconfigid":   {BSONColumn: "dynamic_fields", FieldPath: "messengerconfigid", DataType: "number"},
-			"templateid":          {BSONColumn: "dynamic_fields", FieldPath: "templateid", DataType: "number"},
-			"emailreadconfigid":   {BSONColumn: "dynamic_fields", FieldPath: "emailreadconfigid", DataType: "number"},
+		// Boolean fields
+		"removed": true, "duetimemanuallyupdated": true, "reopened": true,
+		"responsedueviolated": true, "slaviolated": true, "purchaserequest": true,
+		"spam": true, "viprequest": true, "olaviolated": true, "ucviolated": true,
+		"migrated": true,
 
-			// Workflow fields -> workflow_fields BSON column
-			"approvalstatus":     {BSONColumn: "workflow_fields", FieldPath: "approvalstatus", DataType: "number"},
-			"approvaltype":       {BSONColumn: "workflow_fields", FieldPath: "approvaltype", DataType: "number"},
-			"resolutionduelevel": {BSONColumn: "workflow_fields", FieldPath: "resolutionduelevel", DataType: "number"},
-			"responseduelevel":   {BSONColumn: "workflow_fields", FieldPath: "responseduelevel", DataType: "number"},
-			"supportlevel":       {BSONColumn: "workflow_fields", FieldPath: "supportlevel", DataType: "number"},
-			"oladuelevel":        {BSONColumn: "workflow_fields", FieldPath: "oladuelevel", DataType: "number"},
-			"ucduelevel":         {BSONColumn: "workflow_fields", FieldPath: "ucduelevel", DataType: "number"},
-		},
+		// Category and classification fields
+		"categoryid": true, "departmentid": true, "groupid": true, "impactid": true,
+		"locationid": true, "priorityid": true, "statusid": true, "urgencyid": true,
+		"violatedslaid": true, "servicecatalogid": true, "sourceid": true,
+		"requesttype": true, "suggestedcategoryid": true, "suggestedgroupid": true,
+		"companyid": true, "vendorid": true, "violateducid": true,
+		"transitionmodelid": true, "messengerconfigid": true,
+
+		// Approval and workflow fields
+		"approvalstatus": true, "approvaltype": true, "resolutionduelevel": true,
+		"responseduelevel": true, "supportlevel": true, "oladuelevel": true,
+		"ucduelevel": true,
+
+		// Duration and time tracking fields
+		"totalonholdduration": true, "totalresolutiontime": true, "totalslapausetime": true,
+		"totalworkingtime": true, "totaluconholdduration": true, "totalucpausetime": true,
+		"totalucworkingtime": true, "totalucresolutiontime": true,
+
+		// Configuration and template fields
+		"templateid": true, "emailreadconfigid": true,
 	}
 }
 
 // generateTicketID generates a unique ticket ID if not provided
 func (p *PostgreSQLDocumentDBStorage) generateTicketID() string {
-	// Generate a simple ticket ID with timestamp
 	return fmt.Sprintf("TKT-%d", time.Now().UnixNano()/1000000)
 }
 
@@ -206,7 +134,7 @@ func (p *PostgreSQLDocumentDBStorage) ensureTableExists(ctx context.Context) err
 	}
 
 	if !exists {
-		// Create the table
+		// Create the table using the schema file
 		if err := p.createTableIfNotExists(ctx); err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
 		}
@@ -218,36 +146,6 @@ func (p *PostgreSQLDocumentDBStorage) ensureTableExists(ctx context.Context) err
 	return nil
 }
 
-// loadSchemaFromFile loads SQL schema from the database/postgresql directory
-func (p *PostgreSQLDocumentDBStorage) loadSchemaFromFile() (string, error) {
-	// Try to find the hybrid schema file in common locations
-	possiblePaths := []string{
-		"database/postgresql/schema_hybrid.sql",
-		"../database/postgresql/schema_hybrid.sql",
-		"../../database/postgresql/schema_hybrid.sql",
-		"./database/postgresql/schema_hybrid.sql",
-	}
-
-	var schemaContent string
-
-	for _, path := range possiblePaths {
-		if _, err := os.Stat(path); err == nil {
-			content, readErr := ioutil.ReadFile(path)
-			if readErr == nil {
-				schemaContent = string(content)
-				log.Printf("Loaded PostgreSQL DocumentDB hybrid schema from: %s", path)
-				break
-			}
-		}
-	}
-
-	if schemaContent == "" {
-		return "", fmt.Errorf("could not find schema_hybrid.sql file in any of the expected locations: %v", possiblePaths)
-	}
-
-	return schemaContent, nil
-}
-
 // createTableIfNotExists creates the PostgreSQL table using the hybrid schema from file
 func (p *PostgreSQLDocumentDBStorage) createTableIfNotExists(ctx context.Context) error {
 	// Load schema from file
@@ -256,8 +154,8 @@ func (p *PostgreSQLDocumentDBStorage) createTableIfNotExists(ctx context.Context
 		return fmt.Errorf("failed to load schema file: %w", err)
 	}
 
-	// Replace table name in schema
-	adaptedSchema := strings.ReplaceAll(schemaContent, "ticket_hybrid", p.tableName)
+	// Replace table name in schema if needed
+	adaptedSchema := strings.ReplaceAll(schemaContent, "tickets", p.tableName)
 
 	// Execute the schema
 	_, err = p.db.ExecContext(ctx, adaptedSchema)
@@ -269,37 +167,73 @@ func (p *PostgreSQLDocumentDBStorage) createTableIfNotExists(ctx context.Context
 	return nil
 }
 
-// protobufToHybridRow converts a TicketData protobuf to hybrid row data (fixed + dynamic BSON fields)
-func (p *PostgreSQLDocumentDBStorage) protobufToHybridRow(ticketData *ticketpb.TicketData, isUpdate bool) (map[string]interface{}, map[string]bson.M, error) {
-	fixedRow := make(map[string]interface{})
-	// Initialize BSON documents for each column
-	bsonFields := map[string]bson.M{
-		"dynamic_fields":  bson.M{},
-		"user_fields":     bson.M{},
-		"timing_fields":   bson.M{},
-		"workflow_fields": bson.M{},
-		"custom_fields":   bson.M{},
+// loadSchemaFromFile loads SQL schema from the database/postgresql directory
+func (p *PostgreSQLDocumentDBStorage) loadSchemaFromFile() (string, error) {
+	// Try to find the hybrid schema file in common locations
+	possiblePaths := []string{
+		"database/postgresql/schema_hybrid.sql",
+		"../database/postgresql/schema_hybrid.sql",
+		"../../database/postgresql/schema_hybrid.sql",
+		"./database/postgresql/schema_hybrid.sql",
+		"/home/sankalp-singh/Workspace/NextGenNATSPOC/database/postgresql/schema_hybrid.sql",
 	}
 
-	mapping := p.getFieldMapping()
+	var schemaContent string
 
-	// Core fields - these are managed by the application
-	fixedRow["ticket_id"] = ticketData.Id
+	for _, path := range possiblePaths {
+		content, readErr := p.readFileIfExists(path)
+		if readErr == nil && content != "" {
+			schemaContent = content
+			log.Printf("Loaded PostgreSQL DocumentDB hybrid schema from: %s", path)
+			break
+		}
+	}
+
+	if schemaContent == "" {
+		return "", fmt.Errorf("could not find schema_hybrid.sql file in any of the expected locations: %v", possiblePaths)
+	}
+
+	return schemaContent, nil
+}
+
+// readFileIfExists reads a file if it exists, returns empty string and nil error if file doesn't exist
+func (p *PostgreSQLDocumentDBStorage) readFileIfExists(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", err // File doesn't exist
+		}
+		return "", err // Other error
+	}
+	return string(content), nil
+}
+
+// protobufToHybridData converts a TicketData protobuf to fixed fields + custom data
+func (p *PostgreSQLDocumentDBStorage) protobufToHybridData(ticketData *ticketpb.TicketData, isUpdate bool) (map[string]interface{}, map[string]interface{}, error) {
+	fixedFields := make(map[string]interface{})
+	customData := make(map[string]interface{})
+
+	fixedFieldsSet := p.getFixedFields()
+
+	// Core fields
+	fixedFields["ticket_id"] = ticketData.Id
 
 	// Handle timestamps
 	if !isUpdate {
-		// For new tickets, set created_at to current time
-		fixedRow["created_at"] = time.Now()
-		fixedRow["createdtime"] = time.Now().UnixNano() / 1000000 // milliseconds
+		fixedFields["created_at"] = time.Now()
+		fixedFields["createdtime"] = time.Now().UnixNano() / 1000000
 	}
-	// Always update updated_at for both create and update
-	fixedRow["updated_at"] = time.Now()
-	fixedRow["updatedtime"] = time.Now().UnixNano() / 1000000 // milliseconds
+	fixedFields["updated_at"] = time.Now()
+	fixedFields["updatedtime"] = time.Now().UnixNano() / 1000000
 
 	// Process all fields from the protobuf Fields map
 	for fieldName, fieldValue := range ticketData.Fields {
-		var value interface{}
+		if fieldValue == nil {
+			continue
+		}
 
+		// Convert protobuf field value to Go interface
+		var value interface{}
 		switch v := fieldValue.Value.(type) {
 		case *ticketpb.FieldValue_StringValue:
 			value = v.StringValue
@@ -314,85 +248,34 @@ func (p *PostgreSQLDocumentDBStorage) protobufToHybridRow(ticketData *ticketpb.T
 		case *ticketpb.FieldValue_StringArray:
 			value = v.StringArray.Values
 		default:
-			value = nil
+			continue
 		}
 
-		// Check if this field goes to fixed schema
-		if dbColumn, isFixed := mapping.FixedFields[fieldName]; isFixed {
-			// Handle type conversions for fixed schema fields
-			switch fieldName {
-			case "requesterid", "technicianid", "createdbyid", "statusid", "priorityid",
-				"urgencyid", "createdtime", "updatedtime", "dueby", "companyid",
-				"groupid", "departmentid", "categoryid":
-				if intVal, ok := value.(int64); ok {
-					fixedRow[dbColumn] = intVal
-				} else if floatVal, ok := value.(float64); ok {
-					fixedRow[dbColumn] = int64(floatVal)
-				} else if strVal, ok := value.(string); ok {
-					if intVal, err := strconv.ParseInt(strVal, 10, 64); err == nil {
-						fixedRow[dbColumn] = intVal
-					}
-				}
-			case "subject", "description":
-				if strVal, ok := value.(string); ok {
-					fixedRow[dbColumn] = strVal
-				}
-			case "removed", "spam":
-				if boolVal, ok := value.(bool); ok {
-					fixedRow[dbColumn] = boolVal
-				} else if strVal, ok := value.(string); ok {
-					fixedRow[dbColumn] = strings.ToLower(strVal) == "true"
-				}
-			}
-		} else if bsonInfo, isDynamic := mapping.DynamicFields[fieldName]; isDynamic {
-			// Store in appropriate BSON column based on mapping
-			if value != nil {
-				switch bsonInfo.DataType {
-				case "string":
-					if strVal, ok := value.(string); ok && strVal != "" {
-						bsonFields[bsonInfo.BSONColumn][bsonInfo.FieldPath] = strVal
-					}
-				case "number":
-					if intVal, ok := value.(int64); ok {
-						bsonFields[bsonInfo.BSONColumn][bsonInfo.FieldPath] = intVal
-					} else if floatVal, ok := value.(float64); ok {
-						bsonFields[bsonInfo.BSONColumn][bsonInfo.FieldPath] = int64(floatVal)
-					} else if strVal, ok := value.(string); ok {
-						if intVal, err := strconv.ParseInt(strVal, 10, 64); err == nil {
-							bsonFields[bsonInfo.BSONColumn][bsonInfo.FieldPath] = intVal
-						}
-					}
-				case "boolean":
-					if boolVal, ok := value.(bool); ok {
-						bsonFields[bsonInfo.BSONColumn][bsonInfo.FieldPath] = boolVal
-					} else if strVal, ok := value.(string); ok {
-						bsonFields[bsonInfo.BSONColumn][bsonInfo.FieldPath] = strings.ToLower(strVal) == "true"
-					}
-				}
-			}
+		fieldNameLower := strings.ToLower(fieldName)
+
+		// Check if this field is a fixed column
+		if fixedFieldsSet[fieldNameLower] {
+			// Store in fixed fields
+			fixedFields[fieldNameLower] = value
 		} else {
-			// Unknown field - store in custom_fields BSON column
-			log.Printf("WARNING: Unknown field %s, storing in custom_fields BSON", fieldName)
-			bsonFields["custom_fields"][fieldName] = value
+			// Store in custom data BSON
+			customData[fieldName] = value
 		}
 	}
 
-	return fixedRow, bsonFields, nil
+	return fixedFields, customData, nil
 }
 
-// hybridRowToProtobuf converts hybrid row data back to a TicketData protobuf
-func (p *PostgreSQLDocumentDBStorage) hybridRowToProtobuf(fixedRow map[string]interface{}, bsonFields map[string][]byte) *ticketpb.TicketData {
+// hybridDataToProtobuf converts fixed fields + custom data back to protobuf
+func (p *PostgreSQLDocumentDBStorage) hybridDataToProtobuf(fixedRow map[string]interface{}, customDataBytes []byte) *ticketpb.TicketData {
 	ticketData := &ticketpb.TicketData{
 		Fields: make(map[string]*ticketpb.FieldValue),
 	}
-
-	mapping := p.getFieldMapping()
 
 	// Extract core fields
 	if ticketID, ok := fixedRow["ticket_id"].(string); ok {
 		ticketData.Id = ticketID
 	}
-
 	if createdAt, ok := fixedRow["created_at"].(time.Time); ok {
 		ticketData.CreatedAt = createdAt.Format(time.RFC3339)
 	}
@@ -400,96 +283,31 @@ func (p *PostgreSQLDocumentDBStorage) hybridRowToProtobuf(fixedRow map[string]in
 		ticketData.UpdatedAt = updatedAt.Format(time.RFC3339)
 	}
 
-	// Process fixed schema fields
-	for protoField, dbColumn := range mapping.FixedFields {
-		if value, exists := fixedRow[dbColumn]; exists && value != nil {
-			fieldValue := &ticketpb.FieldValue{}
-
-			switch v := value.(type) {
-			case string:
-				fieldValue.Value = &ticketpb.FieldValue_StringValue{StringValue: v}
-			case int64:
-				fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: v}
-			case int32:
-				fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: int64(v)}
-			case int:
-				fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: int64(v)}
-			case float64:
-				fieldValue.Value = &ticketpb.FieldValue_DoubleValue{DoubleValue: v}
-			case bool:
-				fieldValue.Value = &ticketpb.FieldValue_BoolValue{BoolValue: v}
-			default:
-				// Convert to string as fallback
-				fieldValue.Value = &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)}
-			}
-
-			ticketData.Fields[protoField] = fieldValue
+	// Process fixed fields
+	for fieldName, value := range fixedRow {
+		// Skip core fields that are handled separately
+		if fieldName == "id" || fieldName == "ticket_id" || fieldName == "created_at" || fieldName == "updated_at" {
+			continue
 		}
-	}
 
-	// Process dynamic fields from BSON columns
-	for protoField, bsonInfo := range mapping.DynamicFields {
-		if bsonData, exists := bsonFields[bsonInfo.BSONColumn]; exists && len(bsonData) > 0 {
-			// Parse BSON data
-			var bsonDoc bson.M
-			if err := bson.Unmarshal(bsonData, &bsonDoc); err == nil {
-				// Extract field value from BSON document
-				if value, exists := bsonDoc[bsonInfo.FieldPath]; exists && value != nil {
-					fieldValue := &ticketpb.FieldValue{}
-
-					switch bsonInfo.DataType {
-					case "string":
-						if strVal, ok := value.(string); ok {
-							fieldValue.Value = &ticketpb.FieldValue_StringValue{StringValue: strVal}
-						}
-					case "number":
-						switch v := value.(type) {
-						case int32:
-							fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: int64(v)}
-						case int64:
-							fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: v}
-						case float64:
-							fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: int64(v)}
-						}
-					case "boolean":
-						if boolVal, ok := value.(bool); ok {
-							fieldValue.Value = &ticketpb.FieldValue_BoolValue{BoolValue: boolVal}
-						}
-					default:
-						// Convert to string as fallback
-						fieldValue.Value = &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", value)}
-					}
-
-					if fieldValue.Value != nil {
-						ticketData.Fields[protoField] = fieldValue
-					}
-				}
+		if value != nil {
+			fieldValue := interfaceToFieldValue(value)
+			if fieldValue != nil {
+				ticketData.Fields[fieldName] = fieldValue
 			}
 		}
 	}
 
-	// Process any custom fields from custom_fields BSON column
-	if customBsonData, exists := bsonFields["custom_fields"]; exists && len(customBsonData) > 0 {
-		var customDoc bson.M
-		if err := bson.Unmarshal(customBsonData, &customDoc); err == nil {
-			for field, value := range customDoc {
+	// Process custom data from BSON
+	if len(customDataBytes) > 0 {
+		var customData map[string]interface{}
+		if err := json.Unmarshal(customDataBytes, &customData); err == nil {
+			for fieldName, value := range customData {
 				if value != nil {
-					fieldValue := &ticketpb.FieldValue{}
-					switch v := value.(type) {
-					case string:
-						fieldValue.Value = &ticketpb.FieldValue_StringValue{StringValue: v}
-					case int32:
-						fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: int64(v)}
-					case int64:
-						fieldValue.Value = &ticketpb.FieldValue_IntValue{IntValue: v}
-					case float64:
-						fieldValue.Value = &ticketpb.FieldValue_DoubleValue{DoubleValue: v}
-					case bool:
-						fieldValue.Value = &ticketpb.FieldValue_BoolValue{BoolValue: v}
-					default:
-						fieldValue.Value = &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)}
+					fieldValue := interfaceToFieldValue(value)
+					if fieldValue != nil {
+						ticketData.Fields[fieldName] = fieldValue
 					}
-					ticketData.Fields[field] = fieldValue
 				}
 			}
 		}
@@ -498,17 +316,7 @@ func (p *PostgreSQLDocumentDBStorage) hybridRowToProtobuf(fixedRow map[string]in
 	return ticketData
 }
 
-// Helper function to check if slice contains string
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-// CreateTicket stores a new ticket in the PostgreSQL hybrid table
+// CreateTicket stores a new ticket
 func (p *PostgreSQLDocumentDBStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -518,35 +326,26 @@ func (p *PostgreSQLDocumentDBStorage) CreateTicket(ticketData *ticketpb.TicketDa
 		ticketData.Id = p.generateTicketID()
 	}
 
-	// Convert protobuf to hybrid row (isUpdate = false for create)
-	fixedRow, bsonFields, err := p.protobufToHybridRow(ticketData, false)
+	// Convert protobuf to fixed fields + custom data
+	fixedFields, customData, err := p.protobufToHybridData(ticketData, false)
 	if err != nil {
-		return fmt.Errorf("failed to convert protobuf to hybrid row: %w", err), nil
+		return fmt.Errorf("failed to convert protobuf to hybrid data: %w", err), nil
 	}
 
-	// Convert BSON fields to binary format for PostgreSQL BSON storage
-	for columnName, bsonDoc := range bsonFields {
-		if len(bsonDoc) > 0 {
-			bsonBytes, err := bson.Marshal(bsonDoc)
-			if err != nil {
-				return fmt.Errorf("failed to marshal BSON for %s: %w", columnName, err), nil
-			}
-			fixedRow[columnName] = bsonBytes
-		} else {
-			// Set empty BSON document
-			emptyBson, _ := bson.Marshal(bson.M{})
-			fixedRow[columnName] = emptyBson
-		}
+	// Serialize custom data to JSON string
+	customDataJSON, err := json.Marshal(customData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal custom data: %w", err), nil
 	}
-	fixedRow["schema_version"] = 1
+	fixedFields["custom_data"] = string(customDataJSON)
 
-	// Build INSERT query dynamically
-	columns := make([]string, 0, len(fixedRow))
-	placeholders := make([]string, 0, len(fixedRow))
-	values := make([]interface{}, 0, len(fixedRow))
+	// Build dynamic INSERT query
+	columns := make([]string, 0, len(fixedFields))
+	placeholders := make([]string, 0, len(fixedFields))
+	values := make([]interface{}, 0, len(fixedFields))
 
 	i := 1
-	for column, value := range fixedRow {
+	for column, value := range fixedFields {
 		columns = append(columns, column)
 		placeholders = append(placeholders, fmt.Sprintf("$%d", i))
 		values = append(values, value)
@@ -563,10 +362,10 @@ func (p *PostgreSQLDocumentDBStorage) CreateTicket(ticketData *ticketpb.TicketDa
 	var generatedID int64
 	err = p.db.QueryRowContext(ctx, insertSQL, values...).Scan(&generatedID)
 	if err != nil {
-		return fmt.Errorf("failed to create ticket in hybrid table %s: %w", p.tableName, err), nil
+		return fmt.Errorf("failed to create ticket: %w", err), nil
 	}
 
-	log.Printf("Created ticket %s in hybrid table %s with ID %d", ticketData.Id, p.tableName, generatedID)
+	log.Printf("Created ticket %s with ID %d", ticketData.Id, generatedID)
 
 	result := map[string]interface{}{
 		"id":        generatedID,
@@ -576,17 +375,16 @@ func (p *PostgreSQLDocumentDBStorage) CreateTicket(ticketData *ticketpb.TicketDa
 	return nil, result
 }
 
-// GetTicket retrieves a ticket by ID from the PostgreSQL hybrid table
+// GetTicket retrieves a ticket by ID
 func (p *PostgreSQLDocumentDBStorage) GetTicket(id string, store jetstream.KeyValue) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Query for the ticket
 	query := fmt.Sprintf("SELECT * FROM %s WHERE ticket_id = $1", p.tableName)
 
 	rows, err := p.db.QueryContext(ctx, query, id)
 	if err != nil {
-		log.Printf("ERROR: Failed to query ticket %s from hybrid table %s: %v", id, p.tableName, err)
+		log.Printf("ERROR: Failed to query ticket %s: %v", id, err)
 		return nil, false
 	}
 	defer rows.Close()
@@ -615,16 +413,18 @@ func (p *PostgreSQLDocumentDBStorage) GetTicket(id string, store jetstream.KeyVa
 		return nil, false
 	}
 
-	// Convert to map and extract BSON fields
+	// Convert to map
 	rowMap := make(map[string]interface{})
-	bsonFields := make(map[string][]byte)
-	bsonColumns := []string{"dynamic_fields", "user_fields", "timing_fields", "workflow_fields", "custom_fields"}
+	var customDataBytes []byte
 
 	for i, column := range columns {
-		if contains(bsonColumns, column) {
+		if column == "custom_data" {
 			if values[i] != nil {
-				if bsonBytes, ok := values[i].([]byte); ok {
-					bsonFields[column] = bsonBytes
+				switch v := values[i].(type) {
+				case []byte:
+					customDataBytes = v
+				case string:
+					customDataBytes = []byte(v)
 				}
 			}
 		} else {
@@ -633,48 +433,40 @@ func (p *PostgreSQLDocumentDBStorage) GetTicket(id string, store jetstream.KeyVa
 	}
 
 	// Convert to protobuf
-	ticketData := p.hybridRowToProtobuf(rowMap, bsonFields)
+	ticketData := p.hybridDataToProtobuf(rowMap, customDataBytes)
 
-	log.Printf("Retrieved ticket %s from hybrid table %s", id, p.tableName)
+	log.Printf("Retrieved ticket %s", id)
 	return ticketData, true
 }
 
-// UpdateTicket updates an existing ticket in the PostgreSQL hybrid table
+// UpdateTicket updates an existing ticket
 func (p *PostgreSQLDocumentDBStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Convert protobuf to hybrid row (isUpdate = true for update)
-	fixedRow, bsonFields, err := p.protobufToHybridRow(ticketData, true)
+	// Convert protobuf to fixed fields + custom data
+	fixedFields, customData, err := p.protobufToHybridData(ticketData, true)
 	if err != nil {
-		log.Printf("ERROR: Failed to convert protobuf to hybrid row: %v", err)
+		log.Printf("ERROR: Failed to convert protobuf to hybrid data: %v", err)
 		return false
 	}
 
-	// Convert BSON fields to binary format for PostgreSQL BSON storage
-	for columnName, bsonDoc := range bsonFields {
-		if len(bsonDoc) > 0 {
-			bsonBytes, err := bson.Marshal(bsonDoc)
-			if err != nil {
-				log.Printf("ERROR: Failed to marshal BSON for %s: %v", columnName, err)
-				return false
-			}
-			fixedRow[columnName] = bsonBytes
-		} else {
-			// Set empty BSON document
-			emptyBson, _ := bson.Marshal(bson.M{})
-			fixedRow[columnName] = emptyBson
-		}
+	// Serialize custom data to JSON string
+	customDataJSON, err := json.Marshal(customData)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal custom data: %v", err)
+		return false
 	}
+	fixedFields["custom_data"] = string(customDataJSON)
 
-	// Build UPDATE query dynamically
-	setParts := make([]string, 0, len(fixedRow))
-	values := make([]interface{}, 0, len(fixedRow)+1)
+	// Build dynamic UPDATE query
+	setParts := make([]string, 0, len(fixedFields))
+	values := make([]interface{}, 0, len(fixedFields)+1)
 
 	i := 1
-	for column, value := range fixedRow {
+	for column, value := range fixedFields {
 		if column == "ticket_id" || column == "created_at" || column == "createdtime" {
-			continue // Don't update these immutable fields
+			continue // Don't update immutable fields
 		}
 		setParts = append(setParts, fmt.Sprintf("%s = $%d", column, i))
 		values = append(values, value)
@@ -693,7 +485,7 @@ func (p *PostgreSQLDocumentDBStorage) UpdateTicket(ticketData *ticketpb.TicketDa
 
 	result, err := p.db.ExecContext(ctx, updateSQL, values...)
 	if err != nil {
-		log.Printf("ERROR: Failed to update ticket in hybrid table %s: %v", p.tableName, err)
+		log.Printf("ERROR: Failed to update ticket: %v", err)
 		return false
 	}
 
@@ -704,31 +496,30 @@ func (p *PostgreSQLDocumentDBStorage) UpdateTicket(ticketData *ticketpb.TicketDa
 	}
 
 	if rowsAffected == 0 {
-		log.Printf("No ticket found with ID %s in hybrid table %s", ticketData.Id, p.tableName)
+		log.Printf("No ticket found with ID %s", ticketData.Id)
 		return false
 	}
 
-	log.Printf("Updated ticket %s in hybrid table %s", ticketData.Id, p.tableName)
+	log.Printf("Updated ticket %s", ticketData.Id)
 	return true
 }
 
-// DeleteTicket removes a ticket from the PostgreSQL hybrid table
+// DeleteTicket removes a ticket
 func (p *PostgreSQLDocumentDBStorage) DeleteTicket(id string) (*ticketpb.TicketData, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// First, get the ticket to return it
+	// First get the ticket to return it
 	ticketData, exists := p.GetTicket(id, nil)
 	if !exists {
 		return nil, false
 	}
 
-	// Delete the ticket
 	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE ticket_id = $1", p.tableName)
 
 	result, err := p.db.ExecContext(ctx, deleteSQL, id)
 	if err != nil {
-		log.Printf("ERROR: Failed to delete ticket %s from hybrid table %s: %v", id, p.tableName, err)
+		log.Printf("ERROR: Failed to delete ticket %s: %v", id, err)
 		return nil, false
 	}
 
@@ -742,88 +533,38 @@ func (p *PostgreSQLDocumentDBStorage) DeleteTicket(id string) (*ticketpb.TicketD
 		return nil, false
 	}
 
-	log.Printf("Deleted ticket %s from hybrid table %s", id, p.tableName)
+	log.Printf("Deleted ticket %s", id)
 	return ticketData, true
 }
 
-// ListTickets retrieves all tickets from the PostgreSQL hybrid table
+// ListTickets retrieves all tickets
 func (p *PostgreSQLDocumentDBStorage) ListTickets(store jetstream.KeyValue) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Query all tickets
 	query := fmt.Sprintf("SELECT * FROM %s ORDER BY created_at DESC", p.tableName)
 
 	rows, err := p.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query tickets from hybrid table %s: %w", p.tableName, err)
+		return nil, fmt.Errorf("failed to query tickets: %w", err)
 	}
 	defer rows.Close()
 
-	var tickets []*ticketpb.TicketData
-
-	// Get column names
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get columns: %w", err)
-	}
-
-	for rows.Next() {
-		// Create slice to hold values
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		// Scan the row
-		if err := rows.Scan(valuePtrs...); err != nil {
-			log.Printf("ERROR: Failed to scan row: %v", err)
-			continue
-		}
-
-		// Convert to map and extract BSON fields
-		rowMap := make(map[string]interface{})
-		bsonFields := make(map[string][]byte)
-		bsonColumns := []string{"dynamic_fields", "user_fields", "timing_fields", "workflow_fields", "custom_fields"}
-
-		for i, column := range columns {
-			if contains(bsonColumns, column) {
-				if values[i] != nil {
-					if bsonBytes, ok := values[i].([]byte); ok {
-						bsonFields[column] = bsonBytes
-					}
-				}
-			} else {
-				rowMap[column] = values[i]
-			}
-		}
-
-		// Convert to protobuf
-		ticketData := p.hybridRowToProtobuf(rowMap, bsonFields)
-		tickets = append(tickets, ticketData)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
-	}
-
-	log.Printf("Retrieved %d tickets from hybrid table %s", len(tickets), p.tableName)
-	return tickets, nil
+	return p.processRows(rows)
 }
 
-// SearchTickets searches for tickets based on conditions
+// SearchTickets performs a search with dynamic field detection
 func (p *PostgreSQLDocumentDBStorage) SearchTickets(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	return p.SearchTicketsWithProjection(request)
 }
 
-// SearchTicketsWithProjection searches for tickets with optional field projection
+// SearchTicketsWithProjection performs a search with field projection
 func (p *PostgreSQLDocumentDBStorage) SearchTicketsWithProjection(request SearchRequest) ([]*ticketpb.TicketData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Build WHERE clause for both fixed and dynamic fields
-	whereClause, values, err := p.buildHybridWhereClause(request.Conditions)
+	// Build WHERE clause with dynamic field detection
+	whereClause, values, err := p.buildDynamicWhereClause(request.Conditions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build WHERE clause: %w", err)
 	}
@@ -831,214 +572,148 @@ func (p *PostgreSQLDocumentDBStorage) SearchTicketsWithProjection(request Search
 	// Build ORDER BY clause
 	orderByClause := p.buildOrderByClause(request.SortFields)
 
+	// Build SELECT clause with projection
+	selectClause := p.buildSelectClause(request.ProjectedFields)
+
 	// Build complete query
 	var query string
 	if whereClause != "" {
-		query = fmt.Sprintf("SELECT * FROM %s WHERE %s %s", p.tableName, whereClause, orderByClause)
+		query = fmt.Sprintf("%s FROM %s WHERE %s %s", selectClause, p.tableName, whereClause, orderByClause)
 	} else {
-		query = fmt.Sprintf("SELECT * FROM %s %s", p.tableName, orderByClause)
+		query = fmt.Sprintf("%s FROM %s %s", selectClause, p.tableName, orderByClause)
 	}
 
-	// Execute query
 	rows, err := p.db.QueryContext(ctx, query, values...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute search query: %w", err)
 	}
 	defer rows.Close()
 
-	var tickets []*ticketpb.TicketData
-
-	// Get column names
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get columns: %w", err)
-	}
-
-	for rows.Next() {
-		// Create slice to hold values
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		// Scan the row
-		if err := rows.Scan(valuePtrs...); err != nil {
-			log.Printf("ERROR: Failed to scan row: %v", err)
-			continue
-		}
-
-		// Convert to map and extract BSON fields
-		rowMap := make(map[string]interface{})
-		bsonFields := make(map[string][]byte)
-		bsonColumns := []string{"dynamic_fields", "user_fields", "timing_fields", "workflow_fields", "custom_fields"}
-
-		for i, column := range columns {
-			if contains(bsonColumns, column) {
-				if values[i] != nil {
-					if bsonBytes, ok := values[i].([]byte); ok {
-						bsonFields[column] = bsonBytes
-					}
-				}
-			} else {
-				rowMap[column] = values[i]
-			}
-		}
-
-		// Convert to protobuf
-		ticketData := p.hybridRowToProtobuf(rowMap, bsonFields)
-
-		// Apply field projection if requested
-		if len(request.ProjectedFields) > 0 {
-			ticketData = p.applyFieldProjection(ticketData, request.ProjectedFields)
-		}
-
-		tickets = append(tickets, ticketData)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
-	}
-
-	log.Printf("Found %d tickets matching search criteria in hybrid table", len(tickets))
-	return tickets, nil
+	return p.processRows(rows)
 }
 
-// buildHybridWhereClause builds a WHERE clause for hybrid schema (fixed + dynamic fields)
-func (p *PostgreSQLDocumentDBStorage) buildHybridWhereClause(conditions []SearchCondition) (string, []interface{}, error) {
+// buildDynamicWhereClause builds WHERE clause with automatic field detection
+func (p *PostgreSQLDocumentDBStorage) buildDynamicWhereClause(conditions []SearchCondition) (string, []interface{}, error) {
+	if len(conditions) == 0 {
+		return "", nil, nil
+	}
+
+	fixedFields := p.getFixedFields()
 	var whereParts []string
 	var values []interface{}
 	paramIndex := 1
 
-	if len(conditions) == 0 {
-		return "", values, nil
-	}
-
-	mapping := p.getFieldMapping()
-
 	for _, condition := range conditions {
+		fieldName := strings.ToLower(condition.Operand)
+
 		var clause string
 
-		// Check if field is in fixed schema
-		if dbColumn, isFixed := mapping.FixedFields[condition.Operand]; isFixed {
-			// Handle fixed schema field
-			switch strings.ToLower(condition.Operator) {
-			case "eq", "=":
-				clause = fmt.Sprintf("%s = $%d", dbColumn, paramIndex)
-				values = append(values, condition.Value)
-			case "ne", "!=":
-				clause = fmt.Sprintf("%s != $%d", dbColumn, paramIndex)
-				values = append(values, condition.Value)
-			case "gt", ">":
-				clause = fmt.Sprintf("%s > $%d", dbColumn, paramIndex)
-				values = append(values, condition.Value)
-			case "gte", ">=":
-				clause = fmt.Sprintf("%s >= $%d", dbColumn, paramIndex)
-				values = append(values, condition.Value)
-			case "lt", "<":
-				clause = fmt.Sprintf("%s < $%d", dbColumn, paramIndex)
-				values = append(values, condition.Value)
-			case "lte", "<=":
-				clause = fmt.Sprintf("%s <= $%d", dbColumn, paramIndex)
-				values = append(values, condition.Value)
-			case "contains":
-				clause = fmt.Sprintf("%s ILIKE $%d", dbColumn, paramIndex)
-				values = append(values, fmt.Sprintf("%%%v%%", condition.Value))
-			case "begins_with":
-				clause = fmt.Sprintf("%s ILIKE $%d", dbColumn, paramIndex)
-				values = append(values, fmt.Sprintf("%v%%", condition.Value))
-			default:
-				return "", nil, fmt.Errorf("unsupported operator for fixed field: %s", condition.Operator)
-			}
-		} else if bsonInfo, isDynamic := mapping.DynamicFields[condition.Operand]; isDynamic {
-			// Handle dynamic field in BSON
-			bsonField := fmt.Sprintf("%s->>'%s'", bsonInfo.BSONColumn, bsonInfo.FieldPath)
-
-			switch strings.ToLower(condition.Operator) {
-			case "eq", "=":
-				if bsonInfo.DataType == "string" {
-					clause = fmt.Sprintf("%s = $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else if bsonInfo.DataType == "number" {
-					clause = fmt.Sprintf("(%s)::bigint = $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else if bsonInfo.DataType == "boolean" {
-					clause = fmt.Sprintf("(%s)::boolean = $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				}
-			case "ne", "!=":
-				if bsonInfo.DataType == "string" {
-					clause = fmt.Sprintf("%s != $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else if bsonInfo.DataType == "number" {
-					clause = fmt.Sprintf("(%s)::bigint != $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else if bsonInfo.DataType == "boolean" {
-					clause = fmt.Sprintf("(%s)::boolean != $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				}
-			case "gt", ">":
-				if bsonInfo.DataType == "number" {
-					clause = fmt.Sprintf("(%s)::bigint > $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else {
-					return "", nil, fmt.Errorf("gt operator only supported for number fields")
-				}
-			case "gte", ">=":
-				if bsonInfo.DataType == "number" {
-					clause = fmt.Sprintf("(%s)::bigint >= $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else {
-					return "", nil, fmt.Errorf("gte operator only supported for number fields")
-				}
-			case "lt", "<":
-				if bsonInfo.DataType == "number" {
-					clause = fmt.Sprintf("(%s)::bigint < $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else {
-					return "", nil, fmt.Errorf("lt operator only supported for number fields")
-				}
-			case "lte", "<=":
-				if bsonInfo.DataType == "number" {
-					clause = fmt.Sprintf("(%s)::bigint <= $%d", bsonField, paramIndex)
-					values = append(values, condition.Value)
-				} else {
-					return "", nil, fmt.Errorf("lte operator only supported for number fields")
-				}
-			case "contains":
-				if bsonInfo.DataType == "string" {
-					clause = fmt.Sprintf("%s ILIKE $%d", bsonField, paramIndex)
-					values = append(values, fmt.Sprintf("%%%v%%", condition.Value))
-				} else {
-					return "", nil, fmt.Errorf("contains operator only supported for string fields")
-				}
-			default:
-				return "", nil, fmt.Errorf("unsupported operator for dynamic field: %s", condition.Operator)
-			}
+		if fixedFields[fieldName] {
+			// Fixed field - query column directly
+			clause = p.buildFixedFieldCondition(fieldName, condition, paramIndex)
 		} else {
-			// Unknown field - search in all BSON columns
-			clause = fmt.Sprintf("(dynamic_fields::text ILIKE $%d OR user_fields::text ILIKE $%d OR timing_fields::text ILIKE $%d OR workflow_fields::text ILIKE $%d OR custom_fields::text ILIKE $%d)",
-				paramIndex, paramIndex+1, paramIndex+2, paramIndex+3, paramIndex+4)
-			searchTerm := fmt.Sprintf("%%%s%%", condition.Value)
-			values = append(values, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm)
-			paramIndex += 4 // We added 5 parameters, but the loop will increment by 1
+			// Custom field - query BSON
+			clause = p.buildCustomFieldCondition(condition.Operand, condition, paramIndex)
 		}
 
 		whereParts = append(whereParts, clause)
+		values = append(values, condition.Value)
 		paramIndex++
 	}
 
-	whereClause := strings.Join(whereParts, " AND ")
-	return whereClause, values, nil
+	return strings.Join(whereParts, " AND "), values, nil
 }
 
-// buildOrderByClause builds an ORDER BY clause from sort fields
-func (p *PostgreSQLDocumentDBStorage) buildOrderByClause(sortFields []SortField) string {
-	if len(sortFields) == 0 {
-		return "ORDER BY created_at DESC" // Default sort
+// buildFixedFieldCondition builds condition for fixed schema fields
+func (p *PostgreSQLDocumentDBStorage) buildFixedFieldCondition(fieldName string, condition SearchCondition, paramIndex int) string {
+	switch strings.ToLower(condition.Operator) {
+	case "eq", "=":
+		return fmt.Sprintf("%s = $%d", fieldName, paramIndex)
+	case "ne", "!=":
+		return fmt.Sprintf("%s != $%d", fieldName, paramIndex)
+	case "gt", ">":
+		return fmt.Sprintf("%s > $%d", fieldName, paramIndex)
+	case "gte", ">=":
+		return fmt.Sprintf("%s >= $%d", fieldName, paramIndex)
+	case "lt", "<":
+		return fmt.Sprintf("%s < $%d", fieldName, paramIndex)
+	case "lte", "<=":
+		return fmt.Sprintf("%s <= $%d", fieldName, paramIndex)
+	case "contains", "like":
+		return fmt.Sprintf("%s ILIKE $%d", fieldName, paramIndex)
+	case "begins_with", "startswith":
+		return fmt.Sprintf("%s ILIKE $%d", fieldName, paramIndex)
+	default:
+		return fmt.Sprintf("%s = $%d", fieldName, paramIndex)
+	}
+}
+
+// buildCustomFieldCondition builds condition for custom BSON fields
+func (p *PostgreSQLDocumentDBStorage) buildCustomFieldCondition(fieldName string, condition SearchCondition, paramIndex int) string {
+	switch strings.ToLower(condition.Operator) {
+	case "eq", "=":
+		return fmt.Sprintf("custom_data->>'%s' = $%d", fieldName, paramIndex)
+	case "ne", "!=":
+		return fmt.Sprintf("custom_data->>'%s' != $%d", fieldName, paramIndex)
+	case "gt", ">":
+		return fmt.Sprintf("(custom_data->>'%s')::numeric > $%d", fieldName, paramIndex)
+	case "gte", ">=":
+		return fmt.Sprintf("(custom_data->>'%s')::numeric >= $%d", fieldName, paramIndex)
+	case "lt", "<":
+		return fmt.Sprintf("(custom_data->>'%s')::numeric < $%d", fieldName, paramIndex)
+	case "lte", "<=":
+		return fmt.Sprintf("(custom_data->>'%s')::numeric <= $%d", fieldName, paramIndex)
+	case "contains", "like":
+		return fmt.Sprintf("custom_data->>'%s' ILIKE $%d", fieldName, paramIndex)
+	case "begins_with", "startswith":
+		return fmt.Sprintf("custom_data->>'%s' ILIKE $%d", fieldName, paramIndex)
+	default:
+		return fmt.Sprintf("custom_data->>'%s' = $%d", fieldName, paramIndex)
+	}
+}
+
+// buildSelectClause builds SELECT clause with projection
+func (p *PostgreSQLDocumentDBStorage) buildSelectClause(projectedFields []string) string {
+	if len(projectedFields) == 0 {
+		return "SELECT *"
 	}
 
-	mapping := p.getFieldMapping()
+	fixedFields := p.getFixedFields()
+	var selectParts []string
+
+	// Always include core fields
+	selectParts = append(selectParts, "id", "ticket_id", "created_at", "updated_at", "custom_data")
+
+	for _, field := range projectedFields {
+		fieldLower := strings.ToLower(field)
+		if fixedFields[fieldLower] {
+			// Include fixed field if not already included
+			found := false
+			for _, existing := range selectParts {
+				if existing == fieldLower {
+					found = true
+					break
+				}
+			}
+			if !found {
+				selectParts = append(selectParts, fieldLower)
+			}
+		} else {
+			// Add custom field extraction
+			selectParts = append(selectParts, fmt.Sprintf("custom_data->>'%s' as %s", field, field))
+		}
+	}
+
+	return "SELECT " + strings.Join(selectParts, ", ")
+}
+
+// buildOrderByClause builds ORDER BY clause
+func (p *PostgreSQLDocumentDBStorage) buildOrderByClause(sortFields []SortField) string {
+	if len(sortFields) == 0 {
+		return "ORDER BY created_at DESC"
+	}
+
+	fixedFields := p.getFixedFields()
 	var orderParts []string
 
 	for _, sortField := range sortFields {
@@ -1047,55 +722,78 @@ func (p *PostgreSQLDocumentDBStorage) buildOrderByClause(sortFields []SortField)
 			direction = "DESC"
 		}
 
-		// Check if field is in fixed schema
-		if dbColumn, isFixed := mapping.FixedFields[sortField.Field]; isFixed {
-			orderParts = append(orderParts, fmt.Sprintf("%s %s", dbColumn, direction))
-		} else if bsonInfo, isDynamic := mapping.DynamicFields[sortField.Field]; isDynamic {
-			// Handle dynamic field sorting in BSON
-			if bsonInfo.DataType == "number" {
-				bsonField := fmt.Sprintf("(%s->>'%s')::bigint", bsonInfo.BSONColumn, bsonInfo.FieldPath)
-				orderParts = append(orderParts, fmt.Sprintf("%s %s", bsonField, direction))
-			} else {
-				bsonField := fmt.Sprintf("%s->>'%s'", bsonInfo.BSONColumn, bsonInfo.FieldPath)
-				orderParts = append(orderParts, fmt.Sprintf("%s %s", bsonField, direction))
-			}
+		fieldLower := strings.ToLower(sortField.Field)
+		if fixedFields[fieldLower] {
+			orderParts = append(orderParts, fmt.Sprintf("%s %s", fieldLower, direction))
+		} else {
+			// Sort by custom field (try numeric first, fall back to text)
+			orderParts = append(orderParts,
+				fmt.Sprintf("COALESCE((custom_data->>'%s')::numeric, 0) %s, custom_data->>'%s' %s",
+					sortField.Field, direction, sortField.Field, direction))
 		}
 	}
 
 	if len(orderParts) == 0 {
-		return "ORDER BY created_at DESC" // Fallback
+		return "ORDER BY created_at DESC"
 	}
 
 	return "ORDER BY " + strings.Join(orderParts, ", ")
 }
 
-// applyFieldProjection filters ticket fields based on projected fields
-func (p *PostgreSQLDocumentDBStorage) applyFieldProjection(ticketData *ticketpb.TicketData, projectedFields []string) *ticketpb.TicketData {
-	if len(projectedFields) == 0 {
-		return ticketData
+// processRows processes query result rows
+func (p *PostgreSQLDocumentDBStorage) processRows(rows *sql.Rows) ([]*ticketpb.TicketData, error) {
+	var tickets []*ticketpb.TicketData
+
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns: %w", err)
 	}
 
-	projectedTicket := &ticketpb.TicketData{
-		Id:        ticketData.Id,
-		CreatedAt: ticketData.CreatedAt,
-		UpdatedAt: ticketData.UpdatedAt,
-		Fields:    make(map[string]*ticketpb.FieldValue),
-	}
-
-	// Create map for quick lookup
-	projectedFieldsMap := make(map[string]bool)
-	for _, field := range projectedFields {
-		projectedFieldsMap[field] = true
-	}
-
-	// Copy only projected fields
-	for fieldName, fieldValue := range ticketData.Fields {
-		if projectedFieldsMap[fieldName] {
-			projectedTicket.Fields[fieldName] = fieldValue
+	for rows.Next() {
+		// Create slice to hold values
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
 		}
+
+		// Scan the row
+		if err := rows.Scan(valuePtrs...); err != nil {
+			log.Printf("ERROR: Failed to scan row: %v", err)
+			continue
+		}
+
+		// Convert to map
+		rowMap := make(map[string]interface{})
+		var customDataBytes []byte
+
+		for i, column := range columns {
+			if column == "custom_data" {
+				if values[i] != nil {
+					switch v := values[i].(type) {
+					case []byte:
+						customDataBytes = v
+					case string:
+						customDataBytes = []byte(v)
+					}
+				}
+			} else {
+				rowMap[column] = values[i]
+			}
+		}
+
+		// Convert to protobuf
+		ticketData := p.hybridDataToProtobuf(rowMap, customDataBytes)
+		tickets = append(tickets, ticketData)
 	}
 
-	return projectedTicket
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	log.Printf("Processed %d tickets", len(tickets))
+	return tickets, nil
 }
 
 // Close closes the database connection
