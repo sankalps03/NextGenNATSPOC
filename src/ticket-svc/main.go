@@ -39,7 +39,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "pg_documentdb", "scylladb", or "mongodb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -903,7 +903,7 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
-		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
+		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://documentdb:postgres@localhost:5433/postgres?sslmode=disable"),
 		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
 		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
 		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),
@@ -1023,7 +1023,8 @@ func promptForStorageType() string {
 		fmt.Println("4. PostgreSQL EAV")
 		fmt.Println("5. ScyllaDB")
 		fmt.Println("6. MongoDB")
-		fmt.Print("Enter your choice (1, 2, 3, 4, 5, or 6): ")
+		fmt.Println("7. PostgreSQL DocumentDB")
+		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6, or 7): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1051,8 +1052,11 @@ func promptForStorageType() string {
 		case "6":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
+		case "7":
+			fmt.Println("Selected: PostgreSQL DocumentDB")
+			return "pg_documentdb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, or 6.")
+			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, 6, or 7.")
 		}
 	}
 }
@@ -1163,6 +1167,16 @@ func main() {
 		storage = mongoStorage
 		log.Printf("Using MongoDB storage with connection: %s, database: %s, base collection: %s",
 			maskConnectionString(mongoURL), config.MongoDBDatabase, config.MongoDBCollection)
+	case "pg_documentdb":
+		pgDocumentDBStorage, err := storage2.NewPostgreSQLDocumentDBStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL DocumentDB storage: %v", err)
+
+			return
+		}
+		storage = pgDocumentDBStorage
+		log.Printf("Using PostgreSQL DocumentDB storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}
