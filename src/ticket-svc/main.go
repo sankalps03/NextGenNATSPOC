@@ -582,6 +582,8 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	}
 	dbLatency := time.Since(dbStart)
 
+	log.Printf("DB latency : %s", dbLatency)
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to search tickets: %w", err)
 	}

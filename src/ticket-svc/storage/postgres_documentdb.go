@@ -583,11 +583,17 @@ func (p *PostgreSQLDocumentDBStorage) SearchTicketsWithProjection(request Search
 		query = fmt.Sprintf("%s FROM %s %s", selectClause, p.tableName, orderByClause)
 	}
 
+	dbStart := time.Now()
+
 	rows, err := p.db.QueryContext(ctx, query, values...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute search query: %w", err)
 	}
 	defer rows.Close()
+
+	dbLatency := time.Since(dbStart)
+
+	log.Printf("DB Query execution time : %s", dbLatency)
 
 	return p.processRows(rows)
 }

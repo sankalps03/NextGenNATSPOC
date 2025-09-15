@@ -379,6 +379,12 @@ func (g *Generator) processCreateData(fields map[string]interface{}) map[string]
 		}
 	}
 
+	// Add 20 additional custom fields from the business scenarios
+	additionalFields := g.generateAdditionalBusinessFields()
+	for key, value := range additionalFields {
+		processed[key] = value
+	}
+
 	// Add default values for required fields if missing
 	for _, requiredField := range g.config.Operations.Create.RequiredFields {
 		if _, exists := processed[requiredField]; !exists {
@@ -479,6 +485,232 @@ func (g *Generator) generateRandomString(length int) string {
 		result[i] = charset[g.rand.Intn(len(charset))]
 	}
 	return string(result)
+}
+
+// generateAdditionalBusinessFields generates 20 additional fields from business scenarios
+func (g *Generator) generateAdditionalBusinessFields() map[string]interface{} {
+	// Define all possible business fields with their data generators
+	allPossibleFields := map[string]func() interface{}{
+		// Customer fields
+		"customer_id": func() interface{} {
+			customerIDs := []string{"CUST-456789", "CUST-123456", "CUST-789012", "CUST-345678", "CUST-567890", "CUST-234567"}
+			return customerIDs[g.rand.Intn(len(customerIDs))]
+		},
+		"name": func() interface{} {
+			names := []string{"Sarah Johnson", "Michael Chen", "Robert Wilson", "Jane Elizabeth Doe", "David Smith", "Emily Brown", "Alex Garcia", "Maria Rodriguez"}
+			return names[g.rand.Intn(len(names))]
+		},
+		"email": func() interface{} {
+			emails := []string{"sarah.j@gmail.com", "michael.c@company.com", "robert.w@hospital.org", "jane.doe@company.com", "david.smith@tech.com", "emily.brown@startup.io"}
+			return emails[g.rand.Intn(len(emails))]
+		},
+		"phone": func() interface{} {
+			phones := []string{"+1-555-0123", "+1-555-0456", "+1-555-0789", "+1-555-0234", "+1-555-0567"}
+			return phones[g.rand.Intn(len(phones))]
+		},
+		"loyalty_status": func() interface{} {
+			statuses := []string{"gold", "silver", "bronze", "platinum", "diamond"}
+			return statuses[g.rand.Intn(len(statuses))]
+		},
+		"lifetime_value": func() interface{} {
+			return g.rand.Intn(50000) + 5000 // 5000-55000
+		},
+		"account_type": func() interface{} {
+			types := []string{"premium", "standard", "basic", "enterprise", "trial"}
+			return types[g.rand.Intn(len(types))]
+		},
+		"subscription_tier": func() interface{} {
+			tiers := []string{"free", "pro", "business", "enterprise", "custom"}
+			return tiers[g.rand.Intn(len(tiers))]
+		},
+
+		// Order/Financial fields
+		"order_id": func() interface{} {
+			orderIDs := []string{"ORD-2025-789456", "ORD-2025-123789", "ORD-2025-456123", "ORD-2025-789012", "ORD-2025-345678"}
+			return orderIDs[g.rand.Intn(len(orderIDs))]
+		},
+		"total_amount": func() interface{} {
+			return float64(g.rand.Intn(500000))/100 + 10.0 // 10.00-5010.00
+		},
+		"currency": func() interface{} {
+			currencies := []string{"USD", "EUR", "GBP", "CAD", "JPY", "AUD"}
+			return currencies[g.rand.Intn(len(currencies))]
+		},
+		"payment_method": func() interface{} {
+			methods := []string{"credit_card", "debit_card", "paypal", "bank_transfer", "cryptocurrency", "wire_transfer"}
+			return methods[g.rand.Intn(len(methods))]
+		},
+		"invoice_number": func() interface{} {
+			invoices := []string{"INV-2025-001", "INV-2025-002", "INV-2025-003", "INV-2025-004"}
+			return invoices[g.rand.Intn(len(invoices))]
+		},
+		"tax_amount": func() interface{} {
+			return float64(g.rand.Intn(10000))/100 + 1.0 // 1.00-101.00
+		},
+		"discount_applied": func() interface{} {
+			return float64(g.rand.Intn(5000)) / 100 // 0.00-50.00
+		},
+
+		// Infrastructure/Alert fields
+		"alert_id": func() interface{} {
+			alertIDs := []string{"ALT-2025-001234", "ALT-2025-005678", "ALT-2025-009012", "ALT-2025-003456", "ALT-2025-007890"}
+			return alertIDs[g.rand.Intn(len(alertIDs))]
+		},
+		"severity": func() interface{} {
+			severities := []string{"critical", "high", "medium", "low", "info"}
+			return severities[g.rand.Intn(len(severities))]
+		},
+		"hostname": func() interface{} {
+			hostnames := []string{"db-prod-01", "web-prod-02", "api-prod-03", "cache-prod-04", "worker-prod-05", "lb-prod-06"}
+			return hostnames[g.rand.Intn(len(hostnames))]
+		},
+		"ip_address": func() interface{} {
+			ips := []string{"192.168.1.100", "10.0.0.50", "172.16.0.25", "192.168.100.200"}
+			return ips[g.rand.Intn(len(ips))]
+		},
+		"region": func() interface{} {
+			regions := []string{"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "eu-central-1", "ap-northeast-1"}
+			return regions[g.rand.Intn(len(regions))]
+		},
+		"environment": func() interface{} {
+			environments := []string{"production", "staging", "development", "testing", "qa", "demo"}
+			return environments[g.rand.Intn(len(environments))]
+		},
+		"cpu_usage_percent": func() interface{} {
+			return float64(g.rand.Intn(10000)) / 100 // 0.00-100.00
+		},
+		"memory_usage_percent": func() interface{} {
+			return float64(g.rand.Intn(10000)) / 100 // 0.00-100.00
+		},
+		"disk_usage_percent": func() interface{} {
+			return float64(g.rand.Intn(10000)) / 100 // 0.00-100.00
+		},
+		"affected_users_estimate": func() interface{} {
+			return g.rand.Intn(100000) + 1000 // 1000-101000
+		},
+		"service_name": func() interface{} {
+			services := []string{"user-service", "payment-service", "notification-service", "auth-service", "analytics-service"}
+			return services[g.rand.Intn(len(services))]
+		},
+		"error_code": func() interface{} {
+			codes := []string{"E001", "E002", "E003", "E404", "E500", "E503"}
+			return codes[g.rand.Intn(len(codes))]
+		},
+
+		// Manufacturing/Quality fields
+		"product_sku": func() interface{} {
+			skus := []string{"WIDGET-X500", "GADGET-A200", "DEVICE-Z100", "COMPONENT-B300", "TOOL-Y400", "PART-C150"}
+			return skus[g.rand.Intn(len(skus))]
+		},
+		"facility": func() interface{} {
+			facilities := []string{"Factory-Detroit", "Plant-Austin", "Facility-Phoenix", "Manufacturing-Denver", "Assembly-Portland", "Production-Seattle"}
+			return facilities[g.rand.Intn(len(facilities))]
+		},
+		"quantity_produced": func() interface{} {
+			return g.rand.Intn(50000) + 1000 // 1000-51000
+		},
+		"failure_rate_percent": func() interface{} {
+			return g.rand.Intn(50) + 1 // 1-50
+		},
+		"batch_number": func() interface{} {
+			batches := []string{"BATCH-2025-001", "BATCH-2025-002", "BATCH-2025-003", "BATCH-2025-004"}
+			return batches[g.rand.Intn(len(batches))]
+		},
+		"quality_score": func() interface{} {
+			return float64(g.rand.Intn(10000)) / 100 // 0.00-100.00
+		},
+		"production_line": func() interface{} {
+			lines := []string{"LINE-A", "LINE-B", "LINE-C", "LINE-D", "LINE-E"}
+			return lines[g.rand.Intn(len(lines))]
+		},
+		"shift": func() interface{} {
+			shifts := []string{"morning", "afternoon", "night", "weekend"}
+			return shifts[g.rand.Intn(len(shifts))]
+		},
+		"operator_id": func() interface{} {
+			operators := []string{"OP-001", "OP-002", "OP-003", "OP-004", "OP-005"}
+			return operators[g.rand.Intn(len(operators))]
+		},
+		"maintenance_type": func() interface{} {
+			types := []string{"preventive", "corrective", "emergency", "scheduled", "predictive"}
+			return types[g.rand.Intn(len(types))]
+		},
+
+		// Additional Business fields
+		"project_id": func() interface{} {
+			projects := []string{"PROJ-2025-100", "PROJ-2025-200", "PROJ-2025-300", "PROJ-2025-400"}
+			return projects[g.rand.Intn(len(projects))]
+		},
+		"contract_number": func() interface{} {
+			contracts := []string{"CONTRACT-2025-A", "CONTRACT-2025-B", "CONTRACT-2025-C", "CONTRACT-2025-D"}
+			return contracts[g.rand.Intn(len(contracts))]
+		},
+		"vendor_name": func() interface{} {
+			vendors := []string{"TechCorp", "InnovateInc", "GlobalSolutions", "SmartSystems", "DataWorks"}
+			return vendors[g.rand.Intn(len(vendors))]
+		},
+		"budget_allocated": func() interface{} {
+			return float64(g.rand.Intn(1000000))/100 + 1000.0 // 1000.00-11000.00
+		},
+		"risk_level": func() interface{} {
+			levels := []string{"low", "medium", "high", "critical", "negligible"}
+			return levels[g.rand.Intn(len(levels))]
+		},
+		"compliance_status": func() interface{} {
+			statuses := []string{"compliant", "non-compliant", "under-review", "pending-approval"}
+			return statuses[g.rand.Intn(len(statuses))]
+		},
+		"asset_tag": func() interface{} {
+			tags := []string{"ASSET-001", "ASSET-002", "ASSET-003", "ASSET-004", "ASSET-005"}
+			return tags[g.rand.Intn(len(tags))]
+		},
+		"location_code": func() interface{} {
+			codes := []string{"NYC-001", "LAX-002", "CHI-003", "MIA-004", "SEA-005"}
+			return codes[g.rand.Intn(len(codes))]
+		},
+	}
+
+	// Get all field names and randomly select 20
+	allFieldNames := make([]string, 0, len(allPossibleFields))
+	for fieldName := range allPossibleFields {
+		allFieldNames = append(allFieldNames, fieldName)
+	}
+
+	// Shuffle and select 20 fields
+	g.rand.Shuffle(len(allFieldNames), func(i, j int) {
+		allFieldNames[i], allFieldNames[j] = allFieldNames[j], allFieldNames[i]
+	})
+
+	selectedFields := allFieldNames[:20] // Take first 20 after shuffle
+
+	// Generate values for selected fields
+	fields := make(map[string]interface{})
+	for _, fieldName := range selectedFields {
+		if generator, exists := allPossibleFields[fieldName]; exists {
+			fields[fieldName] = generator()
+		}
+	}
+
+	return fields
+}
+
+// getAllPossibleBusinessFieldNames returns all possible business field names
+func (g *Generator) getAllPossibleBusinessFieldNames() []string {
+	return []string{
+		// Customer fields
+		"customer_id", "name", "email", "phone", "loyalty_status", "lifetime_value", "account_type", "subscription_tier",
+		// Order/Financial fields
+		"order_id", "total_amount", "currency", "payment_method", "invoice_number", "tax_amount", "discount_applied",
+		// Infrastructure/Alert fields
+		"alert_id", "severity", "hostname", "ip_address", "region", "environment", "cpu_usage_percent",
+		"memory_usage_percent", "disk_usage_percent", "affected_users_estimate", "service_name", "error_code",
+		// Manufacturing/Quality fields
+		"product_sku", "facility", "quantity_produced", "failure_rate_percent", "batch_number", "quality_score",
+		"production_line", "shift", "operator_id", "maintenance_type",
+		// Additional Business fields
+		"project_id", "contract_number", "vendor_name", "budget_allocated", "risk_level", "compliance_status",
+		"asset_tag", "location_code",
+	}
 }
 
 // generateSearchRequest generates a random search request using collected values from the 19 GSI fields only
@@ -606,6 +838,28 @@ func (g *Generator) generateUpdateData() map[string]interface{} {
 			// Clean the value to avoid empty strings for GSI fields
 			cleanedValue := g.cleanFieldValue(field, value)
 			updateData[field] = cleanedValue
+		}
+	}
+
+	// Add subset of business fields to update operations (randomly select some fields to update)
+	// Get all possible business field names and randomly select 3-8 for this update
+	allBusinessFields := g.getAllPossibleBusinessFieldNames()
+	numFieldsToUpdate := 3 + g.rand.Intn(6) // 3-8 fields
+
+	// Shuffle and select fields for update
+	g.rand.Shuffle(len(allBusinessFields), func(i, j int) {
+		allBusinessFields[i], allBusinessFields[j] = allBusinessFields[j], allBusinessFields[i]
+	})
+
+	selectedFields := allBusinessFields[:numFieldsToUpdate]
+
+	// Generate fresh business field values for the selected fields
+	businessFields := g.generateAdditionalBusinessFields()
+
+	// Add selected fields to update data if they were generated
+	for _, fieldName := range selectedFields {
+		if value, exists := businessFields[fieldName]; exists {
+			updateData[fieldName] = value
 		}
 	}
 
@@ -784,23 +1038,50 @@ func (g *Generator) getSearchableFieldsFromCSV() []string {
 
 // generateConditionForField generates a search condition for a specific field using CSV data
 func (g *Generator) generateConditionForField(field string) *httpclient.SearchCondition {
-	// Get random value from CSV for this field
-	value, err := g.csvReader.GetRandomFieldValue(field)
-	if err != nil {
-		return nil
+	// Check if this is a business field we added
+	businessFields := g.getAllPossibleBusinessFieldNames()
+
+	isBusinessField := false
+	for _, bf := range businessFields {
+		if bf == field {
+			isBusinessField = true
+			break
+		}
 	}
 
-	// Clean the value to avoid empty strings for GSI fields
-	cleanedValue := g.cleanFieldValue(field, value)
+	var cleanedValue interface{}
 
-	// Skip if the cleaned value is still problematic
-	if cleanedValue == nil {
-		return nil
-	}
+	if isBusinessField {
+		// Generate business field values directly
+		businessFieldsMap := g.generateAdditionalBusinessFields()
+		if value, exists := businessFieldsMap[field]; exists {
+			cleanedValue = value
+			// For string values in business fields, format with quotes as requested
+			if strVal, ok := value.(string); ok {
+				cleanedValue = fmt.Sprintf("\"%s\"", strVal)
+			}
+		} else {
+			return nil
+		}
+	} else {
+		// Get random value from CSV for this field
+		value, err := g.csvReader.GetRandomFieldValue(field)
+		if err != nil {
+			return nil
+		}
 
-	// For string values, skip if they're still empty after cleaning
-	if strVal, ok := cleanedValue.(string); ok && strVal == "" {
-		return nil
+		// Clean the value to avoid empty strings for GSI fields
+		cleanedValue = g.cleanFieldValue(field, value)
+
+		// Skip if the cleaned value is still problematic
+		if cleanedValue == nil {
+			return nil
+		}
+
+		// For string values, skip if they're still empty after cleaning
+		if strVal, ok := cleanedValue.(string); ok && strVal == "" {
+			return nil
+		}
 	}
 
 	// Determine operator based on field type and value
@@ -1110,6 +1391,14 @@ func (g *Generator) getBusinessCriticalFields() []string {
 		"statuschangedtime", "groupchangedtime", "oladueby", "olaescalationtime",
 		"askfeedbackdate", "firstfeedbackdate", "lastucviolationtime",
 		"lastapproveddate",
+
+		// Business scenario fields (expanded list for better search coverage)
+		"customer_id", "name", "email", "phone", "loyalty_status", "account_type",
+		"order_id", "total_amount", "currency", "payment_method", "invoice_number",
+		"alert_id", "severity", "hostname", "ip_address", "region", "environment",
+		"service_name", "error_code", "product_sku", "facility", "batch_number",
+		"production_line", "shift", "operator_id", "maintenance_type", "project_id",
+		"contract_number", "vendor_name", "risk_level", "compliance_status", "asset_tag", "location_code",
 	}
 }
 
@@ -1262,30 +1551,101 @@ func (g *Generator) getAvailableSearchableFieldsFromCSV(businessFields []string)
 		"firstfeedbackdate":      true,
 		"lastucviolationtime":    true,
 		"lastapproveddate":       true,
+
+		// Business scenario fields (expanded list)
+		"customer_id":             true,
+		"name":                    true,
+		"email":                   true,
+		"phone":                   true,
+		"loyalty_status":          true,
+		"lifetime_value":          true,
+		"account_type":            true,
+		"subscription_tier":       true,
+		"order_id":                true,
+		"total_amount":            true,
+		"currency":                true,
+		"payment_method":          true,
+		"invoice_number":          true,
+		"tax_amount":              true,
+		"discount_applied":        true,
+		"alert_id":                true,
+		"severity":                true,
+		"hostname":                true,
+		"ip_address":              true,
+		"region":                  true,
+		"environment":             true,
+		"cpu_usage_percent":       true,
+		"memory_usage_percent":    true,
+		"disk_usage_percent":      true,
+		"affected_users_estimate": true,
+		"service_name":            true,
+		"error_code":              true,
+		"product_sku":             true,
+		"facility":                true,
+		"quantity_produced":       true,
+		"failure_rate_percent":    true,
+		"batch_number":            true,
+		"quality_score":           true,
+		"production_line":         true,
+		"shift":                   true,
+		"operator_id":             true,
+		"maintenance_type":        true,
+		"project_id":              true,
+		"contract_number":         true,
+		"vendor_name":             true,
+		"budget_allocated":        true,
+		"risk_level":              true,
+		"compliance_status":       true,
+		"asset_tag":               true,
+		"location_code":           true,
 	}
 
 	var availableFields []string
+	businessFieldsList := []string{
+		"customer_id", "name", "email", "phone", "loyalty_status", "lifetime_value", "account_type", "subscription_tier",
+		"order_id", "total_amount", "currency", "payment_method", "invoice_number", "tax_amount", "discount_applied",
+		"alert_id", "severity", "hostname", "ip_address", "region", "environment", "cpu_usage_percent",
+		"memory_usage_percent", "disk_usage_percent", "affected_users_estimate", "service_name", "error_code",
+		"product_sku", "facility", "quantity_produced", "failure_rate_percent", "batch_number", "quality_score",
+		"production_line", "shift", "operator_id", "maintenance_type", "project_id", "contract_number",
+		"vendor_name", "budget_allocated", "risk_level", "compliance_status", "asset_tag", "location_code",
+	}
+
 	for _, field := range businessFields {
 		// Only consider fields that are in the supported list
 		if !supportedFields[field] {
 			continue
 		}
 
-		// Check if field has values in CSV data
-		if values := g.csvReader.GetFieldValues(field); len(values) > 0 {
-			// Check if field has non-empty values
-			hasNonEmptyValues := false
-			for _, value := range values {
-				if value != nil {
-					valueStr := fmt.Sprintf("%v", value)
-					if valueStr != "" && valueStr != "<nil>" {
-						hasNonEmptyValues = true
-						break
+		// Check if this is a business field (always available)
+		isBusinessField := false
+		for _, bf := range businessFieldsList {
+			if bf == field {
+				isBusinessField = true
+				break
+			}
+		}
+
+		if isBusinessField {
+			// Business fields are always available for search
+			availableFields = append(availableFields, field)
+		} else {
+			// Check if field has values in CSV data
+			if values := g.csvReader.GetFieldValues(field); len(values) > 0 {
+				// Check if field has non-empty values
+				hasNonEmptyValues := false
+				for _, value := range values {
+					if value != nil {
+						valueStr := fmt.Sprintf("%v", value)
+						if valueStr != "" && valueStr != "<nil>" {
+							hasNonEmptyValues = true
+							break
+						}
 					}
 				}
-			}
-			if hasNonEmptyValues {
-				availableFields = append(availableFields, field)
+				if hasNonEmptyValues {
+					availableFields = append(availableFields, field)
+				}
 			}
 		}
 	}
