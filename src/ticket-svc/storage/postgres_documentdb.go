@@ -583,6 +583,8 @@ func (p *PostgreSQLDocumentDBStorage) SearchTicketsWithProjection(request Search
 		query = fmt.Sprintf("%s FROM %s %s", selectClause, p.tableName, orderByClause)
 	}
 
+	log.Printf("DB Query executed : %s", query)
+
 	dbStart := time.Now()
 
 	rows, err := p.db.QueryContext(ctx, query, values...)
@@ -688,7 +690,7 @@ func (p *PostgreSQLDocumentDBStorage) buildSelectClause(projectedFields []string
 	var selectParts []string
 
 	// Always include core fields
-	selectParts = append(selectParts, "id", "ticket_id", "created_at", "updated_at", "custom_data")
+	selectParts = append(selectParts, "id", "ticket_id", "created_at", "updated_at")
 
 	for _, field := range projectedFields {
 		fieldLower := strings.ToLower(field)
@@ -748,13 +750,16 @@ func (p *PostgreSQLDocumentDBStorage) buildOrderByClause(sortFields []SortField)
 
 // processRows processes query result rows
 func (p *PostgreSQLDocumentDBStorage) processRows(rows *sql.Rows) ([]*ticketpb.TicketData, error) {
-	var tickets []*ticketpb.TicketData
 
 	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %w", err)
 	}
+
+	var valuesFinal [][]interface{}
+
+	dbStart := time.Now()
 
 	for rows.Next() {
 		// Create slice to hold values
@@ -770,9 +775,25 @@ func (p *PostgreSQLDocumentDBStorage) processRows(rows *sql.Rows) ([]*ticketpb.T
 			continue
 		}
 
-		// Convert to map
-		rowMap := make(map[string]interface{})
-		var customDataBytes []byte
+		valuesFinal = append(valuesFinal, values)
+
+	}
+
+	dbLatency := time.Since(dbStart)
+
+	log.Printf("DB Query scan time : %s", dbLatency)
+
+	tickets := make([]*ticketpb.TicketData, len(valuesFinal))
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	// Convert to map
+	rowMap := make(map[string]interface{})
+	var customDataBytes []byte
+
+	for i, values := range valuesFinal {
 
 		for i, column := range columns {
 			if column == "custom_data" {
@@ -789,13 +810,7 @@ func (p *PostgreSQLDocumentDBStorage) processRows(rows *sql.Rows) ([]*ticketpb.T
 			}
 		}
 
-		// Convert to protobuf
-		ticketData := p.hybridDataToProtobuf(rowMap, customDataBytes)
-		tickets = append(tickets, ticketData)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+		tickets[i] = p.hybridDataToProtobuf(rowMap, customDataBytes)
 	}
 
 	log.Printf("Processed %d tickets", len(tickets))
