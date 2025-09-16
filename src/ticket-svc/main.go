@@ -39,7 +39,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-jsonb", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-jsonb", "postgresql-dynamic", "scylladb", "mongodb", or "mongodb-attributes"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -1040,7 +1040,8 @@ func promptForStorageType() string {
 		fmt.Println("5. PostgreSQL Hstore")
 		fmt.Println("6. ScyllaDB")
 		fmt.Println("7. MongoDB")
-		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6 or 7): ")
+		fmt.Println("8. MongoDB Attributes")
+		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6, 7 or 8): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1071,6 +1072,9 @@ func promptForStorageType() string {
 		case "7":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
+		case "8":
+			fmt.Println("Selected: MongoDB Attributes")
+			return "mongodb-attributes"
 		default:
 			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, 6, 7, or 8.")
 		}
@@ -1189,6 +1193,19 @@ func main() {
 		}
 		storage = mongoStorage
 		log.Printf("Using MongoDB storage with connection: %s, database: %s, base collection: %s",
+			maskConnectionString(mongoURL), config.MongoDBDatabase, config.MongoDBCollection)
+	case "mongodb-attributes":
+		// Build MongoDB connection string with authentication if provided
+		mongoURL := buildMongoDBConnectionString(config)
+
+		mongoAttributesStorage, err := storage2.NewMongoDBAttributesStorage(mongoURL, config.MongoDBDatabase, config.MongoDBCollection)
+		if err != nil {
+			log.Fatalf("Failed to initialize MongoDB Attributes storage: %v", err)
+
+			return
+		}
+		storage = mongoAttributesStorage
+		log.Printf("Using MongoDB Attributes storage with connection: %s, database: %s, base collection: %s",
 			maskConnectionString(mongoURL), config.MongoDBDatabase, config.MongoDBCollection)
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)

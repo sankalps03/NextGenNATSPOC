@@ -245,7 +245,7 @@ func protobufToPostgreSQLRow(ticketData *ticketpb.TicketData, isUpdate bool) (ma
 			}
 		default:
 			// Skip unknown fields - all CSV fields should be mapped to columns
-			log.Printf("WARNING: Unmapped field %s with value %v", fieldName, value)
+			//log.Printf("WARNING: Unmapped field %s with value %v", fieldName, value)
 		}
 	}
 
@@ -351,7 +351,7 @@ func (p *PostgreSQLStorage) CreateTicket(ticketData *ticketpb.TicketData) (error
 		return fmt.Errorf("failed to create ticket in table %s: %w", p.tableName, err), nil
 	}
 
-	log.Printf("Created ticket %s in table %s with ID %d", ticketData.Id, p.tableName, generatedID)
+	//log.Printf("Created ticket %s in table %s with ID %d", ticketData.Id, p.tableName, generatedID)
 
 	result := map[string]interface{}{
 		"id":        generatedID,
@@ -409,7 +409,7 @@ func (p *PostgreSQLStorage) GetTicket(id string, store jetstream.KeyValue) (*tic
 	// Convert to protobuf
 	ticketData := postgreSQLRowToProtobuf(rowMap)
 
-	log.Printf("Retrieved ticket %s from table %s", id, p.tableName)
+	//log.Printf("Retrieved ticket %s from table %s", id, p.tableName)
 	return ticketData, true
 }
 
@@ -466,7 +466,7 @@ func (p *PostgreSQLStorage) UpdateTicket(ticketData *ticketpb.TicketData) bool {
 		return false
 	}
 
-	log.Printf("Updated ticket %s in table %s", ticketData.Id, p.tableName)
+	//log.Printf("Updated ticket %s in table %s", ticketData.Id, p.tableName)
 	return true
 }
 
@@ -685,6 +685,8 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(request SearchRequest) (
 		query = fmt.Sprintf("SELECT %s FROM %s %s", selectClause, p.tableName, orderByClause)
 	}
 
+	start1 := time.Now()
+
 	// Execute query
 	rows, err := p.db.QueryContext(ctx, query, values...)
 	if err != nil {
@@ -692,13 +694,17 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(request SearchRequest) (
 	}
 	defer rows.Close()
 
-	var tickets []*ticketpb.TicketData
+	fmt.Println("Query execution time:", time.Since(start1))
+
+	start1 = time.Now()
 
 	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %w", err)
 	}
+
+	var values1 [][]interface{}
 
 	for rows.Next() {
 		// Create slice to hold values
@@ -714,7 +720,17 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(request SearchRequest) (
 			continue
 		}
 
-		// Convert to map
+		values1 = append(values1, values)
+	}
+
+	fmt.Println(fmt.Sprintf("Row scan time:%v for %v records", time.Since(start1), len(values1)))
+
+	var tickets = make([]*ticketpb.TicketData, len(values1))
+
+	start2 := time.Now()
+
+	for i, values := range values1 {
+
 		rowMap := make(map[string]interface{})
 		for i, column := range columns {
 			rowMap[column] = values[i]
@@ -722,8 +738,10 @@ func (p *PostgreSQLStorage) SearchTicketsWithProjection(request SearchRequest) (
 
 		// Convert to protobuf
 		ticketData := postgreSQLRowToProtobuf(rowMap)
-		tickets = append(tickets, ticketData)
+		tickets[i] = ticketData
 	}
+
+	fmt.Println(fmt.Sprintf("Protobuf conversion time: %v for %v records", time.Since(start2), len(tickets)))
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating rows: %w", err)
