@@ -418,45 +418,53 @@ func (g *Generator) getDummyValueForField(fieldName string) interface{} {
 	// Determine field type based on field name patterns
 	fieldNameLower := strings.ToLower(fieldName)
 
-	// ID fields - use 0 as dummy value
-	if strings.HasSuffix(fieldNameLower, "id") {
-		return int64(0)
-	}
-
-	// Time fields - use current timestamp or 0
-	if strings.Contains(fieldNameLower, "time") ||
-		strings.Contains(fieldNameLower, "due") ||
-		strings.Contains(fieldNameLower, "date") {
-		return int64(0)
-	}
-
-	// Duration fields - use 0
-	if strings.Contains(fieldNameLower, "duration") {
-		return int64(0)
-	}
-
-	// Level fields - use 0
-	if strings.Contains(fieldNameLower, "level") {
-		return int64(0)
-	}
-
-	// Boolean-like fields
-	if strings.Contains(fieldNameLower, "removed") ||
-		strings.Contains(fieldNameLower, "spam") ||
-		strings.Contains(fieldNameLower, "vip") ||
-		strings.Contains(fieldNameLower, "violated") ||
-		strings.Contains(fieldNameLower, "reopened") ||
-		strings.Contains(fieldNameLower, "migrated") {
-		return false
-	}
-
-	// Text fields - use meaningful dummy values
+	// Specific numeric field mappings from hybrid schema
 	switch fieldNameLower {
+	// BIGINT ID fields - use realistic positive values instead of 0
+	case "updatedbyid", "createdbyid", "removedbyid", "requesterid", "technicianid",
+		"closedby", "resolvedby", "categoryid", "departmentid", "groupid",
+		"impactid", "locationid", "priorityid", "statusid", "urgencyid",
+		"violatedslaid", "servicecatalogid", "sourceid", "suggestedcategoryid",
+		"suggestedgroupid", "companyid", "vendorid", "violateducid",
+		"transitionmodelid", "messengerconfigid", "templateid", "emailreadconfigid":
+		return int64(1) // Use 1 instead of 0 for foreign keys
+
+	case "requesttype":
+		return int64(1) // BIGINT request type
+
+	// BIGINT timestamp fields - use current timestamp
+	case "updatedtime", "createdtime", "removedtime", "dueby", "firstresponsetime",
+		"lastclosedtime", "lastopenedtime", "lastresolvedtime", "lastviolationtime",
+		"olddueby", "oldresponsedue", "resolutionescalationtime", "responsedue",
+		"responseescalationtime", "statuschangedtime", "groupchangedtime",
+		"lastolaviolationtime", "oladueby", "oldoladueby", "askfeedbackdate",
+		"firstfeedbackdate", "olaescalationtime", "lastucviolationtime",
+		"olducdueby", "ucdueby", "ucescalationtime", "lastapproveddate":
+		return int64(time.Now().UnixMilli()) // Current timestamp in milliseconds
+
+	// BIGINT duration fields - use 0 (default values)
+	case "totalonholdduration", "totalresolutiontime", "totalslapausetime",
+		"totalworkingtime", "totaluconholdduration", "totalucpausetime",
+		"totalucworkingtime", "totalucresolutiontime":
+		return int64(0)
+
+	// INTEGER approval and level fields
+	case "approvalstatus", "approvaltype", "resolutionduelevel", "responseduelevel",
+		"supportlevel", "oladuelevel", "ucduelevel":
+		return int32(1) // Use 1 for INTEGER fields
+
+	// Boolean fields
+	case "removed", "duetimemanuallyupdated", "reopened", "responsedueviolated",
+		"slaviolated", "purchaserequest", "spam", "viprequest", "olaviolated",
+		"ucviolated", "migrated":
+		return false
+
+	// Text/VARCHAR fields
 	case "name":
 		return "DUMMY-TICKET-" + g.generateRandomString(6)
 	case "subject":
 		return "Dummy Subject - " + g.generateRandomString(8)
-	case "description":
+	case "description", "originaldescription":
 		return "Dummy description for testing purposes"
 	case "oobtype":
 		return "DUMMY"
@@ -464,15 +472,45 @@ func (g *Generator) getDummyValueForField(fieldName string) interface{} {
 		return "SIMULATOR"
 	case "emailreadconfigemail":
 		return "dummy@simulator.test"
+
 	default:
-		// For unknown string fields, use a generic dummy value
+		// Legacy pattern-based matching for backward compatibility
+		if strings.HasSuffix(fieldNameLower, "id") {
+			return int64(1) // Use 1 instead of 0 for ID fields
+		}
+
+		if strings.Contains(fieldNameLower, "time") ||
+			strings.Contains(fieldNameLower, "due") ||
+			strings.Contains(fieldNameLower, "date") {
+			return int64(time.Now().UnixMilli())
+		}
+
+		if strings.Contains(fieldNameLower, "duration") {
+			return int64(0)
+		}
+
+		if strings.Contains(fieldNameLower, "level") {
+			return int32(1)
+		}
+
+		if strings.Contains(fieldNameLower, "removed") ||
+			strings.Contains(fieldNameLower, "spam") ||
+			strings.Contains(fieldNameLower, "vip") ||
+			strings.Contains(fieldNameLower, "violated") ||
+			strings.Contains(fieldNameLower, "reopened") ||
+			strings.Contains(fieldNameLower, "migrated") {
+			return false
+		}
+
+		// For unknown string fields
 		if strings.Contains(fieldNameLower, "email") {
 			return "dummy@simulator.test"
 		}
 		if strings.Contains(fieldNameLower, "config") {
 			return "DUMMY_CONFIG"
 		}
-		// Default to "DUMMY" for string fields, 0 for numeric fields
+
+		// Default to "DUMMY" for string fields
 		return "DUMMY"
 	}
 }
