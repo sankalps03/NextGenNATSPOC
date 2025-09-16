@@ -84,7 +84,7 @@ func (p *PostgreSQLDocumentDBStorage) getFixedFields() map[string]bool {
 		"subject": true, "callfrom": true, "emailreadconfigemail": true,
 
 		// Boolean fields
-		"removed": true, "duetimemanuallyupdated": true, "reopened": true,
+		"removed": true, "duetimemanuallyupdated": true,
 		"responsedueviolated": true, "slaviolated": true, "purchaserequest": true,
 		"spam": true, "viprequest": true, "olaviolated": true, "ucviolated": true,
 		"migrated": true,
