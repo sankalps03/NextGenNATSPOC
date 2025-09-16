@@ -76,7 +76,6 @@ CREATE TABLE tickets (
     -- Boolean fields
                          removed BOOLEAN DEFAULT FALSE,
                          duetimemanuallyupdated BOOLEAN DEFAULT FALSE,
-                         reopened BOOLEAN DEFAULT FALSE,
                          responsedueviolated BOOLEAN DEFAULT FALSE,
                          slaviolated BOOLEAN DEFAULT FALSE,
                          purchaserequest BOOLEAN DEFAULT FALSE,
