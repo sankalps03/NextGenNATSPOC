@@ -191,16 +191,31 @@ func (g *Generator) runUpdateGenerator(ctx context.Context) {
 func (g *Generator) createTicket(ctx context.Context) {
 	startTime := time.Now()
 
-	// Get random ticket data from CSV
-	ticketData, err := g.csvReader.GetRandomTicket()
-	if err != nil {
-		g.logger.Error(fmt.Sprintf("Failed to get random ticket data: %v", err))
-		g.metrics.RecordCreateRequest(time.Since(startTime), false)
-		return
-	}
+	var processedData map[string]interface{}
+	var err error
 
-	// Apply field filtering and transformations
-	processedData := g.processCreateData(ticketData.Fields)
+	// Check if we should use categorized generation
+	if g.config.Operations.Create.UseCategorizedGeneration {
+		// Use categorized ticket generation
+		categoryID := g.selectRandomCategory()
+		categorizedGen := NewCategorizedGenerator(g)
+		ticketData, genErr := categorizedGen.GenerateCategorizedTicket(ctx, categoryID)
+		if genErr != nil {
+			g.logger.Error(fmt.Sprintf("Failed to generate categorized ticket: %v", genErr))
+			g.metrics.RecordCreateRequest(time.Since(startTime), false)
+			return
+		}
+		processedData = g.processCreateData(ticketData)
+	} else {
+		// Use CSV-based generation (original method)
+		ticketData, err := g.csvReader.GetRandomTicket()
+		if err != nil {
+			g.logger.Error(fmt.Sprintf("Failed to get random ticket data: %v", err))
+			g.metrics.RecordCreateRequest(time.Since(startTime), false)
+			return
+		}
+		processedData = g.processCreateData(ticketData.Fields)
+	}
 
 	// Make API request with tenant tracking
 	response, tenantID, err := g.httpClient.CreateTicketWithTenant(ctx, processedData)
@@ -721,10 +736,27 @@ func (g *Generator) generateSearchRequest() (httpclient.SearchRequest, string) {
 	// Generate random projection fields
 	projectedFields := g.generateRandomProjectionFields()
 
+	// Generate CategoryFilter if enabled
+	var categoryFilter *int64
+	if g.config.Operations.Search.UseCategoryFilter {
+		// Randomly decide whether to use a category filter (70% chance)
+		if g.rand.Float32() < 0.9 {
+			selectedCategory := g.selectRandomCategory()
+			categoryFilter = &selectedCategory
+		}
+		// 30% chance for cross-category search (no filter)
+	}
+
 	return httpclient.SearchRequest{
 		Conditions:      conditions,
 		ProjectedFields: projectedFields,
+		CategoryFilter:  categoryFilter,
 	}, tenantID
+}
+
+// GenerateSearchRequest is a public wrapper for testing purposes
+func (g *Generator) GenerateSearchRequest() (httpclient.SearchRequest, string) {
+	return g.generateSearchRequest()
 }
 
 // generateRandomSearchConditions generates 1-3 random search conditions using CSV values from the indexed fields only
@@ -1162,6 +1194,30 @@ func (g *Generator) generateRandomProjectionFields() []string {
 	}
 
 	return projectedFields
+}
+
+// selectRandomCategory selects a random category ID for ticket generation
+func (g *Generator) selectRandomCategory() int64 {
+	// Define category weights: IT=30%, HR=20%, Facilities=15%, Finance=15%, General=20%
+	categories := []int64{1, 2, 3, 4, 5}
+	weights := []float32{0.30, 0.20, 0.15, 0.15, 0.20}
+
+	total := float32(0)
+	for _, weight := range weights {
+		total += weight
+	}
+
+	r := g.rand.Float32() * total
+	cumulative := float32(0)
+
+	for i, weight := range weights {
+		cumulative += weight
+		if r <= cumulative {
+			return categories[i]
+		}
+	}
+
+	return categories[len(categories)-1] // Default to last category
 }
 
 // extractDatabaseLatency extracts the database_latency_ms from API response

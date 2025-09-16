@@ -10,7 +10,7 @@ A high-performance, event-driven ticket management microservice that handles tic
 - **Multi-tenant Support** - Tenant-isolated ticket management
 - **CRUD Operations** - Full ticket lifecycle management (Create, Read, Update, Delete)
 - **Event Sourcing** - All ticket changes generate domain events
-- **In-Memory Storage** - Fast, ephemeral storage for POC (production would use database)
+- **Multiple Storage Backends** - Support for various storage implementations including high-performance PostgreSQL Dynamic Columns
 - **Hot Reload** - Development mode with automatic restarts
 - **Structured Logging** - JSON-based logging with request tracing
 
@@ -35,6 +35,46 @@ The service is configured via environment variables:
 | `NATS_URL` | `nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224` | NATS cluster URLs (comma-separated) |
 | `SERVICE_NAME` | `ticket-service` | Service identifier for NATS |
 | `LOG_LEVEL` | `info` | Logging level (debug, info, warn, error) |
+| `STORAGE_TYPE` | `mongodb` | Storage backend type (see Storage Backends section) |
+| `POSTGRESQL_URL` | - | PostgreSQL connection string (for PostgreSQL backends) |
+| `POSTGRESQL_TABLE` | `tickets` | PostgreSQL table name (for PostgreSQL backends) |
+| `INTERACTIVE_PROMPT` | `false` | Enable interactive storage selection at startup |
+
+## 🗄️ Storage Backends
+
+The service supports multiple storage backends for different use cases:
+
+### PostgreSQL Dynamic Columns (Recommended)
+- **Type**: `postgresql-dynamic`
+- **Performance**: High-performance in-memory field mapping
+- **Schema**: Static base columns + 50 string + 50 numeric dynamic columns
+- **Features**:
+  - Category-based field mapping
+  - Automatic column assignment
+  - In-memory operations with async persistence
+  - Perfect for dynamic ticket fields
+
+```bash
+export STORAGE_TYPE=postgresql-dynamic
+export POSTGRESQL_URL="postgres://user:pass@localhost/ticketdb?sslmode=disable"
+export POSTGRESQL_TABLE="tickets_dynamic"
+```
+
+### Other Storage Options
+- **PostgreSQL Standard**: `postgresql` - Traditional relational schema
+- **PostgreSQL EAV**: `postgresql-eav` - Entity-Attribute-Value design
+- **PostgreSQL Hstore**: `postgresql-hstore` - Key-value pairs in hstore
+- **PostgreSQL JSONB**: `postgresql-jsonb` - JSON documents in JSONB
+- **MongoDB**: `mongodb` - Document-based storage
+- **ScyllaDB**: `scylladb` - High-performance NoSQL
+- **OpenSearch**: `opensearch` - Full-text search capabilities
+
+### Interactive Selection
+Enable interactive storage selection at startup:
+```bash
+export INTERACTIVE_PROMPT=true
+go run main.go
+```
 
 ## Development
 

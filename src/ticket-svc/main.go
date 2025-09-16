@@ -582,8 +582,6 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	}
 	dbLatency := time.Since(dbStart)
 
-	log.Printf("DB latency : %s", dbLatency)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to search tickets: %w", err)
 	}
@@ -905,7 +903,7 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
-		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://documentdb:postgres@localhost:5433/postgres?sslmode=disable"),
+		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
 		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
 		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
 		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),
@@ -1015,6 +1013,22 @@ func createKVBucket(natsManager *NATSManager, bucketName string) (jetstream.KeyV
 	return kv, nil
 }
 
+func createObjectStore(natsManager *NATSManager, storeName string) (jetstream.ObjectStore, error) {
+	objStore, err := natsManager.js.CreateObjectStore(context.Background(), jetstream.ObjectStoreConfig{
+		Bucket: storeName,
+	})
+	if err != nil {
+		// If object store already exists, try to get it
+		objStore, err = natsManager.js.ObjectStore(context.Background(), storeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create or get object store '%s': %w", storeName, err)
+		}
+	}
+
+	log.Printf("NATS Object Store '%s' ready", storeName)
+	return objStore, nil
+}
+
 func promptForStorageType() string {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -1026,7 +1040,9 @@ func promptForStorageType() string {
 		fmt.Println("5. ScyllaDB")
 		fmt.Println("6. MongoDB")
 		fmt.Println("7. PostgreSQL DocumentDB")
-		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6, or 7): ")
+		fmt.Println("8. PostgreSQL Dynamic Columns")
+
+		fmt.Print("Enter your choice (1, 2, 3, 4, 5, 6, 7, or 8): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1057,6 +1073,9 @@ func promptForStorageType() string {
 		case "7":
 			fmt.Println("Selected: PostgreSQL DocumentDB")
 			return "pg_documentdb"
+		case "8":
+			fmt.Println("Selected: PostgreSQL Dynamic Columns")
+			return "postgresql-dynamic"
 		default:
 			fmt.Println("Invalid choice. Please enter 1, 2, 3, 4, 5, 6, or 7.")
 		}
@@ -1091,13 +1110,10 @@ func main() {
 	var kvStore jetstream.KeyValue
 
 	// Get or create object store for retrieving ticket responses
-	objStore, err := natsManager.js.ObjectStore(context.Background(), "ticket-responses")
+	objStore, err := createObjectStore(natsManager, "ticket-responses")
 	if err != nil {
-		log.Printf("WARNING: Failed to connect to object store: %v. Large responses may not be available.", err)
-
-		return
-	} else {
-		log.Println("Connected to NATS Object Store: ticket-responses")
+		log.Printf("WARNING: Failed to create object store: %v. Large responses may not be available.", err)
+		objStore = nil // Set to nil so service can continue without object store
 	}
 
 	switch storageType {
@@ -1179,6 +1195,18 @@ func main() {
 		storage = pgDocumentDBStorage
 		log.Printf("Using PostgreSQL DocumentDB storage with connection: %s and base table: %s",
 			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+	case "postgresql-dynamic":
+		postgresDynamicStorage, err := storage2.NewPostgreSQLDynamicStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
+		if err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL Dynamic Columns storage: %v", err)
+
+			return
+		}
+		storage = postgresDynamicStorage
+		log.Printf("Using PostgreSQL Dynamic Columns storage with connection: %s and base table: %s",
+			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
+		log.Printf("Field mappings loaded into memory for high-performance operations")
+
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}

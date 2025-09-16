@@ -23,6 +23,7 @@ type SearchRequest struct {
 	Conditions      []SearchCondition `json:"conditions"`                 // search conditions to apply
 	ProjectedFields []string          `json:"projected_fields,omitempty"` // fields to include in results (empty = all fields)
 	SortFields      []SortField       `json:"sort_fields,omitempty"`      // fields to sort by
+	CategoryFilter  *int64            `json:"category_filter,omitempty"`  // optional category filter for dynamic column mapping
 }
 
 // TicketStorage defines the interface for ticket storage operations
