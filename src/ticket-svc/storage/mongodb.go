@@ -512,6 +512,54 @@ func mongoDBDocumentToProtobuf(doc bson.M) *ticketpb.TicketData {
 	return ticketData
 }
 
+// interfaceToFieldValue converts a Go interface{} to protobuf FieldValue
+func interfaceToFieldValue(value interface{}) *ticketpb.FieldValue {
+	if value == nil {
+		return nil
+	}
+
+	switch v := value.(type) {
+	case string:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: v},
+		}
+	case float64:
+		// JSON numbers are float64, check if it's actually an integer
+		if v == float64(int64(v)) {
+			return &ticketpb.FieldValue{
+				Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
+			}
+		}
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: v},
+		}
+	case bool:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_BoolValue{BoolValue: v},
+		}
+	case []interface{}:
+		// Convert to string array
+		var stringArray []string
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				stringArray = append(stringArray, str)
+			} else {
+				stringArray = append(stringArray, fmt.Sprintf("%v", item))
+			}
+		}
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: stringArray},
+			},
+		}
+	default:
+		// Convert unknown types to string
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)},
+		}
+	}
+}
+
 // CreateTicket stores a new ticket in the MongoDB collection
 func (m *MongoDBStorage) CreateTicket(ticketData *ticketpb.TicketData) (error, map[string]interface{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
