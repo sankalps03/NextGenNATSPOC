@@ -14,6 +14,7 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/platform/ticket-svc/logger"
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
 )
 
@@ -36,6 +37,7 @@ type PostgreSQLDynamicStorage struct {
 	mappingMutex      sync.RWMutex                       // protects fieldMappings
 	nextStringColumn  map[int64]int                      // categoryID -> next available string column number
 	nextNumericColumn map[int64]int                      // categoryID -> next available numeric column number
+	logger            logger.Logger                      // logger for performance metrics
 }
 
 // NewPostgreSQLDynamicStorage creates a new PostgreSQL storage instance with dynamic column mapping
@@ -65,6 +67,7 @@ func NewPostgreSQLDynamicStorage(ctx context.Context, tableName, connectionStrin
 		fieldMappings:     make(map[string]map[string]FieldMapping),
 		nextStringColumn:  make(map[int64]int),
 		nextNumericColumn: make(map[int64]int),
+		logger:            logger.NewLogger("postgresql-storage", "ticket-svc"),
 	}
 
 	// Ensure the tables exist
@@ -383,14 +386,46 @@ func (p *PostgreSQLDynamicStorage) protobufToDynamicRow(ticketData *ticketpb.Tic
 	// Category ID is now passed as a parameter - no need to extract from ticket data
 	// This eliminates the collision between categoryid as data field and category for field mapping
 
-	// Process static base columns first
-	// Note: We exclude problematic timestamp fields that might have TIMESTAMP column types
-	// These will be handled by the application-managed created_at/updated_at fields
+	// Process static base columns first - all fields from hybrid schema (excluding document_core)
 	staticFields := map[string]bool{
-		"name": true, "createdbyid": true, "updatedbyid": true,
-		"statusid": true, "priorityid": true, "requesterid": true, "subject": true,
-		// Temporarily exclude timestamp fields to avoid PostgreSQL TIMESTAMP range errors
-		// "createdtime": true, "updatedtime": true,
+		// User and assignment fields
+		"updatedbyid": true, "createdbyid": true, "removedbyid": true, "requesterid": true,
+		"technicianid": true, "closedby": true, "resolvedby": true,
+
+		// Timestamp fields (stored as BIGINT Unix timestamps in milliseconds)
+		"updatedtime": true, "createdtime": true, "removedtime": true, "dueby": true,
+		"firstresponsetime": true, "lastclosedtime": true, "lastopenedtime": true, "lastresolvedtime": true,
+		"lastviolationtime": true, "olddueby": true, "oldresponsedue": true, "resolutionescalationtime": true,
+		"responsedue": true, "responseescalationtime": true, "statuschangedtime": true, "groupchangedtime": true,
+		"lastolaviolationtime": true, "oladueby": true, "oldoladueby": true, "askfeedbackdate": true,
+		"firstfeedbackdate": true, "olaescalationtime": true, "lastucviolationtime": true, "olducdueby": true,
+		"ucdueby": true, "ucescalationtime": true, "lastapproveddate": true,
+
+		// Text fields
+		"name": true, "oobtype": true, "description": true, "originaldescription": true,
+		"subject": true, "callfrom": true, "emailreadconfigemail": true,
+
+		// Boolean fields
+		"removed": true, "duetimemanuallyupdated": true, "reopened": true, "responsedueviolated": true,
+		"slaviolated": true, "purchaserequest": true, "spam": true, "viprequest": true,
+		"olaviolated": true, "ucviolated": true, "migrated": true,
+
+		// Category and classification fields
+		"categoryid": true, "departmentid": true, "groupid": true, "impactid": true, "locationid": true,
+		"priorityid": true, "statusid": true, "urgencyid": true, "violatedslaid": true, "servicecatalogid": true,
+		"sourceid": true, "requesttype": true, "suggestedcategoryid": true, "suggestedgroupid": true,
+		"companyid": true, "vendorid": true, "violateducid": true, "transitionmodelid": true, "messengerconfigid": true,
+
+		// Approval and workflow fields
+		"approvalstatus": true, "approvaltype": true, "resolutionduelevel": true, "responseduelevel": true,
+		"supportlevel": true, "oladuelevel": true, "ucduelevel": true,
+
+		// Duration and time tracking fields (in milliseconds)
+		"totalonholdduration": true, "totalresolutiontime": true, "totalslapausetime": true, "totalworkingtime": true,
+		"totaluconholdduration": true, "totalucpausetime": true, "totalucworkingtime": true, "totalucresolutiontime": true,
+
+		// Configuration and template fields
+		"templateid": true, "emailreadconfigid": true,
 	}
 
 	// Handle static fields
@@ -505,10 +540,46 @@ func (p *PostgreSQLDynamicStorage) dynamicRowToProtobuf(row map[string]interface
 		ticketData.UpdatedAt = updatedAt.Format(time.RFC3339)
 	}
 
-	// Handle static base columns
+	// Handle static base columns - all fields from hybrid schema (excluding document_core)
 	staticFields := map[string]bool{
-		"name": true, "createdbyid": true, "createdtime": true, "updatedbyid": true,
-		"updatedtime": true, "statusid": true, "priorityid": true, "requesterid": true, "subject": true,
+		// User and assignment fields
+		"updatedbyid": true, "createdbyid": true, "removedbyid": true, "requesterid": true,
+		"technicianid": true, "closedby": true, "resolvedby": true,
+
+		// Timestamp fields (stored as BIGINT Unix timestamps in milliseconds)
+		"updatedtime": true, "createdtime": true, "removedtime": true, "dueby": true,
+		"firstresponsetime": true, "lastclosedtime": true, "lastopenedtime": true, "lastresolvedtime": true,
+		"lastviolationtime": true, "olddueby": true, "oldresponsedue": true, "resolutionescalationtime": true,
+		"responsedue": true, "responseescalationtime": true, "statuschangedtime": true, "groupchangedtime": true,
+		"lastolaviolationtime": true, "oladueby": true, "oldoladueby": true, "askfeedbackdate": true,
+		"firstfeedbackdate": true, "olaescalationtime": true, "lastucviolationtime": true, "olducdueby": true,
+		"ucdueby": true, "ucescalationtime": true, "lastapproveddate": true,
+
+		// Text fields
+		"name": true, "oobtype": true, "description": true, "originaldescription": true,
+		"subject": true, "callfrom": true, "emailreadconfigemail": true,
+
+		// Boolean fields
+		"removed": true, "duetimemanuallyupdated": true, "reopened": true, "responsedueviolated": true,
+		"slaviolated": true, "purchaserequest": true, "spam": true, "viprequest": true,
+		"olaviolated": true, "ucviolated": true, "migrated": true,
+
+		// Category and classification fields
+		"categoryid": true, "departmentid": true, "groupid": true, "impactid": true, "locationid": true,
+		"priorityid": true, "statusid": true, "urgencyid": true, "violatedslaid": true, "servicecatalogid": true,
+		"sourceid": true, "requesttype": true, "suggestedcategoryid": true, "suggestedgroupid": true,
+		"companyid": true, "vendorid": true, "violateducid": true, "transitionmodelid": true, "messengerconfigid": true,
+
+		// Approval and workflow fields
+		"approvalstatus": true, "approvaltype": true, "resolutionduelevel": true, "responseduelevel": true,
+		"supportlevel": true, "oladuelevel": true, "ucduelevel": true,
+
+		// Duration and time tracking fields (in milliseconds)
+		"totalonholdduration": true, "totalresolutiontime": true, "totalslapausetime": true, "totalworkingtime": true,
+		"totaluconholdduration": true, "totalucpausetime": true, "totalucworkingtime": true, "totalucresolutiontime": true,
+
+		// Configuration and template fields
+		"templateid": true, "emailreadconfigid": true,
 	}
 
 	for fieldName := range staticFields {
@@ -522,9 +593,21 @@ func (p *PostgreSQLDynamicStorage) dynamicRowToProtobuf(row map[string]interface
 				ticketData.Fields[fieldName] = &ticketpb.FieldValue{
 					Value: &ticketpb.FieldValue_IntValue{IntValue: v},
 				}
+			case int32:
+				ticketData.Fields[fieldName] = &ticketpb.FieldValue{
+					Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
+				}
+			case int:
+				ticketData.Fields[fieldName] = &ticketpb.FieldValue{
+					Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
+				}
 			case float64:
 				ticketData.Fields[fieldName] = &ticketpb.FieldValue{
 					Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: v},
+				}
+			case float32:
+				ticketData.Fields[fieldName] = &ticketpb.FieldValue{
+					Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: float64(v)},
 				}
 			case bool:
 				ticketData.Fields[fieldName] = &ticketpb.FieldValue{
@@ -624,13 +707,22 @@ func (p *PostgreSQLDynamicStorage) CreateTicket(ticketData *ticketpb.TicketData)
 	)
 
 	var insertedID int64
+
+	// Log query execution time
+	queryStart := time.Now()
 	err = p.db.QueryRowContext(ctx, insertSQL, values...).Scan(&insertedID)
+	queryDuration := time.Since(queryStart)
+
 	if err != nil {
 		log.Printf("ERROR: SQL execution failed: %v", err)
 		log.Printf("ERROR: SQL was: %s", insertSQL)
 		log.Printf("ERROR: Values were: %v", values)
+		p.logger.LogQueryExecution("CREATE_TICKET_FAILED", queryDuration, 0)
 		return fmt.Errorf("failed to create ticket in table %s: %w", p.tableName, err), nil
 	}
+
+	// Log successful query execution
+	p.logger.LogQueryExecution("CREATE_TICKET", queryDuration, 1)
 
 	//log.Printf("Created ticket %s in dynamic table %s with ID %d", ticketData.Id, p.tableName, insertedID)
 
@@ -650,12 +742,19 @@ func (p *PostgreSQLDynamicStorage) GetTicket(id string, store jetstream.KeyValue
 	// Build dynamic SELECT query to get all columns
 	selectSQL := fmt.Sprintf("SELECT * FROM %s WHERE ticket_id = $1", p.tableName)
 
+	// Log query execution time
+	queryStart := time.Now()
 	rows, err := p.db.QueryContext(ctx, selectSQL, id)
+	queryDuration := time.Since(queryStart)
+
 	if err != nil {
 		log.Printf("Failed to query ticket %s: %v", id, err)
+		p.logger.LogQueryExecution("GET_TICKET_FAILED", queryDuration, 0)
 		return nil, false
 	}
 	defer rows.Close()
+
+	p.logger.LogQueryExecution("GET_TICKET", queryDuration, 1)
 
 	if !rows.Next() {
 		return nil, false
@@ -675,11 +774,14 @@ func (p *PostgreSQLDynamicStorage) GetTicket(id string, store jetstream.KeyValue
 		valuePtrs[i] = &values[i]
 	}
 
-	// Scan the row
+	// Scan the row - log scan time
+	scanStart := time.Now()
 	if err := rows.Scan(valuePtrs...); err != nil {
 		log.Printf("Failed to scan ticket row: %v", err)
 		return nil, false
 	}
+	scanDuration := time.Since(scanStart)
+	p.logger.LogRowScan("GET_TICKET", scanDuration, 1)
 
 	// Convert to map
 	row := make(map[string]interface{})
@@ -982,11 +1084,18 @@ func (p *PostgreSQLDynamicStorage) SearchTickets(request SearchRequest) ([]*tick
 		selectSQL += " ORDER BY created_at DESC"
 	}
 
+	// Log query execution time
+	queryStart := time.Now()
 	rows, err := p.db.QueryContext(ctx, selectSQL, values...)
+	queryDuration := time.Since(queryStart)
+
 	if err != nil {
+		p.logger.LogQueryExecution("SEARCH_TICKETS_FAILED", queryDuration, 0)
 		return nil, fmt.Errorf("failed to search tickets: %w", err)
 	}
 	defer rows.Close()
+
+	p.logger.LogQueryExecution("SEARCH_TICKETS", queryDuration, 1)
 
 	// Log comprehensive search information
 	categoryInfo := "cross-category"
@@ -1001,8 +1110,13 @@ func (p *PostgreSQLDynamicStorage) SearchTickets(request SearchRequest) ([]*tick
 	}
 
 	var tickets []*ticketpb.TicketData
+	rowCount := 0
+
+	// Track row scanning time
+	scanStart := time.Now()
 
 	for rows.Next() {
+		rowCount++
 		// Create slice to hold values
 		values := make([]interface{}, len(columns))
 		valuePtrs := make([]interface{}, len(columns))
@@ -1035,7 +1149,13 @@ func (p *PostgreSQLDynamicStorage) SearchTickets(request SearchRequest) ([]*tick
 		tickets = append(tickets, ticketData)
 	}
 
+	scanDuration := time.Since(scanStart)
+	p.logger.LogRowScan("SEARCH_TICKETS", scanDuration, rowCount)
+
 	searchDuration := time.Since(searchStart)
+
+	// Log comprehensive search results
+	p.logger.LogSearchResults("SEARCH_TICKETS", len(tickets), searchDuration, false)
 
 	log.Printf("SEARCH: %s | mapped_columns=[%s] | query_time=%v",
 		categoryInfo,

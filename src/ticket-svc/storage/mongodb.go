@@ -101,6 +101,76 @@ func maskConnectionString(connectionString string) string {
 	return connectionString
 }
 
+// interfaceToFieldValue converts a Go interface{} value to protobuf FieldValue
+func interfaceToFieldValue(value interface{}) *ticketpb.FieldValue {
+	switch v := value.(type) {
+	case string:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: v},
+		}
+	case int:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
+		}
+	case int32:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_IntValue{IntValue: int64(v)},
+		}
+	case int64:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_IntValue{IntValue: v},
+		}
+	case float32:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: float64(v)},
+		}
+	case float64:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_DoubleValue{DoubleValue: v},
+		}
+	case bool:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_BoolValue{BoolValue: v},
+		}
+	case []string:
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: v},
+			},
+		}
+	case []interface{}:
+		// Convert interface slice to string slice
+		var stringArray []string
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				stringArray = append(stringArray, str)
+			} else {
+				stringArray = append(stringArray, fmt.Sprintf("%v", item))
+			}
+		}
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: stringArray},
+			},
+		}
+	case primitive.A: // MongoDB array type
+		var stringArray []string
+		for _, item := range v {
+			stringArray = append(stringArray, fmt.Sprintf("%v", item))
+		}
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringArray{
+				StringArray: &ticketpb.StringArray{Values: stringArray},
+			},
+		}
+	default:
+		// Convert unknown types to string
+		return &ticketpb.FieldValue{
+			Value: &ticketpb.FieldValue_StringValue{StringValue: fmt.Sprintf("%v", v)},
+		}
+	}
+}
+
 // generateTicketID generates a unique ticket ID if not provided
 func (m *MongoDBStorage) generateTicketID() string {
 	// Generate a simple ticket ID with timestamp

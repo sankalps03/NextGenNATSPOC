@@ -8,10 +8,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/platform/ticket-svc/cache"
 	storage2 "github.com/platform/ticket-svc/storage"
 
 	"github.com/google/uuid"
@@ -39,7 +41,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-jsonb", "postgresql-dynamic", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-dynamic", "scylladb", or "mongodb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -54,6 +56,12 @@ type Config struct {
 	MongoDBUsername   string // MongoDB username (optional)
 	MongoDBPassword   string // MongoDB password (optional)
 	InteractivePrompt bool   // Enable interactive storage selection
+	// DragonFly Cache Configuration
+	DragonflyURL      string // DragonFly cache URL
+	DragonflyPassword string // DragonFly cache password
+	DragonflyDB       int    // DragonFly cache database number
+	CacheEnabled      bool   // Enable caching
+	CacheTTL          int    // Cache TTL in seconds
 }
 
 type NATSManager struct {
@@ -66,6 +74,8 @@ type TicketService struct {
 	storage     storage2.TicketStorage
 	kvStore     jetstream.KeyValue
 	objStore    jetstream.ObjectStore
+	cache       *cache.DragonflyCache
+	config      *Config
 }
 
 // Removed hardcoded request structs - now using dynamic field handling
@@ -352,6 +362,21 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 	}
 	dbLatency := time.Since(dbStart)
 
+	// Invalidate relevant caches after successful creation
+	if ts.config.CacheEnabled && ts.cache != nil {
+		// Invalidate ticket list cache since a new ticket was added
+		if err := ts.cache.InvalidateTicketList(context.Background()); err != nil {
+			log.Printf("Warning: Failed to invalidate ticket list cache: %v", err)
+		}
+
+		// Invalidate search result caches since they may now be outdated
+		if err := ts.cache.InvalidateSearchPatterns(context.Background(), "*"); err != nil {
+			log.Printf("Warning: Failed to invalidate search caches: %v", err)
+		}
+
+		log.Printf("Invalidated caches after creating ticket %s", ticketData.Id)
+	}
+
 	// Store ticket document in KV store if using OpenSearch storage
 	if ts.kvStore != nil {
 		kvKey := ticketData.Id
@@ -376,13 +401,40 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 }
 
 func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, error) {
-	// Measure database latency
-	dbStart := time.Now()
-	tickets, err := ts.storage.ListTickets(ts.kvStore)
-	dbLatency := time.Since(dbStart)
+	var tickets []*ticketpb.TicketData
+	var err error
+	var dbLatency time.Duration
+	cacheHit := false
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to list tickets: %w", err)
+	// Try cache first if enabled
+	if ts.config.CacheEnabled && ts.cache != nil {
+		cacheStart := time.Now()
+		tickets, cacheHit = ts.cache.GetTicketList(context.Background())
+		if cacheHit {
+			dbLatency = time.Since(cacheStart)
+			log.Printf("Cache HIT for ticket list")
+		} else {
+			log.Printf("Cache MISS for ticket list")
+		}
+	}
+
+	// If not found in cache, get from database
+	if !cacheHit {
+		dbStart := time.Now()
+		tickets, err = ts.storage.ListTickets(ts.kvStore)
+		dbLatency = time.Since(dbStart)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to list tickets: %w", err)
+		}
+
+		// Store in cache for future requests
+		if ts.config.CacheEnabled && ts.cache != nil {
+			ttl := time.Duration(ts.config.CacheTTL) * time.Second
+			if err := ts.cache.SetTicketList(context.Background(), tickets, ttl); err != nil {
+				log.Printf("Warning: Failed to cache ticket list: %v", err)
+			}
+		}
 	}
 
 	// Convert protobuf tickets to JSON
@@ -395,6 +447,7 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 	responseData := map[string]interface{}{
 		"result":      jsonTickets,
 		"total_count": len(tickets),
+		"cache_hit":   cacheHit,
 	}
 
 	// Store in object store if available
@@ -430,10 +483,38 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 }
 
 func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error) {
-	// Measure database latency
-	dbStart := time.Now()
-	ticketData, found := ts.storage.GetTicket(req.TicketID, ts.kvStore)
-	dbLatency := time.Since(dbStart)
+	var ticketData *ticketpb.TicketData
+	var found bool
+	var dbLatency time.Duration
+	cacheHit := false
+
+	// Try cache first if enabled
+	if ts.config.CacheEnabled && ts.cache != nil {
+		cacheStart := time.Now()
+		ticketData, found = ts.cache.GetTicket(context.Background(), req.TicketID)
+		if found {
+			cacheHit = true
+			dbLatency = time.Since(cacheStart)
+			log.Printf("Cache HIT for ticket %s", req.TicketID)
+		} else {
+			log.Printf("Cache MISS for ticket %s", req.TicketID)
+		}
+	}
+
+	// If not found in cache, get from database
+	if !found {
+		dbStart := time.Now()
+		ticketData, found = ts.storage.GetTicket(req.TicketID, ts.kvStore)
+		dbLatency = time.Since(dbStart)
+
+		// Store in cache for future requests
+		if found && ts.config.CacheEnabled && ts.cache != nil {
+			ttl := time.Duration(ts.config.CacheTTL) * time.Second
+			if err := ts.cache.SetTicket(context.Background(), ticketData, ttl); err != nil {
+				log.Printf("Warning: Failed to cache ticket %s: %v", req.TicketID, err)
+			}
+		}
+	}
 
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
@@ -445,6 +526,7 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 	responseData := map[string]interface{}{
 		"result":      jsonTicket,
 		"total_count": 1,
+		"cache_hit":   cacheHit,
 	}
 
 	// Store in object store if available
@@ -526,6 +608,26 @@ func (ts *TicketService) handleUpdateTicket(req ServiceRequest) (interface{}, er
 		updateStart := time.Now()
 		ts.storage.UpdateTicket(ticketData)
 		updateLatency = time.Since(updateStart)
+
+		// Invalidate caches after successful update
+		if ts.config.CacheEnabled && ts.cache != nil {
+			// Remove the specific ticket from cache
+			if err := ts.cache.DeleteTicket(context.Background(), req.TicketID); err != nil {
+				log.Printf("Warning: Failed to invalidate ticket cache for %s: %v", req.TicketID, err)
+			}
+
+			// Invalidate ticket list cache since ticket data changed
+			if err := ts.cache.InvalidateTicketList(context.Background()); err != nil {
+				log.Printf("Warning: Failed to invalidate ticket list cache: %v", err)
+			}
+
+			// Invalidate search result caches since they may now be outdated
+			if err := ts.cache.InvalidateSearchPatterns(context.Background(), "*"); err != nil {
+				log.Printf("Warning: Failed to invalidate search caches: %v", err)
+			}
+
+			log.Printf("Invalidated caches after updating ticket %s", req.TicketID)
+		}
 	}
 
 	// Total database latency includes both get and update operations
@@ -545,6 +647,26 @@ func (ts *TicketService) handleDeleteTicket(req ServiceRequest) (interface{}, er
 
 	if !found {
 		return ErrorResponse{Error: "ticket_not_found"}, nil
+	}
+
+	// Invalidate caches after successful deletion
+	if ts.config.CacheEnabled && ts.cache != nil {
+		// Remove the specific ticket from cache
+		if err := ts.cache.DeleteTicket(context.Background(), req.TicketID); err != nil {
+			log.Printf("Warning: Failed to delete ticket from cache for %s: %v", req.TicketID, err)
+		}
+
+		// Invalidate ticket list cache since a ticket was removed
+		if err := ts.cache.InvalidateTicketList(context.Background()); err != nil {
+			log.Printf("Warning: Failed to invalidate ticket list cache: %v", err)
+		}
+
+		// Invalidate search result caches since they may now be outdated
+		if err := ts.cache.InvalidateSearchPatterns(context.Background(), "*"); err != nil {
+			log.Printf("Warning: Failed to invalidate search caches: %v", err)
+		}
+
+		log.Printf("Invalidated caches after deleting ticket %s", req.TicketID)
 	}
 
 	return ResponseWithLatency{
@@ -567,23 +689,53 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 		return nil, fmt.Errorf("failed to parse search request: %w", err)
 	}
 
-	// Measure database latency
-	dbStart := time.Now()
 	var tickets []*ticketpb.TicketData
+	var dbLatency time.Duration
+	cacheHit := false
 
-	// Use projection-aware search if projected fields are specified
-	if len(searchRequest.ProjectedFields) > 0 {
-		tickets, err = ts.storage.SearchTicketsWithProjection(searchRequest)
-		log.Printf("Using projection-aware search with %d projected fields", len(searchRequest.ProjectedFields))
-	} else {
-		// Fallback to original search for backward compatibility
-		tickets, err = ts.storage.SearchTickets(searchRequest)
-		log.Printf("Using standard search (no projection)")
+	// Generate cache key for search
+	var searchKey string
+	if ts.config.CacheEnabled && ts.cache != nil {
+		searchKey = ts.cache.GenerateSearchKey(searchRequest.Conditions, searchRequest.ProjectedFields, searchRequest.SortFields)
+
+		// Try cache first
+		cacheStart := time.Now()
+		tickets, cacheHit = ts.cache.GetSearchResults(context.Background(), searchKey)
+		if cacheHit {
+			dbLatency = time.Since(cacheStart)
+			log.Printf("Cache HIT for search key %s", searchKey)
+		} else {
+			log.Printf("Cache MISS for search key %s", searchKey)
+		}
 	}
-	dbLatency := time.Since(dbStart)
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to search tickets: %w", err)
+	// If not found in cache, search database
+	if !cacheHit {
+		dbStart := time.Now()
+
+		// Use projection-aware search if projected fields are specified
+		if len(searchRequest.ProjectedFields) > 0 {
+			tickets, err = ts.storage.SearchTicketsWithProjection(searchRequest)
+			log.Printf("Using projection-aware search with %d projected fields", len(searchRequest.ProjectedFields))
+		} else {
+			// Fallback to original search for backward compatibility
+			tickets, err = ts.storage.SearchTickets(searchRequest)
+			log.Printf("Using standard search (no projection)")
+		}
+		dbLatency = time.Since(dbStart)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to search tickets: %w", err)
+		}
+
+		// Store search results in cache
+		if ts.config.CacheEnabled && ts.cache != nil {
+			// Use shorter TTL for search results as they change more frequently
+			searchTTL := time.Duration(ts.config.CacheTTL/2) * time.Second
+			if err := ts.cache.SetSearchResults(context.Background(), searchKey, tickets, searchTTL); err != nil {
+				log.Printf("Warning: Failed to cache search results: %v", err)
+			}
+		}
 	}
 
 	// Convert protobuf tickets to response format
@@ -643,6 +795,7 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	responseData := map[string]interface{}{
 		"result":      responseTickets,
 		"total_count": len(tickets),
+		"cache_hit":   cacheHit,
 	}
 
 	// Store in object store if available
@@ -891,6 +1044,20 @@ func (ts *TicketService) publishTicketSearched(ctx context.Context, resultCount 
 }
 
 func loadConfig() *Config {
+	cacheTTL := 300 // Default 5 minutes
+	if ttlStr := getEnv("CACHE_TTL", "300"); ttlStr != "" {
+		if parsedTTL, err := strconv.Atoi(ttlStr); err == nil {
+			cacheTTL = parsedTTL
+		}
+	}
+
+	dragonflyDB := 0 // Default database 0
+	if dbStr := getEnv("DRAGONFLY_DB", "0"); dbStr != "" {
+		if parsedDB, err := strconv.Atoi(dbStr); err == nil {
+			dragonflyDB = parsedDB
+		}
+	}
+
 	return &Config{
 		NATSUrl:           getEnv("NATS_URL", "nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"),
 		ServiceName:       getEnv("SERVICE_NAME", "ticket-service"),
@@ -903,7 +1070,7 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
-		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
+		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:postgres123@localhost/tickets_db?sslmode=disable"),
 		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
 		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
 		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),
@@ -914,6 +1081,12 @@ func loadConfig() *Config {
 		MongoDBUsername:   getEnv("MONGODB_USERNAME", ""),
 		MongoDBPassword:   getEnv("MONGODB_PASSWORD", ""),
 		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "false") == "true",
+		// DragonFly Cache Configuration
+		DragonflyURL:      getEnv("DRAGONFLY_URL", "localhost:6379"),
+		DragonflyPassword: getEnv("DRAGONFLY_PASSWORD", ""),
+		DragonflyDB:       dragonflyDB,
+		CacheEnabled:      getEnv("CACHE_ENABLED", "true") == "true",
+		CacheTTL:          cacheTTL,
 	}
 }
 
@@ -1038,11 +1211,10 @@ func promptForStorageType() string {
 		fmt.Println("3. PostgreSQL")
 		fmt.Println("4. PostgreSQL EAV")
 		fmt.Println("5. PostgreSQL Hstore")
-		fmt.Println("6. PostgreSQL JSONB")
-		fmt.Println("7. PostgreSQL Dynamic Columns")
-		fmt.Println("8. ScyllaDB")
-		fmt.Println("9. MongoDB")
-		fmt.Print("Enter your choice (1-9): ")
+		fmt.Println("6. PostgreSQL Dynamic Columns")
+		fmt.Println("7. ScyllaDB")
+		fmt.Println("8. MongoDB")
+		fmt.Print("Enter your choice (1-8): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1068,19 +1240,16 @@ func promptForStorageType() string {
 			fmt.Println("Selected: PostgreSQL Hstore")
 			return "postgresql-hstore"
 		case "6":
-			fmt.Println("Selected: PostgreSQL JSONB")
-			return "postgresql-jsonb"
-		case "7":
 			fmt.Println("Selected: PostgreSQL Dynamic Columns")
 			return "postgresql-dynamic"
-		case "8":
+		case "7":
 			fmt.Println("Selected: ScyllaDB")
 			return "scylladb"
-		case "9":
+		case "8":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1-9.")
+			fmt.Println("Invalid choice. Please enter 1-8.")
 		}
 	}
 }
@@ -1169,16 +1338,6 @@ func main() {
 		storage = postgresHstoreStorage
 		log.Printf("Using PostgreSQL Hstore storage with connection: %s and base table: %s",
 			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
-	case "postgresql-jsonb":
-		postgresJSONBStorage, err := storage2.NewPostgreSQLJSONBStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
-		if err != nil {
-			log.Fatalf("Failed to initialize PostgreSQL JSONB storage: %v", err)
-
-			return
-		}
-		storage = postgresJSONBStorage
-		log.Printf("Using PostgreSQL JSONB storage with connection: %s and base table: %s",
-			maskConnectionString(config.PostgreSQLURL), config.PostgreSQLTable)
 	case "postgresql-dynamic":
 		postgresDynamicStorage, err := storage2.NewPostgreSQLDynamicStorage(context.Background(), config.PostgreSQLTable, config.PostgreSQLURL)
 		if err != nil {
@@ -1223,11 +1382,26 @@ func main() {
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}
 
+	// Initialize DragonFly cache if enabled
+	var dragonflyCache *cache.DragonflyCache
+	if config.CacheEnabled {
+		var err error
+		dragonflyCache, err = cache.NewDragonflyCache(config.DragonflyURL, config.DragonflyPassword, config.DragonflyDB)
+		if err != nil {
+			log.Printf("WARNING: Failed to initialize DragonFly cache: %v. Continuing without cache.", err)
+			config.CacheEnabled = false // Disable caching for this session
+		} else {
+			log.Printf("DragonFly cache initialized successfully. TTL: %d seconds", config.CacheTTL)
+		}
+	}
+
 	service := &TicketService{
 		natsManager: natsManager,
 		storage:     storage,
 		kvStore:     kvStore,
 		objStore:    objStore,
+		cache:       dragonflyCache,
+		config:      config,
 	}
 
 	sub, err := natsManager.conn.Subscribe("ticket.service", service.handleServiceRequest)
@@ -1248,6 +1422,15 @@ func main() {
 	if storage != nil {
 		if err := storage.Close(); err != nil {
 			log.Printf("Error closing storage: %v", err)
+		}
+	}
+
+	// Close DragonFly cache connection
+	if dragonflyCache != nil {
+		if err := dragonflyCache.Close(); err != nil {
+			log.Printf("Error closing DragonFly cache: %v", err)
+		} else {
+			log.Println("DragonFly cache connection closed")
 		}
 	}
 
