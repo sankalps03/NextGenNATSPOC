@@ -79,13 +79,14 @@ type CreateConfig struct {
 
 // SearchConfig defines search operation settings
 type SearchConfig struct {
-	Enabled           bool               `json:"enabled"`
-	SearchConditions  []SearchCondition  `json:"search_conditions"`
-	ProjectedFields   []string           `json:"projected_fields"`
-	RandomizeFields   bool               `json:"randomize_fields"`
-	MaxResults        int                `json:"max_results"`
-	ConditionWeights  map[string]float64 `json:"condition_weights"`
-	UseCategoryFilter bool               `json:"use_category_filter"` // Use CategoryFilter for category-aware searches
+	Enabled             bool               `json:"enabled"`
+	SearchConditions    []SearchCondition  `json:"search_conditions"`
+	ProjectedFields     []string           `json:"projected_fields"`
+	RandomizeFields     bool               `json:"randomize_fields"`
+	MaxResults          int                `json:"max_results"`
+	ConditionWeights    map[string]float64 `json:"condition_weights"`
+	UseCategoryFilter   bool               `json:"use_category_filter"`   // Use CategoryFilter for category-aware searches
+	LoadExistingTickets bool               `json:"load_existing_tickets"` // Load existing tickets on startup for search operations
 }
 
 // SearchCondition defines a search condition template
@@ -156,13 +157,14 @@ func Load() (*Config, error) {
 				UseCategorizedGeneration: getEnvBool("CREATE_USE_CATEGORIZED_GENERATION", true),
 			},
 			Search: SearchConfig{
-				Enabled:           getEnvBool("SEARCH_ENABLED", true),
-				ProjectedFields:   getEnvStringSlice("SEARCH_PROJECTED_FIELDS", []string{}),
-				RandomizeFields:   getEnvBool("SEARCH_RANDOMIZE_FIELDS", true),
-				MaxResults:        getEnvInt("SEARCH_MAX_RESULTS", 100),
-				SearchConditions:  getDefaultSearchConditions(),
-				ConditionWeights:  getDefaultConditionWeights(),
-				UseCategoryFilter: getEnvBool("SEARCH_USE_CATEGORY_FILTER", true), // Enable CategoryFilter
+				Enabled:             getEnvBool("SEARCH_ENABLED", true),
+				ProjectedFields:     getEnvStringSlice("SEARCH_PROJECTED_FIELDS", []string{}),
+				RandomizeFields:     getEnvBool("SEARCH_RANDOMIZE_FIELDS", true),
+				MaxResults:          getEnvInt("SEARCH_MAX_RESULTS", 100),
+				SearchConditions:    getDefaultSearchConditions(),
+				ConditionWeights:    getDefaultConditionWeights(),
+				UseCategoryFilter:   getEnvBool("SEARCH_USE_CATEGORY_FILTER", true),   // Enable CategoryFilter
+				LoadExistingTickets: getEnvBool("SEARCH_LOAD_EXISTING_TICKETS", true), // Load existing tickets on startup
 			},
 			Get: GetConfig{
 				Enabled:         getEnvBool("GET_ENABLED", true),

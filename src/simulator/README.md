@@ -7,6 +7,7 @@ A high-performance Go-based simulator service that generates tickets and tests A
 - **EPS-based Generation**: Configurable events per second for different API operations
 - **Multi-Tenant Support**: Random tenant selection for realistic multi-tenant testing
 - **CSV Data Source**: Reads real ticket data from CSV files with automatic field mapping
+- **Existing Ticket Loading**: Load existing tickets from database on startup for comprehensive search operations
 - **Multi-API Testing**: Parallel testing of create, search, get, and update APIs
 - **Empty Value Handling**: Automatic replacement of empty values with dummy data
 - **Comprehensive Metrics**: Real-time performance monitoring and reporting
@@ -210,6 +211,50 @@ The simulator automatically:
 - **Uses CSV Values**: Extracts actual values from your CSV data for realistic searches
 - **Smart Operators**: Selects appropriate operators based on field types
 - **Random Projections**: Generates 3-8 random projection fields per query
+
+## 📊 Existing Ticket Loading
+
+The simulator can load existing tickets from the database on startup to provide comprehensive search data from day one.
+
+### How It Works
+1. **Startup Loading**: On simulator start, queries the database for all existing tickets per tenant
+2. **Data Extraction**: Extracts searchable field values from existing tickets
+3. **Search Pool Population**: Builds comprehensive pools of realistic search values
+4. **Continuous Enhancement**: Newly created tickets are added to the search pools
+
+### Configuration
+```bash
+# Environment Variable
+export SEARCH_LOAD_EXISTING_TICKETS=true
+
+# JSON Configuration
+{
+  "operations": {
+    "search": {
+      "load_existing_tickets": true
+    }
+  }
+}
+```
+
+### Benefits
+- **Immediate Realism**: Search operations use real data from startup
+- **Comprehensive Coverage**: Access to full range of existing field values
+- **Better Load Testing**: More representative search patterns and edge cases
+- **Operational Continuity**: GET/UPDATE operations can access existing ticket IDs
+
+### Performance Impact
+- **Startup Time**: Additional 5-15 seconds depending on ticket count
+- **Memory Usage**: ~100 values per field per tenant (memory-limited)
+- **Search Quality**: Dramatically improved realism and coverage
+
+### Expected Log Output
+```
+INFO [simulator]: Loading existing tickets for search operations...
+INFO [simulator]: Loaded 1250 existing tickets for tenant tenant-1
+INFO [simulator]: Ticket loading summary: 4240 total tickets loaded across 3 tenants
+INFO [simulator]: Search data summary: 19 fields with searchable values, 8500 total unique values
+```
 
 ## 🛠️ Development
 

@@ -59,6 +59,15 @@ func New(cfg *config.Config, csvReader *csvreader.CSVReader, httpClient *httpcli
 func (g *Generator) Start(ctx context.Context) error {
 	g.logger.Info("Starting ticket generator...")
 
+	// Load existing tickets on startup if enabled
+	if g.config.Operations.Search.LoadExistingTickets {
+		g.logger.Info("Loading existing tickets for search operations...")
+		if err := g.loadExistingTickets(ctx); err != nil {
+			g.logger.Error(fmt.Sprintf("Failed to load existing tickets: %v", err))
+			// Continue anyway - this is not a fatal error
+		}
+	}
+
 	var wg sync.WaitGroup
 
 	// Start create ticket generator
@@ -375,9 +384,10 @@ func (g *Generator) updateTicket(ctx context.Context) {
 
 // processCreateData processes ticket data for creation
 func (g *Generator) processCreateData(fields map[string]interface{}) map[string]interface{} {
-	processed := make(map[string]interface{})
+	// Start with all static fields from PostgreSQL schema
+	processed := g.generateAllStaticFields()
 
-	// Copy fields excluding the ones in exclude list
+	// Override with provided fields (excluding the ones in exclude list)
 	for key, value := range fields {
 		excluded := false
 		for _, excludeField := range g.config.Operations.Create.ExcludeFields {
@@ -1552,6 +1562,185 @@ func (g *Generator) generateConditionFromCollectedValues(field string) (*httpcli
 	}, tenantID
 }
 
+// loadExistingTickets loads existing tickets from the database to populate search data
+func (g *Generator) loadExistingTickets(ctx context.Context) error {
+	g.logger.Info("Starting to load existing tickets from database...")
+
+	// For each configured tenant, load tickets
+	for _, tenantID := range g.config.TenantIDs {
+		if err := g.loadTicketsForTenant(ctx, tenantID); err != nil {
+			g.logger.Error(fmt.Sprintf("Failed to load tickets for tenant %s: %v", tenantID, err))
+			continue
+		}
+	}
+
+	// Log summary of loaded data
+	g.logLoadedTicketsSummary()
+
+	return nil
+}
+
+// loadTicketsForTenant loads tickets for a specific tenant
+func (g *Generator) loadTicketsForTenant(ctx context.Context, tenantID string) error {
+	g.logger.Info(fmt.Sprintf("Loading existing tickets for tenant: %s", tenantID))
+
+	// Create a search request to get all tickets (no conditions = get all)
+	searchRequest := httpclient.SearchRequest{
+		Conditions:      []httpclient.SearchCondition{}, // Empty conditions to get all tickets
+		ProjectedFields: g.getBusinessCriticalFields(),  // Only get the fields we need for searching
+	}
+
+	// Make API request to get existing tickets
+	response, err := g.httpClient.SearchTicketsWithTenant(ctx, searchRequest, tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to search existing tickets: %w", err)
+	}
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("search request failed with status %d: %s", response.StatusCode, response.Error)
+	}
+
+	// Debug: Log the actual response structure
+	g.logger.Info(fmt.Sprintf("DEBUG: Raw response body for tenant %s: %+v", tenantID, response.Body))
+
+	// Parse response to extract tickets
+	tickets, err := g.parseTicketsFromResponse(response.Body)
+	if err != nil {
+		return fmt.Errorf("failed to parse tickets from response: %w", err)
+	}
+
+	// Process each ticket to collect searchable values and IDs
+	loadedCount := 0
+	for _, ticket := range tickets {
+		// Extract ticket ID and add to created tickets list
+		if ticketID, ok := ticket["id"].(string); ok && ticketID != "" {
+			g.addCreatedTicketID(tenantID, ticketID)
+		}
+
+		// Collect searchable values from this ticket
+		g.collectSearchableValues(tenantID, ticket)
+		loadedCount++
+	}
+
+	g.logger.Info(fmt.Sprintf("Loaded %d existing tickets for tenant %s", loadedCount, tenantID))
+	return nil
+}
+
+// parseTicketsFromResponse parses the API response to extract ticket data
+func (g *Generator) parseTicketsFromResponse(responseBody map[string]interface{}) ([]map[string]interface{}, error) {
+	// Log the full response structure for debugging
+	g.logger.Info(fmt.Sprintf("DEBUG: Full response structure: %+v", responseBody))
+
+	// Check if response is directly an array (some APIs return arrays directly)
+	if ticketsArray, ok := responseBody["result"].([]interface{}); ok {
+		g.logger.Info("DEBUG: Found direct 'result' array in response body")
+		tickets := make([]map[string]interface{}, 0, len(ticketsArray))
+		for _, ticketInterface := range ticketsArray {
+			if ticket, ok := ticketInterface.(map[string]interface{}); ok {
+				tickets = append(tickets, ticket)
+			}
+		}
+		return tickets, nil
+	}
+
+	// Try to extract data from response body
+	data, ok := responseBody["data"].(map[string]interface{})
+	if !ok {
+		// Check if the entire response body is the data we need
+		g.logger.Info("DEBUG: No 'data' field found, checking for direct ticket fields")
+
+		// Check if response body itself contains ticket array
+		if ticketsArray, ok := responseBody["result"].([]interface{}); ok {
+			g.logger.Info("DEBUG: Found 'result' array directly in response body")
+			tickets := make([]map[string]interface{}, 0, len(ticketsArray))
+			for _, ticketInterface := range ticketsArray {
+				if ticket, ok := ticketInterface.(map[string]interface{}); ok {
+					tickets = append(tickets, ticket)
+				}
+			}
+			return tickets, nil
+		}
+
+		return nil, fmt.Errorf("response does not contain 'data' field and no direct 'result' array found. Available fields: %v", getMapKeys(responseBody))
+	}
+
+	g.logger.Info(fmt.Sprintf("DEBUG: Found 'data' field with content: %+v", data))
+
+	// Try to extract tickets from data - support both "tickets" and "result" fields
+	var ticketsInterface interface{}
+	var found bool
+
+	// First try "result" field (used by ticket service)
+	if ticketsInterface, found = data["result"]; !found {
+		// Fallback to "tickets" field (for backward compatibility)
+		if ticketsInterface, found = data["tickets"]; !found {
+			return nil, fmt.Errorf("response data does not contain 'result' or 'tickets' field. Available fields in data: %v", getMapKeys(data))
+		}
+	}
+
+	g.logger.Info(fmt.Sprintf("DEBUG: Found tickets field with %d items", getArrayLength(ticketsInterface)))
+
+	// Convert to slice of maps
+	ticketsSlice, ok := ticketsInterface.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("tickets/result field is not an array, got type: %T", ticketsInterface)
+	}
+
+	tickets := make([]map[string]interface{}, 0, len(ticketsSlice))
+	for _, ticketInterface := range ticketsSlice {
+		if ticket, ok := ticketInterface.(map[string]interface{}); ok {
+			tickets = append(tickets, ticket)
+		}
+	}
+
+	g.logger.Info(fmt.Sprintf("DEBUG: Successfully parsed %d tickets", len(tickets)))
+	return tickets, nil
+}
+
+// Helper function to get array length safely
+func getArrayLength(v interface{}) int {
+	if arr, ok := v.([]interface{}); ok {
+		return len(arr)
+	}
+	return 0
+}
+
+// logLoadedTicketsSummary logs a summary of loaded tickets and searchable values
+func (g *Generator) logLoadedTicketsSummary() {
+	g.searchValuesMu.RLock()
+	g.ticketIDsMu.RLock()
+	defer g.searchValuesMu.RUnlock()
+	defer g.ticketIDsMu.RUnlock()
+
+	// Count total tickets loaded
+	totalTickets := 0
+	for _, ticketIDs := range g.createdTickets {
+		totalTickets += len(ticketIDs)
+	}
+
+	// Count searchable fields with values
+	fieldsWithValues := 0
+	totalValues := 0
+	for _, fieldValues := range g.searchableValues {
+		if len(fieldValues) > 0 {
+			fieldsWithValues++
+			for _, tenantValues := range fieldValues {
+				totalValues += len(tenantValues)
+			}
+		}
+	}
+
+	g.logger.Info(fmt.Sprintf("Ticket loading summary: %d total tickets loaded across %d tenants",
+		totalTickets, len(g.createdTickets)))
+	g.logger.Info(fmt.Sprintf("Search data summary: %d fields with searchable values, %d total unique values",
+		fieldsWithValues, totalValues))
+
+	// Log per-tenant summary
+	for tenantID, ticketIDs := range g.createdTickets {
+		g.logger.Info(fmt.Sprintf("Tenant %s: %d tickets available for operations", tenantID, len(ticketIDs)))
+	}
+}
+
 // generateAdditionalBusinessFields generates 20 additional fields from business scenarios
 func (g *Generator) generateAdditionalBusinessFields() map[string]interface{} {
 	// Define all possible business fields with their data generators
@@ -1776,4 +1965,219 @@ func (g *Generator) getAllPossibleBusinessFieldNames() []string {
 		"project_id", "contract_number", "vendor_name", "budget_allocated", "risk_level", "compliance_status",
 		"asset_tag", "location_code",
 	}
+}
+
+// generateAllStaticFields generates all static fields from PostgreSQL schema with realistic values
+func (g *Generator) generateAllStaticFields() map[string]interface{} {
+	now := time.Now()
+	nowUnixMilli := now.UnixMilli()
+
+	// Generate a unique ticket ID
+	ticketID := fmt.Sprintf("TKT-%d-%d", g.rand.Intn(9999)+1000, nowUnixMilli)
+
+	fields := map[string]interface{}{
+		// Core fields (auto-generated by database, but included for completeness)
+		"ticket_id":  ticketID,
+		"created_at": now.Format(time.RFC3339),
+		"updated_at": now.Format(time.RFC3339),
+
+		// User and assignment fields
+		"updatedbyid":  int64(g.rand.Intn(1000) + 1000), // User IDs 1000-1999
+		"createdbyid":  int64(g.rand.Intn(1000) + 1000), // User IDs 1000-1999
+		"removedbyid":  nil,                             // Usually null initially
+		"requesterid":  int64(g.rand.Intn(5000) + 2000), // Requester IDs 2000-6999
+		"technicianid": int64(g.rand.Intn(100) + 100),   // Technician IDs 100-199
+		"closedby":     nil,                             // Usually null initially
+		"resolvedby":   nil,                             // Usually null initially
+
+		// Timestamp fields (Unix timestamps in milliseconds)
+		"updatedtime":              nowUnixMilli,
+		"createdtime":              nowUnixMilli,
+		"removedtime":              nil,
+		"dueby":                    nowUnixMilli + int64(g.rand.Intn(7*24*60*60*1000)), // Due within 7 days
+		"firstresponsetime":        nil,
+		"lastclosedtime":           nil,
+		"lastopenedtime":           nowUnixMilli,
+		"lastresolvedtime":         nil,
+		"lastviolationtime":        nil,
+		"olddueby":                 nil,
+		"oldresponsedue":           nil,
+		"resolutionescalationtime": nil,
+		"responsedue":              nowUnixMilli + int64(g.rand.Intn(24*60*60*1000)), // Response due within 24 hours
+		"responseescalationtime":   nil,
+		"statuschangedtime":        nowUnixMilli,
+		"groupchangedtime":         nowUnixMilli,
+		"lastolaviolationtime":     nil,
+		"oladueby":                 nil,
+		"oldoladueby":              nil,
+		"askfeedbackdate":          nil,
+		"firstfeedbackdate":        nil,
+		"olaescalationtime":        nil,
+		"lastucviolationtime":      nil,
+		"olducdueby":               nil,
+		"ucdueby":                  nil,
+		"ucescalationtime":         nil,
+		"lastapproveddate":         nil,
+
+		// Text fields
+		"name":                 g.generateTicketName(),
+		"oobtype":              nil,
+		"description":          g.generateDescription(),
+		"originaldescription":  g.generateDescription(),
+		"subject":              g.generateSubject(),
+		"callfrom":             g.generateCallFrom(),
+		"emailreadconfigemail": nil,
+
+		// Boolean fields (default to false)
+		"removed":                false,
+		"duetimemanuallyupdated": g.rand.Float32() < 0.1, // 10% manually updated
+		"reopened":               false,
+		"responsedueviolated":    g.rand.Float32() < 0.05, // 5% violated
+		"slaviolated":            g.rand.Float32() < 0.03, // 3% violated
+		"purchaserequest":        g.rand.Float32() < 0.15, // 15% purchase requests
+		"spam":                   g.rand.Float32() < 0.02, // 2% spam
+		"viprequest":             g.rand.Float32() < 0.05, // 5% VIP requests
+		"olaviolated":            g.rand.Float32() < 0.02, // 2% OLA violated
+		"ucviolated":             g.rand.Float32() < 0.01, // 1% UC violated
+		"migrated":               g.rand.Float32() < 0.05, // 5% migrated
+
+		// Category and classification fields
+		"categoryid":          int64(g.rand.Intn(50) + 1),  // Categories 1-50
+		"departmentid":        int64(g.rand.Intn(20) + 1),  // Departments 1-20
+		"groupid":             int64(g.rand.Intn(30) + 1),  // Groups 1-30
+		"impactid":            int64(g.rand.Intn(4) + 1),   // Impact 1-4
+		"locationid":          int64(g.rand.Intn(100) + 1), // Locations 1-100
+		"priorityid":          int64(g.rand.Intn(4) + 1),   // Priority 1-4
+		"statusid":            int64(g.rand.Intn(5) + 1),   // Status 1-5
+		"urgencyid":           int64(g.rand.Intn(4) + 1),   // Urgency 1-4
+		"violatedslaid":       nil,
+		"servicecatalogid":    int64(g.rand.Intn(100) + 1), // Service catalog 1-100
+		"sourceid":            int64(g.rand.Intn(5) + 1),   // Sources 1-5
+		"requesttype":         g.generateRequestType(),
+		"suggestedcategoryid": nil,
+		"suggestedgroupid":    nil,
+		"companyid":           int64(g.rand.Intn(10) + 1), // Companies 1-10
+		"vendorid":            nil,
+		"violateducid":        nil,
+		"transitionmodelid":   int64(g.rand.Intn(10) + 1), // Transition models 1-10
+		"messengerconfigid":   nil,
+
+		// Approval and workflow fields
+		"approvalstatus":     int32(g.rand.Intn(3)),     // 0=none, 1=pending, 2=approved
+		"approvaltype":       int32(g.rand.Intn(3)),     // 0=none, 1=manager, 2=finance
+		"resolutionduelevel": int32(g.rand.Intn(3) + 1), // 1-3
+		"responseduelevel":   int32(g.rand.Intn(3) + 1), // 1-3
+		"supportlevel":       int32(g.rand.Intn(3) + 1), // 1-3
+		"oladuelevel":        int32(g.rand.Intn(3) + 1), // 1-3
+		"ucduelevel":         int32(g.rand.Intn(3) + 1), // 1-3
+
+		// Duration and time tracking fields (in milliseconds)
+		"totalonholdduration":   int64(0),
+		"totalresolutiontime":   int64(0),
+		"totalslapausetime":     int64(0),
+		"totalworkingtime":      int64(0),
+		"totaluconholdduration": int64(0),
+		"totalucpausetime":      int64(0),
+		"totalucworkingtime":    int64(0),
+		"totalucresolutiontime": int64(0),
+
+		// Configuration and template fields
+		"templateid":        nil,
+		"emailreadconfigid": nil,
+	}
+
+	return fields
+}
+
+// Helper functions for generating realistic static field values
+
+// generateTicketName generates a realistic ticket name
+func (g *Generator) generateTicketName() string {
+	prefixes := []string{"INC", "SR", "CHG", "PRB", "TSK", "REQ"}
+	prefix := prefixes[g.rand.Intn(len(prefixes))]
+	number := g.rand.Intn(999999) + 100000
+	return fmt.Sprintf("%s-%06d", prefix, number)
+}
+
+// generateDescription generates a realistic ticket description
+func (g *Generator) generateDescription() string {
+	descriptions := []string{
+		"User experiencing intermittent network connectivity issues affecting productivity",
+		"Application crashes when attempting to save large documents",
+		"Request for additional software installation and configuration",
+		"Hardware replacement needed due to recurring system failures",
+		"Database performance degradation observed during peak hours",
+		"Email synchronization problems with mobile devices",
+		"Security access review and permission updates required",
+		"System backup and recovery procedures need to be implemented",
+		"Network printer not responding to print jobs from workstations",
+		"VPN connection drops frequently during remote work sessions",
+		"File server access permissions need to be updated for new team members",
+		"Software license renewal and compliance audit required",
+		"Workstation upgrade to support new business applications",
+		"Data migration from legacy system to new platform",
+		"User training request for new software implementation",
+	}
+	return descriptions[g.rand.Intn(len(descriptions))]
+}
+
+// generateSubject generates a realistic ticket subject
+func (g *Generator) generateSubject() string {
+	subjects := []string{
+		"Network connectivity issue",
+		"Software installation request",
+		"Password reset required",
+		"Hardware malfunction",
+		"System access request",
+		"Email configuration problem",
+		"VPN connection issue",
+		"Database access needed",
+		"Printer not working",
+		"Application error",
+		"File sharing problem",
+		"Security update required",
+		"Backup restoration needed",
+		"Performance issue",
+		"Training request",
+		"License renewal",
+		"Data recovery",
+		"System upgrade",
+		"Permission update",
+		"Configuration change",
+	}
+	return subjects[g.rand.Intn(len(subjects))]
+}
+
+// generateCallFrom generates a realistic call source
+func (g *Generator) generateCallFrom() string {
+	sources := []string{
+		"Phone",
+		"Email",
+		"Web Portal",
+		"Mobile App",
+		"Walk-in",
+		"Chat",
+		"SMS",
+	}
+	if g.rand.Float32() < 0.3 { // 30% chance of having a call source
+		return sources[g.rand.Intn(len(sources))]
+	}
+	return ""
+}
+
+// generateRequestType generates a realistic request type
+func (g *Generator) generateRequestType() string {
+	types := []string{
+		"INCIDENT",
+		"SERVICE_REQUEST",
+		"CHANGE_REQUEST",
+		"PROBLEM",
+		"TASK",
+		"INFORMATION_REQUEST",
+		"ACCESS_REQUEST",
+		"HARDWARE_REQUEST",
+		"SOFTWARE_REQUEST",
+		"TRAINING_REQUEST",
+	}
+	return types[g.rand.Intn(len(types))]
 }

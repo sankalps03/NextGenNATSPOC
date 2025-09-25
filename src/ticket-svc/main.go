@@ -374,7 +374,7 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 			log.Printf("Warning: Failed to invalidate search caches: %v", err)
 		}
 
-		log.Printf("Invalidated caches after creating ticket %s", ticketData.Id)
+		//log.Printf("Invalidated caches after creating ticket %s", ticketData.Id)
 	}
 
 	// Store ticket document in KV store if using OpenSearch storage
@@ -741,52 +741,37 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 	// Convert protobuf tickets to response format
 	var responseTickets []map[string]interface{}
 	for _, ticket := range tickets {
-		ticketMap := make(map[string]interface{})
-		ticketMap["id"] = ticket.Id
-		ticketMap["created_at"] = ticket.CreatedAt
-		ticketMap["updated_at"] = ticket.UpdatedAt
+		// Use the existing ticketToJSON function for consistent conversion
+		ticketMap := ticketToJSON(ticket)
 
-		// Add dynamic fields
-		for fieldName, fieldValue := range ticket.Fields {
-			ticketMap[fieldName] = convertFieldValueToInterface(fieldValue)
-		}
-
+		// If KV store is available and we have projected fields, enhance with KV data
 		if ts.kvStore != nil {
-
 			entries, err := ts.kvStore.Get(context.Background(), ticket.Id)
-
 			if err == nil && entries != nil {
-
-				if searchRequest.ProjectedFields == nil {
-
-					json.Unmarshal(entries.Value(), &ticketMap)
-
-				} else {
-
-					var docs map[string]interface{}
-
-					json.Unmarshal(entries.Value(), &docs)
-
-					counters := map[string]struct{}{}
-
-					for _, c := range searchRequest.ProjectedFields {
-
-						counters[c] = struct{}{}
-					}
-
-					for key, value := range docs {
-
-						if _, ok := counters[key]; ok {
-
-							ticketMap[key] = value
+				var kvData map[string]interface{}
+				if err := json.Unmarshal(entries.Value(), &kvData); err == nil {
+					// If projected fields are specified, only include those fields from KV store
+					if len(searchRequest.ProjectedFields) > 0 {
+						projectedFields := make(map[string]struct{})
+						for _, field := range searchRequest.ProjectedFields {
+							projectedFields[field] = struct{}{}
 						}
 
+						// Only add KV fields that are in the projection list
+						for key, value := range kvData {
+							if _, isProjected := projectedFields[key]; isProjected {
+								ticketMap[key] = value
+							}
+						}
+					} else {
+						// No projection specified, merge all KV data
+						for key, value := range kvData {
+							ticketMap[key] = value
+						}
 					}
 				}
 			}
 		}
-
-		delete(ticketMap, "fields")
 
 		responseTickets = append(responseTickets, ticketMap)
 	}
@@ -1070,7 +1055,7 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
-		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:postgres123@localhost/tickets_db?sslmode=disable"),
+		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
 		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
 		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
 		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),

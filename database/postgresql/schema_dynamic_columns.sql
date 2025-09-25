@@ -223,7 +223,18 @@ CREATE TABLE tickets_dynamic (
     c47_numeric BIGINT,
     c48_numeric BIGINT,
     c49_numeric BIGINT,
-    c50_numeric BIGINT
+    c50_numeric BIGINT,
+
+    -- Array columns for dynamic field mapping
+    c1_array_string TEXT[],
+    c2_array_string TEXT[],
+
+    c1_array_numeric BIGINT[],
+    c2_array_numeric BIGINT[],
+
+    -- Geo location columns for spatial data
+    c1_geolocation POINT,
+    c2_geolocation POINT
 );
 
 -- Create field mappings table to track which fields map to which columns per category
@@ -232,7 +243,7 @@ CREATE TABLE field_mappings (
     category_id BIGINT NOT NULL,
     field_name VARCHAR(255) NOT NULL,
     column_name VARCHAR(50) NOT NULL,
-    data_type VARCHAR(20) NOT NULL, -- 'string' or 'numeric'
+    data_type VARCHAR(20) NOT NULL, -- 'string', 'numeric', 'array_string', 'array_numeric', or 'geolocation'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
     -- Ensure unique mapping per category and field
@@ -283,6 +294,16 @@ CREATE INDEX idx_tickets_dynamic_text_search ON tickets_dynamic USING GIN (to_ts
 CREATE INDEX idx_field_mappings_category ON field_mappings(category_id);
 CREATE INDEX idx_field_mappings_field_name ON field_mappings(field_name);
 CREATE INDEX idx_field_mappings_column_name ON field_mappings(column_name);
+
+-- Indexes for array columns (using GIN for array operations)
+CREATE INDEX idx_tickets_dynamic_c1_array_string ON tickets_dynamic USING GIN (c1_array_string);
+CREATE INDEX idx_tickets_dynamic_c2_array_string ON tickets_dynamic USING GIN (c2_array_string);
+CREATE INDEX idx_tickets_dynamic_c1_array_numeric ON tickets_dynamic USING GIN (c1_array_numeric);
+CREATE INDEX idx_tickets_dynamic_c2_array_numeric ON tickets_dynamic USING GIN (c2_array_numeric);
+
+-- Indexes for geo location columns (using GIST for spatial operations)
+CREATE INDEX idx_tickets_dynamic_c1_geolocation ON tickets_dynamic USING GIST (c1_geolocation);
+CREATE INDEX idx_tickets_dynamic_c2_geolocation ON tickets_dynamic USING GIST (c2_geolocation);
 
 -- Helper function to get list of static/fixed field column names
 CREATE OR REPLACE FUNCTION get_static_field_columns()
@@ -335,7 +356,12 @@ BEGIN
         'c11_numeric', 'c12_numeric', 'c13_numeric', 'c14_numeric', 'c15_numeric', 'c16_numeric', 'c17_numeric', 'c18_numeric', 'c19_numeric', 'c20_numeric',
         'c21_numeric', 'c22_numeric', 'c23_numeric', 'c24_numeric', 'c25_numeric', 'c26_numeric', 'c27_numeric', 'c28_numeric', 'c29_numeric', 'c30_numeric',
         'c31_numeric', 'c32_numeric', 'c33_numeric', 'c34_numeric', 'c35_numeric', 'c36_numeric', 'c37_numeric', 'c38_numeric', 'c39_numeric', 'c40_numeric',
-        'c41_numeric', 'c42_numeric', 'c43_numeric', 'c44_numeric', 'c45_numeric', 'c46_numeric', 'c47_numeric', 'c48_numeric', 'c49_numeric', 'c50_numeric'
+        'c41_numeric', 'c42_numeric', 'c43_numeric', 'c44_numeric', 'c45_numeric', 'c46_numeric', 'c47_numeric', 'c48_numeric', 'c49_numeric', 'c50_numeric',
+        -- Array columns
+        'c1_array_string', 'c2_array_string',
+        'c1_array_numeric', 'c2_array_numeric',
+        -- Geo location columns
+        'c1_geolocation', 'c2_geolocation'
         ];
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
@@ -355,4 +381,12 @@ COMMENT ON COLUMN tickets_dynamic.dueby IS 'Unix timestamp when ticket is due fo
 COMMENT ON COLUMN field_mappings.category_id IS 'Category ID that this field mapping belongs to';
 COMMENT ON COLUMN field_mappings.field_name IS 'Original field name from the ticket data';
 COMMENT ON COLUMN field_mappings.column_name IS 'Mapped column name (e.g., c1_string, c5_numeric)';
-COMMENT ON COLUMN field_mappings.data_type IS 'Data type of the field (string or numeric)';
+COMMENT ON COLUMN field_mappings.data_type IS 'Data type of the field (string, numeric, array_string, array_numeric, or geolocation)';
+
+-- Comments for new column types
+COMMENT ON COLUMN tickets_dynamic.c1_array_string IS 'Dynamic array column for string array fields';
+COMMENT ON COLUMN tickets_dynamic.c2_array_string IS 'Dynamic array column for string array fields';
+COMMENT ON COLUMN tickets_dynamic.c1_array_numeric IS 'Dynamic array column for numeric array fields';
+COMMENT ON COLUMN tickets_dynamic.c2_array_numeric IS 'Dynamic array column for numeric array fields';
+COMMENT ON COLUMN tickets_dynamic.c1_geolocation IS 'Dynamic geo location column for spatial coordinates (latitude, longitude)';
+COMMENT ON COLUMN tickets_dynamic.c2_geolocation IS 'Dynamic geo location column for spatial coordinates (latitude, longitude)';

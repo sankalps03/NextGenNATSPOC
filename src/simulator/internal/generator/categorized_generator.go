@@ -33,80 +33,35 @@ func NewCategorizedGenerator(baseGen *Generator) *CategorizedTicketGenerator {
 func (g *CategorizedTicketGenerator) GetFieldCategories() FieldCategories {
 	return FieldCategories{
 		BaseColumns: []string{
-			"id",
-			"name",
-			"createdbyid",
-			"createdtime",
-			"updatedbyid",
-			"updatedtime",
-			"statusid",
-			"priorityid",
-			"requesterid",
-			"subject",
+			"id", "ticket_id", "name", "createdbyid", "createdtime", "updatedbyid", "updatedtime",
+			"statusid", "priorityid", "requesterid", "subject", "description", "originaldescription",
+			"oobtype", "callfrom", "emailreadconfigemail",
 		},
 		RequestUserInfo: []string{
-			"description",
-			"originaldescription",
-			"categoryid",
-			"departmentid",
-			"locationid",
-			"groupid",
-			"impactid",
-			"urgencyid",
-			"technicianid",
-			"supportlevel",
-			"vendorid",
+			"categoryid", "departmentid", "locationid", "groupid", "impactid", "urgencyid",
+			"technicianid", "supportlevel", "vendorid", "companyid", "servicecatalogid",
+			"sourceid", "requesttype", "suggestedcategoryid", "suggestedgroupid",
+			"violateducid", "transitionmodelid", "messengerconfigid", "templateid",
+			"emailreadconfigid",
 		},
 		TimeSLAManagement: []string{
-			"dueby",
-			"duetimemanuallyupdated",
-			"firstresponsetime",
-			"responsedue",
-			"responseduelevel",
-			"responsedueviolated",
-			"resolutionescalationtime",
-			"responsetimeescalationtime",
-			"totalresolutiontime",
-			"totalworkingtime",
-			"totalslapausetime",
-			"totalonholdduration",
-			"oladueby",
-			"olaviolated",
-			"olaescalationtime",
-			"oladuelevel",
-			"ucdueby",
-			"ucduelevel",
-			"ucescalationtime",
-			"ucviolated",
-			"totalucworkingtime",
-			"totalucresolutiontime",
+			"dueby", "duetimemanuallyupdated", "firstresponsetime", "responsedue",
+			"responseduelevel", "responsedueviolated", "resolutionescalationtime",
+			"responseescalationtime", "totalresolutiontime", "totalworkingtime",
+			"totalslapausetime", "totalonholdduration", "oladueby", "oldoladueby",
+			"olaviolated", "olaescalationtime", "oladuelevel", "ucdueby", "olducdueby",
+			"ucduelevel", "ucescalationtime", "ucviolated", "totalucworkingtime",
+			"totalucresolutiontime", "totaluconholdduration", "totalucpausetime",
+			"olddueby", "oldresponsedue", "violatedslaid", "lastviolationtime",
+			"lastolaviolationtime", "lastucviolationtime", "askfeedbackdate",
+			"firstfeedbackdate", "lastapproveddate",
 		},
 		LifecycleWorkflow: []string{
-			"approvalstatus",
-			"approvaltype",
-			"removed",
-			"removedbyid",
-			"removedtime",
-			"reopened",
-			"resolvedby",
-			"closedby",
-			"lastopenedtime",
-			"lastresolvedtime",
-			"lastclosedtime",
-			"statuschangedtime",
-			"groupchangedtime",
-			"lastviolationtime",
-			"lastolaviolationtime",
-			"lastucviolationtime",
-			"transitionmodelid",
-			"migrated",
-			"mergedrequest",
-			"templateid",
-			"servicecatalogid",
-			"requesttype",
-			"sourceid",
-			"spam",
-			"viprequest",
+			"approvalstatus", "approvaltype", "resolutionduelevel", "removed",
+			"removedbyid", "removedtime", "reopened", "resolvedby", "closedby",
+			"lastopenedtime", "lastresolvedtime", "lastclosedtime", "statuschangedtime",
+			"groupchangedtime", "migrated", "purchaserequest", "spam", "viprequest",
+			"slaviolated", "olaviolated", "ucviolated",
 		},
 	}
 }
@@ -141,143 +96,146 @@ func (g *CategorizedTicketGenerator) GenerateCategorizedTicket(ctx context.Conte
 
 // generateBaseColumns creates the core ticket fields
 func (g *CategorizedTicketGenerator) generateBaseColumns(ticket map[string]interface{}, categoryID int64) {
+	// Start with all static fields from the main generator
+	staticFields := g.Generator.generateAllStaticFields()
+
+	// Copy all static fields to the ticket
+	for key, value := range staticFields {
+		ticket[key] = value
+	}
+
+	// Override specific fields for categorized generation
 	now := time.Now().UnixMilli()
 	ticketID := fmt.Sprintf("TKT-%d-%d", categoryID, now)
 
 	ticket["id"] = ticketID
+	ticket["ticket_id"] = ticketID
 	ticket["name"] = g.generateTicketName(categoryID)
-	ticket["createdbyid"] = g.rand.Intn(1000) + 1000 // User IDs 1000-1999
 	ticket["createdtime"] = now
-	ticket["updatedbyid"] = ticket["createdbyid"]
 	ticket["updatedtime"] = now
 	ticket["statusid"] = g.generateStatusID()
 	ticket["priorityid"] = g.generatePriorityID()
-	ticket["requesterid"] = g.rand.Intn(5000) + 2000 // Requester IDs 2000-6999
 	ticket["subject"] = g.generateSubject(categoryID)
+	ticket["categoryid"] = categoryID // Set the specific category ID
 }
 
 // generateITSupportTicket creates an IT support ticket with relevant fields
 func (g *CategorizedTicketGenerator) generateITSupportTicket(ticket map[string]interface{}, categories FieldCategories) {
-	// Request & User Information
+	// Override specific fields for IT Support (static fields are already set)
 	ticket["description"] = "IT support request for system access and troubleshooting"
 	ticket["originaldescription"] = ticket["description"]
-	ticket["ticketCatelogid"] = int64(1) // IT category for field mapping
-	ticket["categoryid"] = int64(1)      // IT Support (regular data field)
-	ticket["departmentid"] = g.rand.Intn(10) + 1
-	ticket["locationid"] = g.rand.Intn(50) + 1
-	ticket["groupid"] = g.rand.Intn(5) + 10 // IT groups 10-14
-	ticket["impactid"] = g.rand.Intn(4) + 1
-	ticket["urgencyid"] = g.rand.Intn(4) + 1
-	ticket["technicianid"] = g.rand.Intn(20) + 100 // IT technicians 100-119
-	ticket["supportlevel"] = g.rand.Intn(3) + 1
+	ticket["categoryid"] = int64(1)                       // IT Support category
+	ticket["departmentid"] = int64(g.rand.Intn(10) + 1)   // IT departments 1-10
+	ticket["locationid"] = int64(g.rand.Intn(50) + 1)     // Locations 1-50
+	ticket["groupid"] = int64(g.rand.Intn(5) + 10)        // IT groups 10-14
+	ticket["impactid"] = int64(g.rand.Intn(4) + 1)        // Impact 1-4
+	ticket["urgencyid"] = int64(g.rand.Intn(4) + 1)       // Urgency 1-4
+	ticket["technicianid"] = int64(g.rand.Intn(20) + 100) // IT technicians 100-119
+	ticket["supportlevel"] = int32(g.rand.Intn(3) + 1)    // Support level 1-3
 
 	// Time & SLA Management (IT typically has strict SLAs)
 	g.generateTimeSLAFields(ticket, true) // strict SLA
 
 	// Lifecycle & Workflow
-	ticket["approvalstatus"] = 0 // No approval needed for IT
+	ticket["approvalstatus"] = int32(0) // No approval needed for IT
 	ticket["requesttype"] = "IT_SUPPORT"
-	ticket["sourceid"] = g.rand.Intn(3) + 1 // Email, Portal, Phone
+	ticket["sourceid"] = int64(g.rand.Intn(3) + 1) // Email, Portal, Phone
 }
 
 // generateHRRequestTicket creates an HR request ticket
 func (g *CategorizedTicketGenerator) generateHRRequestTicket(ticket map[string]interface{}, categories FieldCategories) {
-	// Request & User Information
+	// Override specific fields for HR Request (static fields are already set)
 	ticket["description"] = "HR request for employee onboarding and policy information"
 	ticket["originaldescription"] = ticket["description"]
-	ticket["ticketCatelogid"] = int64(2) // HR category for field mapping
-	ticket["categoryid"] = int64(2)      // HR (regular data field)
-	ticket["departmentid"] = g.rand.Intn(10) + 1
-	ticket["locationid"] = g.rand.Intn(50) + 1
-	ticket["groupid"] = g.rand.Intn(3) + 20 // HR groups 20-22
-	ticket["impactid"] = g.rand.Intn(3) + 1
-	ticket["urgencyid"] = g.rand.Intn(3) + 1
-	ticket["technicianid"] = g.rand.Intn(10) + 200 // HR staff 200-209
-	ticket["supportlevel"] = 1
+	ticket["categoryid"] = int64(2)                       // HR category
+	ticket["departmentid"] = int64(g.rand.Intn(10) + 1)   // HR departments 1-10
+	ticket["locationid"] = int64(g.rand.Intn(50) + 1)     // Locations 1-50
+	ticket["groupid"] = int64(g.rand.Intn(3) + 20)        // HR groups 20-22
+	ticket["impactid"] = int64(g.rand.Intn(3) + 1)        // Impact 1-3
+	ticket["urgencyid"] = int64(g.rand.Intn(3) + 1)       // Urgency 1-3
+	ticket["technicianid"] = int64(g.rand.Intn(10) + 200) // HR staff 200-209
+	ticket["supportlevel"] = int32(1)                     // Support level 1
 
 	// Time & SLA Management (HR has moderate SLAs)
 	g.generateTimeSLAFields(ticket, false) // moderate SLA
 
 	// Lifecycle & Workflow (HR often requires approval)
-	ticket["approvalstatus"] = g.rand.Intn(3) // 0=none, 1=pending, 2=approved
-	ticket["approvaltype"] = g.rand.Intn(2) + 1
+	ticket["approvalstatus"] = int32(g.rand.Intn(3))   // 0=none, 1=pending, 2=approved
+	ticket["approvaltype"] = int32(g.rand.Intn(2) + 1) // 1-2
 	ticket["requesttype"] = "HR_REQUEST"
-	ticket["sourceid"] = g.rand.Intn(3) + 1
+	ticket["sourceid"] = int64(g.rand.Intn(3) + 1) // Sources 1-3
 }
 
 // generateFacilitiesTicket creates a facilities request ticket
 func (g *CategorizedTicketGenerator) generateFacilitiesTicket(ticket map[string]interface{}, categories FieldCategories) {
-	// Request & User Information
+	// Override specific fields for Facilities Request (static fields are already set)
 	ticket["description"] = "Facilities request for office space and equipment"
 	ticket["originaldescription"] = ticket["description"]
-	ticket["ticketCatelogid"] = int64(3) // Facilities category for field mapping
-	ticket["categoryid"] = int64(3)      // Facilities (regular data field)
-	ticket["departmentid"] = g.rand.Intn(10) + 1
-	ticket["locationid"] = g.rand.Intn(50) + 1
-	ticket["groupid"] = g.rand.Intn(3) + 30 // Facilities groups 30-32
-	ticket["impactid"] = g.rand.Intn(3) + 1
-	ticket["urgencyid"] = g.rand.Intn(3) + 1
-	ticket["technicianid"] = g.rand.Intn(15) + 300 // Facilities staff 300-314
-	ticket["supportlevel"] = 1
-	ticket["vendorid"] = g.rand.Intn(50) + 1000 // External vendors
+	ticket["categoryid"] = int64(3)                       // Facilities category
+	ticket["departmentid"] = int64(g.rand.Intn(10) + 1)   // Facilities departments 1-10
+	ticket["locationid"] = int64(g.rand.Intn(50) + 1)     // Locations 1-50
+	ticket["groupid"] = int64(g.rand.Intn(3) + 30)        // Facilities groups 30-32
+	ticket["impactid"] = int64(g.rand.Intn(3) + 1)        // Impact 1-3
+	ticket["urgencyid"] = int64(g.rand.Intn(3) + 1)       // Urgency 1-3
+	ticket["technicianid"] = int64(g.rand.Intn(15) + 300) // Facilities staff 300-314
+	ticket["supportlevel"] = int32(1)                     // Support level 1
+	ticket["vendorid"] = int64(g.rand.Intn(50) + 1000)    // External vendors 1000-1049
 
 	// Time & SLA Management (Facilities has relaxed SLAs)
 	g.generateTimeSLAFields(ticket, false) // relaxed SLA
 
 	// Lifecycle & Workflow
-	ticket["approvalstatus"] = g.rand.Intn(3)
+	ticket["approvalstatus"] = int32(g.rand.Intn(3)) // 0-2
 	ticket["requesttype"] = "FACILITIES_REQUEST"
-	ticket["sourceid"] = g.rand.Intn(3) + 1
+	ticket["sourceid"] = int64(g.rand.Intn(3) + 1) // Sources 1-3
 }
 
 // generateFinanceTicket creates a finance request ticket
 func (g *CategorizedTicketGenerator) generateFinanceTicket(ticket map[string]interface{}, categories FieldCategories) {
-	// Request & User Information
+	// Override specific fields for Finance Request (static fields are already set)
 	ticket["description"] = "Finance request for budget approval and expense processing"
 	ticket["originaldescription"] = ticket["description"]
-	ticket["ticketCatelogid"] = int64(4) // Finance category for field mapping
-	ticket["categoryid"] = int64(4)      // Finance (regular data field)
-	ticket["departmentid"] = g.rand.Intn(10) + 1
-	ticket["locationid"] = g.rand.Intn(50) + 1
-	ticket["groupid"] = g.rand.Intn(3) + 40 // Finance groups 40-42
-	ticket["impactid"] = g.rand.Intn(4) + 1
-	ticket["urgencyid"] = g.rand.Intn(4) + 1
-	ticket["technicianid"] = g.rand.Intn(10) + 400 // Finance staff 400-409
-	ticket["supportlevel"] = 2
+	ticket["categoryid"] = int64(4)                       // Finance category
+	ticket["departmentid"] = int64(g.rand.Intn(10) + 1)   // Finance departments 1-10
+	ticket["locationid"] = int64(g.rand.Intn(50) + 1)     // Locations 1-50
+	ticket["groupid"] = int64(g.rand.Intn(3) + 40)        // Finance groups 40-42
+	ticket["impactid"] = int64(g.rand.Intn(4) + 1)        // Impact 1-4
+	ticket["urgencyid"] = int64(g.rand.Intn(4) + 1)       // Urgency 1-4
+	ticket["technicianid"] = int64(g.rand.Intn(10) + 400) // Finance staff 400-409
+	ticket["supportlevel"] = int32(2)                     // Support level 2
 
 	// Time & SLA Management (Finance has strict SLAs for compliance)
 	g.generateTimeSLAFields(ticket, true) // strict SLA
 
 	// Lifecycle & Workflow (Finance always requires approval)
-	ticket["approvalstatus"] = g.rand.Intn(3)
-	ticket["approvaltype"] = 2 // Always requires approval
+	ticket["approvalstatus"] = int32(g.rand.Intn(3)) // 0-2
+	ticket["approvaltype"] = int32(2)                // Always requires approval
 	ticket["requesttype"] = "FINANCE_REQUEST"
-	ticket["sourceid"] = g.rand.Intn(3) + 1
-	ticket["viprequest"] = g.rand.Float32() < 0.1 // 10% VIP requests
+	ticket["sourceid"] = int64(g.rand.Intn(3) + 1) // Sources 1-3
+	ticket["viprequest"] = g.rand.Float32() < 0.1  // 10% VIP requests
 }
 
 // generateGeneralRequestTicket creates a general request ticket
 func (g *CategorizedTicketGenerator) generateGeneralRequestTicket(ticket map[string]interface{}, categories FieldCategories) {
-	// Request & User Information
+	// Override specific fields for General Request (static fields are already set)
 	ticket["description"] = "General request for miscellaneous services"
 	ticket["originaldescription"] = ticket["description"]
-	ticket["ticketCatelogid"] = int64(5) // General category for field mapping
-	ticket["categoryid"] = int64(5)      // General (regular data field)
-	ticket["departmentid"] = g.rand.Intn(10) + 1
-	ticket["locationid"] = g.rand.Intn(50) + 1
-	ticket["groupid"] = g.rand.Intn(5) + 50 // General groups 50-54
-	ticket["impactid"] = g.rand.Intn(3) + 1
-	ticket["urgencyid"] = g.rand.Intn(3) + 1
-	ticket["technicianid"] = g.rand.Intn(20) + 500 // General staff 500-519
-	ticket["supportlevel"] = 1
+	ticket["categoryid"] = int64(5)                       // General category
+	ticket["departmentid"] = int64(g.rand.Intn(10) + 1)   // General departments 1-10
+	ticket["locationid"] = int64(g.rand.Intn(50) + 1)     // Locations 1-50
+	ticket["groupid"] = int64(g.rand.Intn(5) + 50)        // General groups 50-54
+	ticket["impactid"] = int64(g.rand.Intn(3) + 1)        // Impact 1-3
+	ticket["urgencyid"] = int64(g.rand.Intn(3) + 1)       // Urgency 1-3
+	ticket["technicianid"] = int64(g.rand.Intn(20) + 500) // General staff 500-519
+	ticket["supportlevel"] = int32(1)                     // Support level 1
 
 	// Time & SLA Management (General has moderate SLAs)
 	g.generateTimeSLAFields(ticket, false) // moderate SLA
 
 	// Lifecycle & Workflow
-	ticket["approvalstatus"] = g.rand.Intn(2) // 0=none, 1=pending
+	ticket["approvalstatus"] = int32(g.rand.Intn(2)) // 0=none, 1=pending
 	ticket["requesttype"] = "GENERAL_REQUEST"
-	ticket["sourceid"] = g.rand.Intn(3) + 1
+	ticket["sourceid"] = int64(g.rand.Intn(3) + 1) // Sources 1-3
 }
 
 // generateDefaultTicket creates a ticket with random fields from all categories
