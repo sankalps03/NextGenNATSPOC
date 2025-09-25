@@ -1,6 +1,7 @@
 package main
 
 import (
+	"api-server/logger"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+var apiLogger = logger.NewLogger("api-server", "api-server")
 
 type Config struct {
 	NATSUrl      string
@@ -114,6 +117,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
+
+	start := time.Now()
+
 	// Accept any JSON data for dynamic field handling
 	var ticketData map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&ticketData); err != nil {
@@ -139,7 +145,11 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+
+	apiLogger.Info(fmt.Sprintf("Created ticket in %v", time.Since(start)))
 	w.Write(response)
+
+	apiLogger.Info(fmt.Sprintf("Sent create ticket response in %v", time.Since(start)))
 }
 
 func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {

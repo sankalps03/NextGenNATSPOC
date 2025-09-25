@@ -15,12 +15,15 @@ import (
 
 	"github.com/platform/ticket-svc/cache"
 	storage2 "github.com/platform/ticket-svc/storage"
+	"github.com/platform/ticket-svc/storage/logger"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	ticketpb "github.com/platform/ticket-svc/pb/proto"
 )
+
+var mainLogger = logger.NewLogger("ticket-svc", "ticket-svc")
 
 type Meta struct {
 	EventId    string `json:"event_id"`
@@ -293,7 +296,11 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 
 	switch req.Action {
 	case "create":
+
+		start := time.Now()
 		response, err = ts.handleCreateTicket(req)
+
+		mainLogger.Info(fmt.Sprintf("time taken to handle create ticket: %v", time.Since(start)))
 	case "list":
 		response, err = ts.handleListTickets(req)
 	case "get":
@@ -324,6 +331,8 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 }
 
 func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, error) {
+
+	start := time.Now()
 	// Convert req.Data to map[string]interface{} for dynamic field handling
 	var fieldData map[string]interface{}
 
@@ -342,6 +351,9 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 		return nil, fmt.Errorf("failed to convert fields: %w", err)
 	}
 
+	mainLogger.Info(fmt.Sprintf("time taken to convert fields: %v", time.Since(start)))
+
+	start2 := time.Now()
 	now := time.Now().Format(time.RFC3339)
 
 	// Create protobuf TicketData with dynamic fields
@@ -362,20 +374,9 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 	}
 	dbLatency := time.Since(dbStart)
 
+	mainLogger.Info(fmt.Sprintf("time taken to convert fields: %v , db latency: %v", time.Since(start), dbLatency))
+
 	// Invalidate relevant caches after successful creation
-	if ts.config.CacheEnabled && ts.cache != nil {
-		// Invalidate ticket list cache since a new ticket was added
-		if err := ts.cache.InvalidateTicketList(context.Background()); err != nil {
-			log.Printf("Warning: Failed to invalidate ticket list cache: %v", err)
-		}
-
-		// Invalidate search result caches since they may now be outdated
-		if err := ts.cache.InvalidateSearchPatterns(context.Background(), "*"); err != nil {
-			log.Printf("Warning: Failed to invalidate search caches: %v", err)
-		}
-
-		//log.Printf("Invalidated caches after creating ticket %s", ticketData.Id)
-	}
 
 	// Store ticket document in KV store if using OpenSearch storage
 	if ts.kvStore != nil {
@@ -393,6 +394,8 @@ func (ts *TicketService) handleCreateTicket(req ServiceRequest) (interface{}, er
 			}
 		}
 	}
+
+	mainLogger.Info(fmt.Sprintf("time taken for other is: %v", time.Since(start2)))
 
 	return ResponseWithLatency{
 		Data:            ticketToJSON(ticketData),

@@ -2260,6 +2260,7 @@ func (p *PostgreSQLDynamicStorage) SearchTicketsWithDragonflyIndex(request Exten
 // queryDragonflyIndexes queries Dragonfly indexes for each search condition and returns ticket ID lists
 func (p *PostgreSQLDynamicStorage) queryDragonflyIndexes(conditions []SearchCondition) ([][]string, error) {
 	var ticketIDLists [][]string
+	indexQueryStart := time.Now()
 
 	for i, condition := range conditions {
 		// Check if field should be indexed (skip excluded fields)
@@ -2267,16 +2268,29 @@ func (p *PostgreSQLDynamicStorage) queryDragonflyIndexes(conditions []SearchCond
 			return nil, fmt.Errorf("field '%s' is not indexed in Dragonfly (excluded: description/timestamp/ID fields)", condition.Operand)
 		}
 
+		conditionStart := time.Now()
 		log.Printf("Querying index for condition %d: %s %s %v", i+1, condition.Operand, condition.Operator, condition.Value)
 
 		ticketIDs, err := p.queryIndexForCondition(condition)
+		conditionDuration := time.Since(conditionStart)
+
 		if err != nil {
+			p.logger.Error(fmt.Sprintf("Index query failed: condition=%d, field=%s, operator=%s, value=%v, duration=%dms, error=%s",
+				i+1, condition.Operand, condition.Operator, condition.Value, conditionDuration.Milliseconds(), err.Error()))
 			return nil, fmt.Errorf("failed to query index for field %s: %w", condition.Operand, err)
 		}
 
-		log.Printf("Condition %d result: %d tickets found", i+1, len(ticketIDs))
+		log.Printf("Condition %d result: %d tickets found in %v", i+1, len(ticketIDs), conditionDuration)
+		p.logger.Info(fmt.Sprintf("Index query success: condition=%d, field=%s, operator=%s, value=%v, results=%d, duration=%dms",
+			i+1, condition.Operand, condition.Operator, condition.Value, len(ticketIDs), conditionDuration.Milliseconds()))
+
 		ticketIDLists = append(ticketIDLists, ticketIDs)
 	}
+
+	totalIndexDuration := time.Since(indexQueryStart)
+	log.Printf("All index queries completed: %d conditions processed in %v", len(conditions), totalIndexDuration)
+	p.logger.Info(fmt.Sprintf("Index query summary: total_conditions=%d, total_duration=%dms, avg_per_condition=%dms",
+		len(conditions), totalIndexDuration.Milliseconds(), totalIndexDuration.Milliseconds()/int64(len(conditions))))
 
 	return ticketIDLists, nil
 }
@@ -2342,18 +2356,30 @@ func (p *PostgreSQLDynamicStorage) queryIndexForCondition(condition SearchCondit
 
 // queryExactMatchIndex queries the field_value_list SET for exact matches
 func (p *PostgreSQLDynamicStorage) queryExactMatchIndex(ctx context.Context, fieldName, value string) ([]string, error) {
+	queryStart := time.Now()
 	valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
 
+	// Execute index query and measure latency
+	indexStart := time.Now()
 	ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+	indexDuration := time.Since(indexStart)
+	totalDuration := time.Since(queryStart)
+
 	if err != nil {
+		p.logger.Error(fmt.Sprintf("Exact match index query failed: field=%s, value=%s, key=%s, index_latency=%dms, total_latency=%dms, error=%s",
+			fieldName, value, valueListKey, indexDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
 		return nil, fmt.Errorf("failed to query exact match index for %s=%s: %w", fieldName, value, err)
 	}
+
+	p.logger.Info(fmt.Sprintf("Exact match index query: field=%s, value=%s, results=%d, index_latency=%dms, total_latency=%dms",
+		fieldName, value, len(ticketIDs), indexDuration.Milliseconds(), totalDuration.Milliseconds()))
 
 	return ticketIDs, nil
 }
 
 // queryNumericRangeIndex queries the numeric ZSET and retrieves ticket IDs for matching values
 func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, fieldName string, minValue, maxValue float64, includeMin, includeMax bool) ([]string, error) {
+	queryStart := time.Now()
 	indexKey := fmt.Sprintf("field_numeric_index:%s:%s", p.tableName, fieldName)
 
 	// Build range query parameters
@@ -2367,62 +2393,99 @@ func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, f
 		maxStr = "(" + maxStr // Exclusive maximum
 	}
 
-	// Query ZSET to get matching values
+	// Query ZSET to get matching values and measure latency
+	zsetStart := time.Now()
 	values, err := p.dragonflyClient.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
 		Min: minStr,
 		Max: maxStr,
 	}).Result()
+	zsetDuration := time.Since(zsetStart)
 
 	if err != nil {
+		totalDuration := time.Since(queryStart)
+		p.logger.Error(fmt.Sprintf("Numeric range ZSET query failed: field=%s, range=[%f,%f], include_min=%t, include_max=%t, zset_latency=%dms, total_latency=%dms, error=%s",
+			fieldName, minValue, maxValue, includeMin, includeMax, zsetDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
 		return nil, fmt.Errorf("failed to query numeric range index for %s: %w", fieldName, err)
 	}
 
-	// For each value, get the ticket IDs from the value list
+	// For each value, get the ticket IDs from the value list and measure latency
 	var allTicketIDs []string
+	valueListStart := time.Now()
+	var valueListErrors int
+
 	for _, value := range values {
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
 		ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
 		if err != nil {
 			log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+			valueListErrors++
 			continue
 		}
 		allTicketIDs = append(allTicketIDs, ticketIDs...)
 	}
 
+	valueListDuration := time.Since(valueListStart)
+	totalDuration := time.Since(queryStart)
+
 	// Remove duplicates
-	return removeDuplicates(allTicketIDs), nil
+	result := removeDuplicates(allTicketIDs)
+
+	p.logger.Info(fmt.Sprintf("Numeric range index query: field=%s, range=[%f,%f], values_found=%d, zset_latency=%dms, valuelist_latency=%dms, total_latency=%dms, results=%d, errors=%d",
+		fieldName, minValue, maxValue, len(values), zsetDuration.Milliseconds(), valueListDuration.Milliseconds(), totalDuration.Milliseconds(), len(result), valueListErrors))
+
+	return result, nil
 }
 
 // queryStringPrefixIndex queries the string ZSET using ZRANGEBYLEX for prefix matching
 func (p *PostgreSQLDynamicStorage) queryStringPrefixIndex(ctx context.Context, fieldName, prefix string) ([]string, error) {
+	queryStart := time.Now()
 	indexKey := fmt.Sprintf("field_string_index:%s:%s", p.tableName, fieldName)
 
-	// Query ZSET by lexicographical range for prefix matching
+	// Query ZSET by lexicographical range for prefix matching and measure latency
+	zsetStart := time.Now()
 	values, err := p.dragonflyClient.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
 		Min: fmt.Sprintf("[%s", prefix),
 		Max: fmt.Sprintf("(%s~", prefix), // Use ~ as upper bound for prefix
 	}).Result()
+	zsetDuration := time.Since(zsetStart)
 
 	if err != nil {
+		totalDuration := time.Since(queryStart)
+		p.logger.Error(fmt.Sprintf("String prefix ZSET query failed: field=%s, prefix=%s, zset_latency=%dms, total_latency=%dms, error=%s",
+			fieldName, prefix, zsetDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
 		return nil, fmt.Errorf("failed to query string prefix index for %s: %w", fieldName, err)
 	}
 
-	// For each matching value, get the ticket IDs
+	// For each matching value, get the ticket IDs and measure latency
 	var allTicketIDs []string
+	valueListStart := time.Now()
+	var valueListErrors int
+	var matchingValues int
+
 	for _, value := range values {
 		if strings.HasPrefix(value, prefix) {
+			matchingValues++
 			valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
 			ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
 			if err != nil {
 				log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+				valueListErrors++
 				continue
 			}
 			allTicketIDs = append(allTicketIDs, ticketIDs...)
 		}
 	}
 
+	valueListDuration := time.Since(valueListStart)
+	totalDuration := time.Since(queryStart)
+
 	// Remove duplicates
-	return removeDuplicates(allTicketIDs), nil
+	result := removeDuplicates(allTicketIDs)
+
+	p.logger.Info(fmt.Sprintf("String prefix index query: field=%s, prefix=%s, values_found=%d, matching_values=%d, zset_latency=%dms, valuelist_latency=%dms, total_latency=%dms, results=%d, errors=%d",
+		fieldName, prefix, len(values), matchingValues, zsetDuration.Milliseconds(), valueListDuration.Milliseconds(), totalDuration.Milliseconds(), len(result), valueListErrors))
+
+	return result, nil
 }
 
 // queryNotEqualIndex queries all values for a field except the specified value (NOT EQUAL operator)
