@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"math"
@@ -45,10 +46,12 @@ type PostgreSQLDynamicStorage struct {
 	nextArrayNumericColumn map[int64]int                      // categoryID -> next available array numeric column number
 	nextGeolocationColumn  map[int64]int                      // categoryID -> next available geolocation column number
 
-	// Dragonfly integration for indexing
-	dragonflyClient  *redis.Client   // Dragonfly client for indexing
-	dragonflyEnabled bool            // Whether Dragonfly indexing is enabled
-	staticIndexes    map[string]bool // tracks created static field indexes in Dragonfly
+	// Dragonfly integration for partitioned indexing (10 databases)
+	dragonflyClients   []*redis.Client // Array of Dragonfly clients for partitioned indexing
+	dragonflyEnabled   bool            // Whether Dragonfly indexing is enabled
+	dragonflyAddresses []string        // Array of Dragonfly addresses for partitioning
+	staticIndexes      map[string]bool // tracks created static field indexes in Dragonfly
+	partitionCount     int             // Number of partitions (default: 10)
 
 	// Dragonfly cache for ticket data (separate connection)
 	cacheClient    *redis.Client   // Dragonfly client for ticket caching (port 6380)
@@ -59,18 +62,74 @@ type PostgreSQLDynamicStorage struct {
 	logger logger.Logger // logger for performance metrics
 }
 
+// ===== DRAGONFLY PARTITIONING FUNCTIONS =====
+
+// getPartitionForField returns the partition number (0-9) for a given field name using consistent hashing
+func (p *PostgreSQLDynamicStorage) getPartitionForField(fieldName string) int {
+	if p.partitionCount <= 1 {
+		return 0 // Single partition fallback
+	}
+
+	// Use FNV hash for consistent partitioning
+	h := fnv.New32a()
+	h.Write([]byte(fieldName))
+	hash := h.Sum32()
+
+	partition := int(hash) % p.partitionCount
+	if partition < 0 {
+		partition = -partition // Handle negative modulo
+	}
+
+	return partition
+}
+
+// getDragonflyClientForField returns the appropriate Dragonfly client for a given field
+func (p *PostgreSQLDynamicStorage) getDragonflyClientForField(fieldName string) *redis.Client {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
+		return nil
+	}
+
+	partition := p.getPartitionForField(fieldName)
+	if partition >= len(p.dragonflyClients) {
+		partition = 0 // Fallback to first client
+	}
+
+	return p.dragonflyClients[partition]
+}
+
+// getAllDragonflyClients returns all active Dragonfly clients for operations that need to query all partitions
+func (p *PostgreSQLDynamicStorage) getAllDragonflyClients() []*redis.Client {
+	if !p.dragonflyEnabled {
+		return nil
+	}
+	return p.dragonflyClients
+}
+
+// logPartitionInfo logs partition information for debugging
+func (p *PostgreSQLDynamicStorage) logPartitionInfo(fieldName string, operation string) {
+	if p.dragonflyEnabled && len(p.dragonflyClients) > 1 {
+		partition := p.getPartitionForField(fieldName)
+		p.logger.Info(fmt.Sprintf("Partition routing: field=%s, operation=%s, partition=%d, total_partitions=%d",
+			fieldName, operation, partition, len(p.dragonflyClients)))
+	}
+}
+
 // NewPostgreSQLDynamicStorage creates a new PostgreSQL storage instance with dynamic column mapping and Dragonfly integration
 func NewPostgreSQLDynamicStorage(ctx context.Context, tableName, connectionString string) (*PostgreSQLDynamicStorage, error) {
-	return NewPostgreSQLDynamicStorageWithDragonflyAndCache(ctx, tableName, connectionString, "localhost:6379", "", 0, true, "localhost:6380", "", 0, true)
+	// Default to single address with 10 partitioned databases (DB 0-9)
+	dragonflyAddresses := []string{"localhost:6379"}
+	return NewPostgreSQLDynamicStorageWithPartitionedDragonfly(ctx, tableName, connectionString, dragonflyAddresses, "", 0, true, "localhost:6379", "", 10, true)
 }
 
-// NewPostgreSQLDynamicStorageWithDragonfly creates a new PostgreSQL storage instance with optional Dragonfly integration
+// NewPostgreSQLDynamicStorageWithDragonfly creates a new PostgreSQL storage instance with optional Dragonfly integration (single database - legacy)
 func NewPostgreSQLDynamicStorageWithDragonfly(ctx context.Context, tableName, connectionString, dragonflyAddr, dragonflyPassword string, dragonflyDB int, enableDragonfly bool) (*PostgreSQLDynamicStorage, error) {
-	return NewPostgreSQLDynamicStorageWithDragonflyAndCache(ctx, tableName, connectionString, dragonflyAddr, dragonflyPassword, dragonflyDB, enableDragonfly, "localhost:6380", "", 0, true)
+	// Convert single address to array for backward compatibility
+	dragonflyAddresses := []string{dragonflyAddr}
+	return NewPostgreSQLDynamicStorageWithPartitionedDragonfly(ctx, tableName, connectionString, dragonflyAddresses, dragonflyPassword, dragonflyDB, enableDragonfly, dragonflyAddr, dragonflyPassword, 10, true)
 }
 
-// NewPostgreSQLDynamicStorageWithDragonflyAndCache creates a new PostgreSQL storage instance with Dragonfly indexing and caching
-func NewPostgreSQLDynamicStorageWithDragonflyAndCache(ctx context.Context, tableName, connectionString, dragonflyAddr, dragonflyPassword string, dragonflyDB int, enableDragonfly bool, cacheAddr, cachePassword string, cacheDB int, enableCache bool) (*PostgreSQLDynamicStorage, error) {
+// NewPostgreSQLDynamicStorageWithPartitionedDragonfly creates a new PostgreSQL storage instance with partitioned Dragonfly indexing and caching
+func NewPostgreSQLDynamicStorageWithPartitionedDragonfly(ctx context.Context, tableName, connectionString string, dragonflyAddresses []string, dragonflyPassword string, dragonflyDB int, enableDragonfly bool, cacheAddr, cachePassword string, cacheDB int, enableCache bool) (*PostgreSQLDynamicStorage, error) {
 	// Open database connection
 	db, err := sql.Open("postgres", connectionString)
 	if err != nil {
@@ -89,28 +148,43 @@ func NewPostgreSQLDynamicStorageWithDragonflyAndCache(ctx context.Context, table
 
 	log.Printf("PostgreSQL Dynamic Columns connection established successfully")
 
-	// Initialize Dragonfly client if enabled
-	var dragonflyClient *redis.Client
-	if enableDragonfly && dragonflyAddr != "" {
-		dragonflyClient = redis.NewClient(&redis.Options{
-			Addr:         dragonflyAddr,
-			Password:     dragonflyPassword,
-			DB:           dragonflyDB,
-			PoolSize:     20,
-			MinIdleConns: 5,
-			DialTimeout:  5 * time.Second,
-			ReadTimeout:  3 * time.Second,
-			WriteTimeout: 3 * time.Second,
-		})
+	// Initialize partitioned Dragonfly clients if enabled
+	var dragonflyClients []*redis.Client
+	partitionCount := 10 // Fixed to 10 partitions using database numbers 0-9
 
-		// Test Dragonfly connection
-		_, err = dragonflyClient.Ping(ctx).Result()
-		if err != nil {
-			log.Printf("Warning: Failed to connect to Dragonfly at %s: %v. Continuing without Dragonfly indexing.", dragonflyAddr, err)
-			dragonflyClient = nil
+	if enableDragonfly && len(dragonflyAddresses) > 0 {
+		dragonflyAddr := dragonflyAddresses[0] // Use first (and typically only) address
+		log.Printf("Initializing %d partitioned Dragonfly databases at %s (DB 0-9) for indexing", partitionCount, dragonflyAddr)
+
+		for dbNum := 0; dbNum < partitionCount; dbNum++ {
+			client := redis.NewClient(&redis.Options{
+				Addr:         dragonflyAddr,
+				Password:     dragonflyPassword,
+				DB:           dbNum, // Use database number as partition
+				PoolSize:     20,
+				MinIdleConns: 5,
+				DialTimeout:  5 * time.Second,
+				ReadTimeout:  3 * time.Second,
+				WriteTimeout: 3 * time.Second,
+			})
+
+			// Test Dragonfly connection
+			_, err = client.Ping(ctx).Result()
+			if err != nil {
+				log.Printf("Warning: Failed to connect to Dragonfly partition %d (DB %d) at %s: %v. Skipping this partition.", dbNum, dbNum, dragonflyAddr, err)
+				client.Close()
+				continue
+			}
+
+			dragonflyClients = append(dragonflyClients, client)
+			log.Printf("Dragonfly partition %d (DB %d) connection established successfully at %s", dbNum, dbNum, dragonflyAddr)
+		}
+
+		if len(dragonflyClients) == 0 {
+			log.Printf("Warning: No Dragonfly partitions available. Continuing without Dragonfly indexing.")
 			enableDragonfly = false
 		} else {
-			log.Printf("Dragonfly connection established successfully at %s", dragonflyAddr)
+			log.Printf("Successfully connected to %d/%d Dragonfly partitions at %s", len(dragonflyClients), partitionCount, dragonflyAddr)
 		}
 	}
 
@@ -149,8 +223,10 @@ func NewPostgreSQLDynamicStorageWithDragonflyAndCache(ctx context.Context, table
 		nextArrayStringColumn:  make(map[int64]int),
 		nextArrayNumericColumn: make(map[int64]int),
 		nextGeolocationColumn:  make(map[int64]int),
-		dragonflyClient:        dragonflyClient,
+		dragonflyClients:       dragonflyClients,
 		dragonflyEnabled:       enableDragonfly,
+		dragonflyAddresses:     dragonflyAddresses,
+		partitionCount:         partitionCount,
 		staticIndexes:          make(map[string]bool),
 		dynamicIndexes:         make(map[string]bool),
 		cacheClient:            cacheClient,
@@ -1636,12 +1712,16 @@ func (p *PostgreSQLDynamicStorage) Close() error {
 		log.Printf("Warning: Failed to flush field mappings during close: %v", err)
 	}
 
-	// Close Dragonfly client if enabled
-	if p.dragonflyClient != nil {
-		if err := p.dragonflyClient.Close(); err != nil {
-			log.Printf("Warning: Failed to close Dragonfly connection: %v", err)
-		} else {
-			log.Printf("Closed Dragonfly connection")
+	// Close all Dragonfly clients if enabled
+	if p.dragonflyEnabled && len(p.dragonflyClients) > 0 {
+		for i, client := range p.dragonflyClients {
+			if client != nil {
+				if err := client.Close(); err != nil {
+					log.Printf("Warning: Failed to close Dragonfly partition %d connection: %v", i, err)
+				} else {
+					log.Printf("Closed Dragonfly partition %d connection", i)
+				}
+			}
 		}
 	}
 
@@ -1753,9 +1833,9 @@ func (p *PostgreSQLDynamicStorage) ReloadFieldMappings() error {
 
 // ===== DRAGONFLY INTEGRATION METHODS =====
 
-// createStaticFieldIndexes creates indexes for all static fields in Dragonfly
+// createStaticFieldIndexes creates indexes for all static fields in partitioned Dragonfly databases
 func (p *PostgreSQLDynamicStorage) createStaticFieldIndexes(ctx context.Context) error {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return nil
 	}
 
@@ -1816,6 +1896,15 @@ func (p *PostgreSQLDynamicStorage) createStaticFieldIndexes(ctx context.Context)
 			continue
 		}
 
+		// Get the appropriate Dragonfly client for this field
+		client := p.getDragonflyClientForField(fieldName)
+		if client == nil {
+			continue
+		}
+
+		// Log partition routing for debugging
+		p.logPartitionInfo(fieldName, "create_static_index")
+
 		indexKey := fmt.Sprintf("static_field_index:%s:%s", p.tableName, fieldName)
 
 		// Check if index already exists
@@ -1823,18 +1912,20 @@ func (p *PostgreSQLDynamicStorage) createStaticFieldIndexes(ctx context.Context)
 			continue
 		}
 
-		// Create index metadata in Dragonfly
+		// Create index metadata in the appropriate partitioned Dragonfly database
 		indexMetadata := map[string]interface{}{
 			"field_name": fieldName,
 			"index_type": "static",
 			"table_name": p.tableName,
+			"partition":  p.getPartitionForField(fieldName),
 			"created_at": time.Now().Unix(),
 		}
 
 		metadataJSON, _ := json.Marshal(indexMetadata)
-		err := p.dragonflyClient.Set(ctx, indexKey, metadataJSON, 0).Err() // No TTL - persist indefinitely
+		err := client.Set(ctx, indexKey, metadataJSON, 0).Err() // No TTL - persist indefinitely
 		if err != nil {
-			log.Printf("Warning: Failed to create static field index for %s: %v", fieldName, err)
+			log.Printf("Warning: Failed to create static field index for %s in partition %d: %v",
+				fieldName, p.getPartitionForField(fieldName), err)
 			continue
 		}
 
@@ -1845,9 +1936,9 @@ func (p *PostgreSQLDynamicStorage) createStaticFieldIndexes(ctx context.Context)
 	return nil
 }
 
-// createDynamicColumnIndex creates an index for a dynamic column in Dragonfly
+// createDynamicColumnIndex creates an index for a dynamic column in partitioned Dragonfly databases
 func (p *PostgreSQLDynamicStorage) createDynamicColumnIndex(columnName, dataType string) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return
 	}
 
@@ -1857,6 +1948,15 @@ func (p *PostgreSQLDynamicStorage) createDynamicColumnIndex(columnName, dataType
 	p.indexMutex.Lock()
 	defer p.indexMutex.Unlock()
 
+	// Get the appropriate Dragonfly client for this column
+	client := p.getDragonflyClientForField(columnName)
+	if client == nil {
+		return
+	}
+
+	// Log partition routing for debugging
+	p.logPartitionInfo(columnName, "create_dynamic_index")
+
 	indexKey := fmt.Sprintf("dynamic_column_index:%s:%s", p.tableName, columnName)
 
 	// Check if index already exists
@@ -1864,29 +1964,32 @@ func (p *PostgreSQLDynamicStorage) createDynamicColumnIndex(columnName, dataType
 		return
 	}
 
-	// Create index metadata in Dragonfly
+	// Create index metadata in the appropriate partitioned Dragonfly database
 	indexMetadata := map[string]interface{}{
 		"column_name": columnName,
 		"data_type":   dataType,
 		"index_type":  "dynamic",
 		"table_name":  p.tableName,
+		"partition":   p.getPartitionForField(columnName),
 		"created_at":  time.Now().Unix(),
 	}
 
 	metadataJSON, _ := json.Marshal(indexMetadata)
-	err := p.dragonflyClient.Set(ctx, indexKey, metadataJSON, 0).Err() // No TTL - persist indefinitely
+	err := client.Set(ctx, indexKey, metadataJSON, 0).Err() // No TTL - persist indefinitely
 	if err != nil {
-		log.Printf("Warning: Failed to create dynamic column index for %s: %v", columnName, err)
+		log.Printf("Warning: Failed to create dynamic column index for %s in partition %d: %v",
+			columnName, p.getPartitionForField(columnName), err)
 		return
 	}
 
 	p.dynamicIndexes[indexKey] = true
-	log.Printf("Created dynamic column index for %s (type: %s) in Dragonfly", columnName, dataType)
+	log.Printf("Created dynamic column index for %s (type: %s) in Dragonfly partition %d",
+		columnName, dataType, p.getPartitionForField(columnName))
 }
 
-// updateDragonflyIndexes updates field value indexes in Dragonfly for a ticket using ZSET for range queries
+// updateDragonflyIndexes updates field value indexes in partitioned Dragonfly databases for a ticket using ZSET for range queries
 func (p *PostgreSQLDynamicStorage) updateDragonflyIndexes(ticketID string, row map[string]interface{}) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return
 	}
 
@@ -1901,6 +2004,12 @@ func (p *PostgreSQLDynamicStorage) updateDragonflyIndexes(ticketID string, row m
 
 		// Skip fields that should not be indexed
 		if p.shouldSkipIndexing(fieldName) {
+			continue
+		}
+
+		// Get the appropriate Dragonfly client for this field
+		client := p.getDragonflyClientForField(fieldName)
+		if client == nil {
 			continue
 		}
 
@@ -1966,22 +2075,24 @@ func (p *PostgreSQLDynamicStorage) updateDragonflyIndexes(ticketID string, row m
 		// Create a key for storing the list of ticket IDs for this specific value
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, valueStr)
 
-		// Add ticket ID to the list of tickets with this value
-		err := p.dragonflyClient.SAdd(ctx, valueListKey, ticketID).Err()
+		// Add ticket ID to the list of tickets with this value in the appropriate partition
+		err := client.SAdd(ctx, valueListKey, ticketID).Err()
 		if err != nil {
-			log.Printf("Warning: Failed to update ticket ID list for %s=%s: %v", fieldName, valueStr, err)
+			log.Printf("Warning: Failed to update ticket ID list for %s=%s in partition %d: %v",
+				fieldName, valueStr, p.getPartitionForField(fieldName), err)
 			continue
 		}
 
 		// Add entry to ZSET with appropriate score, storing the value as member
 		// The ZSET member is just the value, and we use the valueListKey to get ticket IDs
-		err = p.dragonflyClient.ZAdd(ctx, indexKey, redis.Z{
+		err = client.ZAdd(ctx, indexKey, redis.Z{
 			Score:  score,
 			Member: valueStr, // Store just the value, not ticket ID
 		}).Err()
 
 		if err != nil {
-			log.Printf("Warning: Failed to update ZSET field index for %s=%s: %v", fieldName, valueStr, err)
+			log.Printf("Warning: Failed to update ZSET field index for %s=%s in partition %d: %v",
+				fieldName, valueStr, p.getPartitionForField(fieldName), err)
 			continue
 		}
 
@@ -1991,10 +2102,16 @@ func (p *PostgreSQLDynamicStorage) updateDragonflyIndexes(ticketID string, row m
 
 // ===== DRAGONFLY QUERY METHODS =====
 
-// QueryNumericRange queries tickets by numeric field range using ZSET indexes
+// QueryNumericRange queries tickets by numeric field range using ZSET indexes in partitioned databases
 func (p *PostgreSQLDynamicStorage) QueryNumericRange(fieldName string, minValue, maxValue float64) ([]string, error) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return nil, fmt.Errorf("dragonfly not enabled")
+	}
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2002,23 +2119,25 @@ func (p *PostgreSQLDynamicStorage) QueryNumericRange(fieldName string, minValue,
 
 	indexKey := fmt.Sprintf("field_numeric_index:%s:%s", p.tableName, fieldName)
 
-	// Query ZSET by score range (numeric values) - returns values, not ticket IDs
-	values, err := p.dragonflyClient.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
+	// Query ZSET by score range (numeric values) in the appropriate partition - returns values, not ticket IDs
+	values, err := client.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
 		Min: fmt.Sprintf("%f", minValue),
 		Max: fmt.Sprintf("%f", maxValue),
 	}).Result()
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to query numeric range for %s: %w", fieldName, err)
+		return nil, fmt.Errorf("failed to query numeric range for %s in partition %d: %w",
+			fieldName, p.getPartitionForField(fieldName), err)
 	}
 
-	// For each value, get the list of ticket IDs
+	// For each value, get the list of ticket IDs from the same partition
 	var allTicketIDs []string
 	for _, value := range values {
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-		ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+		ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 		if err != nil {
-			log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+			log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+				fieldName, value, p.getPartitionForField(fieldName), err)
 			continue
 		}
 		allTicketIDs = append(allTicketIDs, ticketIDs...)
@@ -2029,10 +2148,16 @@ func (p *PostgreSQLDynamicStorage) QueryNumericRange(fieldName string, minValue,
 	return uniqueTicketIDs, nil
 }
 
-// QueryStringRange queries tickets by string field lexicographical range using ZSET indexes
+// QueryStringRange queries tickets by string field lexicographical range using ZSET indexes in partitioned databases
 func (p *PostgreSQLDynamicStorage) QueryStringRange(fieldName string, minValue, maxValue string) ([]string, error) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return nil, fmt.Errorf("dragonfly not enabled")
+	}
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2040,23 +2165,25 @@ func (p *PostgreSQLDynamicStorage) QueryStringRange(fieldName string, minValue, 
 
 	indexKey := fmt.Sprintf("field_string_index:%s:%s", p.tableName, fieldName)
 
-	// Query ZSET by lexicographical range (string values with score 0) - returns values, not ticket IDs
-	values, err := p.dragonflyClient.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
+	// Query ZSET by lexicographical range (string values with score 0) in the appropriate partition - returns values, not ticket IDs
+	values, err := client.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
 		Min: fmt.Sprintf("[%s", minValue), // Include minValue
 		Max: fmt.Sprintf("[%s", maxValue), // Include maxValue
 	}).Result()
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to query string range for %s: %w", fieldName, err)
+		return nil, fmt.Errorf("failed to query string range for %s in partition %d: %w",
+			fieldName, p.getPartitionForField(fieldName), err)
 	}
 
-	// For each value, get the list of ticket IDs
+	// For each value, get the list of ticket IDs from the same partition
 	var allTicketIDs []string
 	for _, value := range values {
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-		ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+		ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 		if err != nil {
-			log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+			log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+				fieldName, value, p.getPartitionForField(fieldName), err)
 			continue
 		}
 		allTicketIDs = append(allTicketIDs, ticketIDs...)
@@ -2067,10 +2194,16 @@ func (p *PostgreSQLDynamicStorage) QueryStringRange(fieldName string, minValue, 
 	return uniqueTicketIDs, nil
 }
 
-// QueryExactMatch queries tickets by exact field value using value list indexes
+// QueryExactMatch queries tickets by exact field value using value list indexes in partitioned databases
 func (p *PostgreSQLDynamicStorage) QueryExactMatch(fieldName string, value string) ([]string, error) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return nil, fmt.Errorf("dragonfly not enabled")
+	}
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2079,10 +2212,11 @@ func (p *PostgreSQLDynamicStorage) QueryExactMatch(fieldName string, value strin
 	// Use the value list key to get all ticket IDs for this exact value
 	valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
 
-	// Query SET for exact matches
-	results, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+	// Query SET for exact matches in the appropriate partition
+	results, err := client.SMembers(ctx, valueListKey).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to query exact match for %s=%s: %w", fieldName, value, err)
+		return nil, fmt.Errorf("failed to query exact match for %s=%s in partition %d: %w",
+			fieldName, value, p.getPartitionForField(fieldName), err)
 	}
 
 	return results, nil
@@ -2098,10 +2232,16 @@ func (p *PostgreSQLDynamicStorage) QueryNumericLessThan(fieldName string, value 
 	return p.QueryNumericRange(fieldName, math.Inf(-1), value-0.000001) // Exclude the value itself
 }
 
-// QueryStringPrefix queries tickets where string field starts with prefix
+// QueryStringPrefix queries tickets where string field starts with prefix in partitioned databases
 func (p *PostgreSQLDynamicStorage) QueryStringPrefix(fieldName string, prefix string) ([]string, error) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		return nil, fmt.Errorf("dragonfly not enabled")
+	}
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2109,24 +2249,26 @@ func (p *PostgreSQLDynamicStorage) QueryStringPrefix(fieldName string, prefix st
 
 	indexKey := fmt.Sprintf("field_string_index:%s:%s", p.tableName, fieldName)
 
-	// Query ZSET by lexicographical range for prefix matching - returns values, not ticket IDs
-	values, err := p.dragonflyClient.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
+	// Query ZSET by lexicographical range for prefix matching in the appropriate partition - returns values, not ticket IDs
+	values, err := client.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
 		Min: fmt.Sprintf("[%s", prefix),
 		Max: fmt.Sprintf("(%s~", prefix), // Use ~ as upper bound for prefix
 	}).Result()
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to query string prefix for %s: %w", fieldName, err)
+		return nil, fmt.Errorf("failed to query string prefix for %s in partition %d: %w",
+			fieldName, p.getPartitionForField(fieldName), err)
 	}
 
-	// For each value that matches the prefix, get the list of ticket IDs
+	// For each value that matches the prefix, get the list of ticket IDs from the same partition
 	var allTicketIDs []string
 	for _, value := range values {
 		if strings.HasPrefix(value, prefix) {
 			valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-			ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+			ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 			if err != nil {
-				log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+				log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+					fieldName, value, p.getPartitionForField(fieldName), err)
 				continue
 			}
 			allTicketIDs = append(allTicketIDs, ticketIDs...)
@@ -2198,7 +2340,7 @@ type ExtendedSearchRequest struct {
 
 // SearchTicketsWithDragonflyIndex performs two-phase search: Dragonfly indexes first, then PostgreSQL data retrieval
 func (p *PostgreSQLDynamicStorage) SearchTicketsWithDragonflyIndex(request ExtendedSearchRequest) ([]*ticketpb.TicketData, error) {
-	if !p.dragonflyEnabled || p.dragonflyClient == nil {
+	if !p.dragonflyEnabled || len(p.dragonflyClients) == 0 {
 		// Fallback to regular PostgreSQL search if Dragonfly not available
 		return p.searchTicketsPostgreSQLOnly(request)
 	}
@@ -2354,32 +2496,46 @@ func (p *PostgreSQLDynamicStorage) queryIndexForCondition(condition SearchCondit
 	}
 }
 
-// queryExactMatchIndex queries the field_value_list SET for exact matches
+// queryExactMatchIndex queries the field_value_list SET for exact matches in partitioned databases
 func (p *PostgreSQLDynamicStorage) queryExactMatchIndex(ctx context.Context, fieldName, value string) ([]string, error) {
 	queryStart := time.Now()
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
+	}
+
 	valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
 
 	// Execute index query and measure latency
 	indexStart := time.Now()
-	ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+	ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 	indexDuration := time.Since(indexStart)
 	totalDuration := time.Since(queryStart)
 
 	if err != nil {
-		p.logger.Error(fmt.Sprintf("Exact match index query failed: field=%s, value=%s, key=%s, index_latency=%dms, total_latency=%dms, error=%s",
-			fieldName, value, valueListKey, indexDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
+		p.logger.Error(fmt.Sprintf("Exact match index query failed: field=%s, value=%s, key=%s, partition=%d, index_latency=%dms, total_latency=%dms, error=%s",
+			fieldName, value, valueListKey, p.getPartitionForField(fieldName), indexDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
 		return nil, fmt.Errorf("failed to query exact match index for %s=%s: %w", fieldName, value, err)
 	}
 
-	p.logger.Info(fmt.Sprintf("Exact match index query: field=%s, value=%s, results=%d, index_latency=%dms, total_latency=%dms",
-		fieldName, value, len(ticketIDs), indexDuration.Milliseconds(), totalDuration.Milliseconds()))
+	p.logger.Info(fmt.Sprintf("Exact match index query: field=%s, value=%s, partition=%d, results=%d, index_latency=%dms, total_latency=%dms",
+		fieldName, value, p.getPartitionForField(fieldName), len(ticketIDs), indexDuration.Milliseconds(), totalDuration.Milliseconds()))
 
 	return ticketIDs, nil
 }
 
-// queryNumericRangeIndex queries the numeric ZSET and retrieves ticket IDs for matching values
+// queryNumericRangeIndex queries the numeric ZSET and retrieves ticket IDs for matching values in partitioned databases
 func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, fieldName string, minValue, maxValue float64, includeMin, includeMax bool) ([]string, error) {
 	queryStart := time.Now()
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
+	}
+
 	indexKey := fmt.Sprintf("field_numeric_index:%s:%s", p.tableName, fieldName)
 
 	// Build range query parameters
@@ -2393,9 +2549,9 @@ func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, f
 		maxStr = "(" + maxStr // Exclusive maximum
 	}
 
-	// Query ZSET to get matching values and measure latency
+	// Query ZSET to get matching values and measure latency in the appropriate partition
 	zsetStart := time.Now()
-	values, err := p.dragonflyClient.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
+	values, err := client.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
 		Min: minStr,
 		Max: maxStr,
 	}).Result()
@@ -2403,8 +2559,8 @@ func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, f
 
 	if err != nil {
 		totalDuration := time.Since(queryStart)
-		p.logger.Error(fmt.Sprintf("Numeric range ZSET query failed: field=%s, range=[%f,%f], include_min=%t, include_max=%t, zset_latency=%dms, total_latency=%dms, error=%s",
-			fieldName, minValue, maxValue, includeMin, includeMax, zsetDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
+		p.logger.Error(fmt.Sprintf("Numeric range ZSET query failed: field=%s, range=[%f,%f], include_min=%t, include_max=%t, partition=%d, zset_latency=%dms, total_latency=%dms, error=%s",
+			fieldName, minValue, maxValue, includeMin, includeMax, p.getPartitionForField(fieldName), zsetDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
 		return nil, fmt.Errorf("failed to query numeric range index for %s: %w", fieldName, err)
 	}
 
@@ -2415,9 +2571,10 @@ func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, f
 
 	for _, value := range values {
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-		ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+		ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 		if err != nil {
-			log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+			log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+				fieldName, value, p.getPartitionForField(fieldName), err)
 			valueListErrors++
 			continue
 		}
@@ -2430,20 +2587,27 @@ func (p *PostgreSQLDynamicStorage) queryNumericRangeIndex(ctx context.Context, f
 	// Remove duplicates
 	result := removeDuplicates(allTicketIDs)
 
-	p.logger.Info(fmt.Sprintf("Numeric range index query: field=%s, range=[%f,%f], values_found=%d, zset_latency=%dms, valuelist_latency=%dms, total_latency=%dms, results=%d, errors=%d",
-		fieldName, minValue, maxValue, len(values), zsetDuration.Milliseconds(), valueListDuration.Milliseconds(), totalDuration.Milliseconds(), len(result), valueListErrors))
+	p.logger.Info(fmt.Sprintf("Numeric range index query: field=%s, range=[%f,%f], partition=%d, values_found=%d, zset_latency=%dms, valuelist_latency=%dms, total_latency=%dms, results=%d, errors=%d",
+		fieldName, minValue, maxValue, p.getPartitionForField(fieldName), len(values), zsetDuration.Milliseconds(), valueListDuration.Milliseconds(), totalDuration.Milliseconds(), len(result), valueListErrors))
 
 	return result, nil
 }
 
-// queryStringPrefixIndex queries the string ZSET using ZRANGEBYLEX for prefix matching
+// queryStringPrefixIndex queries the string ZSET using ZRANGEBYLEX for prefix matching in partitioned databases
 func (p *PostgreSQLDynamicStorage) queryStringPrefixIndex(ctx context.Context, fieldName, prefix string) ([]string, error) {
 	queryStart := time.Now()
+
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
+	}
+
 	indexKey := fmt.Sprintf("field_string_index:%s:%s", p.tableName, fieldName)
 
-	// Query ZSET by lexicographical range for prefix matching and measure latency
+	// Query ZSET by lexicographical range for prefix matching and measure latency in the appropriate partition
 	zsetStart := time.Now()
-	values, err := p.dragonflyClient.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
+	values, err := client.ZRangeByLex(ctx, indexKey, &redis.ZRangeBy{
 		Min: fmt.Sprintf("[%s", prefix),
 		Max: fmt.Sprintf("(%s~", prefix), // Use ~ as upper bound for prefix
 	}).Result()
@@ -2451,8 +2615,8 @@ func (p *PostgreSQLDynamicStorage) queryStringPrefixIndex(ctx context.Context, f
 
 	if err != nil {
 		totalDuration := time.Since(queryStart)
-		p.logger.Error(fmt.Sprintf("String prefix ZSET query failed: field=%s, prefix=%s, zset_latency=%dms, total_latency=%dms, error=%s",
-			fieldName, prefix, zsetDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
+		p.logger.Error(fmt.Sprintf("String prefix ZSET query failed: field=%s, prefix=%s, partition=%d, zset_latency=%dms, total_latency=%dms, error=%s",
+			fieldName, prefix, p.getPartitionForField(fieldName), zsetDuration.Milliseconds(), totalDuration.Milliseconds(), err.Error()))
 		return nil, fmt.Errorf("failed to query string prefix index for %s: %w", fieldName, err)
 	}
 
@@ -2466,9 +2630,10 @@ func (p *PostgreSQLDynamicStorage) queryStringPrefixIndex(ctx context.Context, f
 		if strings.HasPrefix(value, prefix) {
 			matchingValues++
 			valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-			ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+			ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 			if err != nil {
-				log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+				log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+					fieldName, value, p.getPartitionForField(fieldName), err)
 				valueListErrors++
 				continue
 			}
@@ -2488,22 +2653,30 @@ func (p *PostgreSQLDynamicStorage) queryStringPrefixIndex(ctx context.Context, f
 	return result, nil
 }
 
-// queryNotEqualIndex queries all values for a field except the specified value (NOT EQUAL operator)
+// queryNotEqualIndex queries all values for a field except the specified value (NOT EQUAL operator) in partitioned databases
 func (p *PostgreSQLDynamicStorage) queryNotEqualIndex(ctx context.Context, fieldName, excludeValue string) ([]string, error) {
 	// Strategy: Get all unique values for the field, then get ticket IDs for all values except the excluded one
 
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
+	}
+
 	// First, try to get all values from the string index
 	stringIndexKey := fmt.Sprintf("field_string_index:%s:%s", p.tableName, fieldName)
-	allStringValues, err := p.dragonflyClient.ZRange(ctx, stringIndexKey, 0, -1).Result()
+	allStringValues, err := client.ZRange(ctx, stringIndexKey, 0, -1).Result()
 	if err != nil && err.Error() != "redis: nil" {
-		log.Printf("Warning: Failed to get string values for field %s: %v", fieldName, err)
+		log.Printf("Warning: Failed to get string values for field %s in partition %d: %v",
+			fieldName, p.getPartitionForField(fieldName), err)
 	}
 
 	// Also try to get all values from the numeric index
 	numericIndexKey := fmt.Sprintf("field_numeric_index:%s:%s", p.tableName, fieldName)
-	allNumericValues, err := p.dragonflyClient.ZRange(ctx, numericIndexKey, 0, -1).Result()
+	allNumericValues, err := client.ZRange(ctx, numericIndexKey, 0, -1).Result()
 	if err != nil && err.Error() != "redis: nil" {
-		log.Printf("Warning: Failed to get numeric values for field %s: %v", fieldName, err)
+		log.Printf("Warning: Failed to get numeric values for field %s in partition %d: %v",
+			fieldName, p.getPartitionForField(fieldName), err)
 	}
 
 	// Combine all values and exclude the specified value
@@ -2521,13 +2694,14 @@ func (p *PostgreSQLDynamicStorage) queryNotEqualIndex(ctx context.Context, field
 		}
 	}
 
-	// Get ticket IDs for all filtered values
+	// Get ticket IDs for all filtered values from the same partition
 	var allTicketIDs []string
 	for _, value := range filteredValues {
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-		ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+		ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 		if err != nil {
-			log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+			log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+				fieldName, value, p.getPartitionForField(fieldName), err)
 			continue
 		}
 		allTicketIDs = append(allTicketIDs, ticketIDs...)
@@ -2573,13 +2747,20 @@ func (p *PostgreSQLDynamicStorage) queryInIndex(ctx context.Context, fieldName s
 		return []string{}, nil
 	}
 
+	// Get the appropriate Dragonfly client for this field
+	client := p.getDragonflyClientForField(fieldName)
+	if client == nil {
+		return nil, fmt.Errorf("no dragonfly client available for field %s", fieldName)
+	}
+
 	// Get ticket IDs for each value and combine them (union operation)
 	var allTicketIDs []string
 	for _, value := range valueList {
 		valueListKey := fmt.Sprintf("field_value_list:%s:%s:%s", p.tableName, fieldName, value)
-		ticketIDs, err := p.dragonflyClient.SMembers(ctx, valueListKey).Result()
+		ticketIDs, err := client.SMembers(ctx, valueListKey).Result()
 		if err != nil {
-			log.Printf("Warning: Failed to get ticket IDs for %s=%s: %v", fieldName, value, err)
+			log.Printf("Warning: Failed to get ticket IDs for %s=%s in partition %d: %v",
+				fieldName, value, p.getPartitionForField(fieldName), err)
 			continue
 		}
 		allTicketIDs = append(allTicketIDs, ticketIDs...)
@@ -3177,4 +3358,11 @@ func (p *PostgreSQLDynamicStorage) getAllTicketsWithProjection(request ExtendedS
 	}
 
 	return tickets, nil
+}
+
+// NewPostgreSQLDynamicStorageWithDragonflyAndCache creates a new PostgreSQL storage instance with Dragonfly indexing and caching (legacy - single database)
+func NewPostgreSQLDynamicStorageWithDragonflyAndCache(ctx context.Context, tableName, connectionString, dragonflyAddr, dragonflyPassword string, dragonflyDB int, enableDragonfly bool, cacheAddr, cachePassword string, cacheDB int, enableCache bool) (*PostgreSQLDynamicStorage, error) {
+	// Convert single address to array for backward compatibility
+	dragonflyAddresses := []string{dragonflyAddr}
+	return NewPostgreSQLDynamicStorageWithPartitionedDragonfly(ctx, tableName, connectionString, dragonflyAddresses, dragonflyPassword, dragonflyDB, enableDragonfly, cacheAddr, cachePassword, cacheDB, enableCache)
 }
