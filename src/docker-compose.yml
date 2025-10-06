@@ -1,14 +1,14 @@
 services:
-  mongo:
-    image: mongo:latest   # always pulls the latest stable release
-    container_name: mongo
-    ports:
-      - "27017:27017"
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: example
-    volumes:
-      - mongo-data:/data/db
+#  mongo:
+#    image: mongo:latest   # always pulls the latest stable release
+#    container_name: mongo
+#    ports:
+#      - "27017:27017"
+#    environment:
+#      MONGO_INITDB_ROOT_USERNAME: root
+#      MONGO_INITDB_ROOT_PASSWORD: example
+#    volumes:
+#      - mongo-data:/data/db
 
   postgres:
     image: "postgres:latest"
@@ -22,20 +22,20 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
-  scylla:
-    image: scylladb/scylla:latest
-    container_name: scylla
-    command:
-      - --smp=1
-      - --memory=2G
-      - --overprovisioned=1
-      - --api-address=0.0.0.0
-    ports:
-      - "9042:9042"   # CQL
-      - "9180:9180"   # REST API
-      - "10000:10000" # Prometheus metrics
-    volumes:
-      - scylla-data:/var/lib/scylla
+#  scylla:
+#    image: scylladb/scylla:latest
+#    container_name: scylla
+#    command:
+#      - --smp=1
+#      - --memory=2G
+#      - --overprovisioned=1
+#      - --api-address=0.0.0.0
+#    ports:
+#      - "9042:9042"   # CQL
+#      - "9180:9180"   # REST API
+#      - "10000:10000" # Prometheus metrics
+#    volumes:
+#      - scylla-data:/var/lib/scylla
 
   nats-server-1:
     image: nats:2.9-alpine
@@ -125,8 +125,8 @@ services:
 
 # Volume definitions must be at the root level
 volumes:
-  mongo-data:
-  scylla-data:
+  #mongo-data:
+  #scylla-data:
   postgres-data:
   nats-data-1:
   nats-data-2:
