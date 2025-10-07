@@ -127,7 +127,7 @@ func Load() (*Config, error) {
 
 		EPS: EPSConfig{
 			Create: getEnvFloat("EPS_CREATE", 100),
-			Search: getEnvFloat("EPS_SEARCH", 2),
+			Search: getEnvFloat("EPS_SEARCH", 5),
 			Get:    getEnvFloat("EPS_GET", 1),
 			Update: getEnvFloat("EPS_UPDATE", 1),
 		},

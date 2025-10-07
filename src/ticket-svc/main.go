@@ -41,7 +41,7 @@ type Config struct {
 	DynamoDBURL       string // DynamoDB endpoint URL (for local development)
 	DynamoDBAddress   string // DynamoDB address (alternative to URL)
 	AWSRegion         string
-	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-dynamic", "scylladb", or "mongodb"
+	StorageType       string // "dynamodb", "opensearch", "postgresql", "postgresql-eav", "postgresql-hstore", "postgresql-dynamic", "scylladb", "mongodb", or "duckdb"
 	StorageMode       string // "fixed" or "dynamic" (for DynamoDB schema)
 	OpenSearchURL     string // OpenSearch endpoint URL
 	OpenSearchIndex   string // OpenSearch index name
@@ -55,6 +55,9 @@ type Config struct {
 	MongoDBCollection string // MongoDB base collection name
 	MongoDBUsername   string // MongoDB username (optional)
 	MongoDBPassword   string // MongoDB password (optional)
+	// DuckDB Configuration
+	DuckDBPath        string // DuckDB local storage path
+	DuckDBTable       string // DuckDB base table name
 	InteractivePrompt bool   // Enable interactive storage selection
 	// DragonFly Cache Configuration
 	DragonflyURL      string // DragonFly cache URL
@@ -1070,7 +1073,7 @@ func loadConfig() *Config {
 		StorageMode:       getEnv("STORAGE_MODE", "dynamic"),
 		OpenSearchURL:     getEnv("OPENSEARCH_URL", "http://localhost:9200"),
 		OpenSearchIndex:   getEnv("OPENSEARCH_INDEX", "tickets"),
-		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:postgres123@localhost/tickets_db?sslmode=disable"),
+		PostgreSQLURL:     getEnv("POSTGRESQL_URL", "postgres://postgres:password@localhost/myapp?sslmode=disable"),
 		PostgreSQLTable:   getEnv("POSTGRESQL_TABLE", "tickets"),
 		ScyllaDBHosts:     getEnv("SCYLLADB_HOSTS", "localhost:9042"),
 		ScyllaDBKeyspace:  getEnv("SCYLLADB_KEYSPACE", "ticket_management"),
@@ -1080,6 +1083,9 @@ func loadConfig() *Config {
 		MongoDBCollection: getEnv("MONGODB_COLLECTION", "tickets"),
 		MongoDBUsername:   getEnv("MONGODB_USERNAME", ""),
 		MongoDBPassword:   getEnv("MONGODB_PASSWORD", ""),
+		// DuckDB Configuration
+		DuckDBPath:        getEnv("DUCKDB_PATH", "./data"),
+		DuckDBTable:       getEnv("DUCKDB_TABLE", "tickets"),
 		InteractivePrompt: getEnv("INTERACTIVE_PROMPT", "false") == "true",
 		// DragonFly Cache Configuration
 		DragonflyURL:      getEnv("DRAGONFLY_URL", "localhost:6379"),
@@ -1214,7 +1220,8 @@ func promptForStorageType() string {
 		fmt.Println("6. PostgreSQL Dynamic Columns")
 		fmt.Println("7. ScyllaDB")
 		fmt.Println("8. MongoDB")
-		fmt.Print("Enter your choice (1-8): ")
+		fmt.Println("9. DuckDB")
+		fmt.Print("Enter your choice (1-9): ")
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -1248,8 +1255,11 @@ func promptForStorageType() string {
 		case "8":
 			fmt.Println("Selected: MongoDB")
 			return "mongodb"
+		case "9":
+			fmt.Println("Selected: DuckDB")
+			return "duckdb"
 		default:
-			fmt.Println("Invalid choice. Please enter 1-8.")
+			fmt.Println("Invalid choice. Please enter 1-9.")
 		}
 	}
 }
@@ -1274,8 +1284,8 @@ func main() {
 	} else if config.StorageType != "" {
 		storageType = config.StorageType
 	} else {
-		// Default to PostgreSQL if no selection
-		storageType = "mongodb"
+		// Default to DuckDB if no selection (for local development)
+		storageType = "duckdb"
 	}
 
 	// Initialize selected storage
@@ -1378,6 +1388,32 @@ func main() {
 		storage = mongoStorage
 		log.Printf("Using MongoDB storage with connection: %s, database: %s, base collection: %s",
 			maskConnectionString(mongoURL), config.MongoDBDatabase, config.MongoDBCollection)
+	case "duckdb":
+		// Initialize DuckDB as cache layer with PostgreSQL fallback
+		postgresConfig := &storage2.PostgreSQLConfig{
+			ConnectionString: config.PostgreSQLURL,
+			TableName:        config.PostgreSQLTable,
+		}
+
+		duckdbCacheConfig := storage2.DuckDBCacheConfig{
+			LocalStoragePath:   config.DuckDBPath,
+			TableName:          config.DuckDBTable,
+			PostgreSQLConfig:   postgresConfig,
+			NATSConn:           natsManager.conn,
+			CompactionInterval: 1 * time.Hour,
+			DeltaFlushInterval: 5 * time.Minute,
+		}
+
+		duckdbCache, err := storage2.NewDuckDBCache(context.Background(), duckdbCacheConfig)
+		if err != nil {
+			log.Fatalf("Failed to initialize DuckDB cache: %v", err)
+			return
+		}
+		storage = duckdbCache
+		log.Printf("Using DuckDB cache layer with PostgreSQL fallback")
+		log.Printf("Local cache path: %s, base table: %s", config.DuckDBPath, config.DuckDBTable)
+		log.Printf("Parquet files enabled with delta updates and hot/warm/cold tiering")
+		log.Printf("NATS event synchronization enabled for multi-instance cache coherence")
 	default:
 		log.Fatalf("Unknown storage type: %s", storageType)
 	}

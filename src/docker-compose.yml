@@ -22,6 +22,20 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  duckdb:
+    image: "duckdb/duckdb:latest"
+    container_name: duckdb-cache
+    volumes:
+      - duckdb-data:/data
+      - ./ticket-svc/data:/app/cache
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    environment:
+      - DUCKDB_PATH=/app/cache
+    ports:
+      - "9090:9090"  # Optional: for any DuckDB web interface if needed
+
 #  scylla:
 #    image: scylladb/scylla:latest
 #    container_name: scylla
@@ -128,6 +142,7 @@ volumes:
   #mongo-data:
   #scylla-data:
   postgres-data:
+  duckdb-data:
   nats-data-1:
   nats-data-2:
   nats-data-3:
