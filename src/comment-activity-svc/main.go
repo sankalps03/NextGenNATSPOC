@@ -19,6 +19,7 @@ import (
 type CommentActivityService struct {
 	natsConn    *nats.Conn
 	js          nats.JetStreamContext
+	objStore    nats.ObjectStore // NEW: Object Store for comments and activities
 	serviceName string
 	shutdownCh  chan struct{}
 	wg          sync.WaitGroup
@@ -160,9 +161,17 @@ func NewCommentActivityService(config Config) (*CommentActivityService, error) {
 		return nil, fmt.Errorf("failed to ensure streams: %w", err)
 	}
 
+	// Create or get Object Store for comments and activities
+	objStore, err := createObjectStore(js, "comment-activity-objects")
+	if err != nil {
+		log.Printf("WARNING: Failed to create Object Store: %v. Comments will only use in-memory storage.", err)
+		objStore = nil
+	}
+
 	service := &CommentActivityService{
 		natsConn:    natsConn,
 		js:          js,
+		objStore:    objStore,
 		serviceName: config.ServiceName,
 		shutdownCh:  make(chan struct{}),
 		comments:    make(map[string]map[string]*Comment),
@@ -173,24 +182,68 @@ func NewCommentActivityService(config Config) (*CommentActivityService, error) {
 }
 
 func ensureStreams(js nats.JetStreamContext) error {
-	// Ensure ACTIVITY_EVENTS stream exists
-	streamName := "ACTIVITY_EVENTS"
-	_, err := js.StreamInfo(streamName)
+	// Ensure EVENTS stream exists for ticket events (needed for subscription)
+	eventsStreamName := "EVENTS"
+	_, err := js.StreamInfo(eventsStreamName)
 	if err != nil {
 		_, err = js.AddStream(&nats.StreamConfig{
-			Name:     streamName,
-			Subjects: []string{"activity.created", "comment.created", "comment.updated"},
-			Storage:  nats.FileStorage,
-			MaxMsgs:  1000000,
-			MaxAge:   7 * 24 * time.Hour, // 7 days
+			Name: eventsStreamName,
+			Subjects: []string{
+				"tenant.*.ticket.created",
+				"tenant.*.ticket.updated",
+				"tenant.*.ticket.deleted",
+			},
+			Storage: nats.FileStorage,
+			MaxMsgs: 1000000,
+			MaxAge:  7 * 24 * time.Hour, // 7 days
+		})
+		if err != nil {
+			log.Printf("Warning: Failed to create EVENTS stream (may already exist): %v", err)
+		} else {
+			log.Printf("Created JetStream stream: %s with tenant-scoped ticket event subjects", eventsStreamName)
+		}
+	}
+
+	// Ensure ACTIVITY_EVENTS stream exists with tenant-scoped subjects
+	activityStreamName := "ACTIVITY_EVENTS"
+	_, err = js.StreamInfo(activityStreamName)
+	if err != nil {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name: activityStreamName,
+			Subjects: []string{
+				"tenant.*.activity.created",
+				"tenant.*.comment.added",
+				"tenant.*.comment.updated",
+			},
+			Storage: nats.FileStorage,
+			MaxMsgs: 1000000,
+			MaxAge:  7 * 24 * time.Hour, // 7 days
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create activity events stream: %w", err)
 		}
-		log.Printf("Created JetStream stream: %s", streamName)
+		log.Printf("Created JetStream stream: %s with tenant-scoped subjects", activityStreamName)
 	}
 
 	return nil
+}
+
+func createObjectStore(js nats.JetStreamContext, storeName string) (nats.ObjectStore, error) {
+	objStore, err := js.CreateObjectStore(&nats.ObjectStoreConfig{
+		Bucket:      storeName,
+		Description: "Tenant-scoped comments and activity logs",
+		TTL:         30 * 24 * time.Hour, // 30 days retention
+	})
+	if err != nil {
+		// If object store already exists, try to get it
+		objStore, err = js.ObjectStore(storeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create or get object store '%s': %w", storeName, err)
+		}
+	}
+
+	log.Printf("NATS Object Store '%s' ready for tenant-scoped comments and activities", storeName)
+	return objStore, nil
 }
 
 func (s *CommentActivityService) Start() error {
@@ -213,39 +266,61 @@ func (s *CommentActivityService) Start() error {
 }
 
 func (s *CommentActivityService) subscribeToServiceRequests() {
-	sub, err := s.natsConn.Subscribe("comment-activity.service", s.handleServiceRequest)
+	// Subscribe to tenant-wildcard subject with queue group
+	// Subject pattern: tenant.*.comment-activity.service
+	queueGroup := "comment-activity-service"
+	subject := "tenant.*.comment-activity.service"
+
+	sub, err := s.natsConn.QueueSubscribe(subject, queueGroup, s.handleServiceRequest)
 	if err != nil {
 		log.Printf("Failed to subscribe to service requests: %v", err)
 		return
 	}
 	defer sub.Unsubscribe()
 
-	log.Printf("Subscribed to comment-activity.service")
+	log.Printf("Subscribed to %s with queue group: %s", subject, queueGroup)
 	<-s.shutdownCh
 }
 
 func (s *CommentActivityService) subscribeToTicketEvents() {
-	// Subscribe to ticket events with durable consumer
-	sub, err := s.js.Subscribe("ticket.>", s.handleTicketEvent, nats.Durable("comment-activity-ticket-events"))
+	// Subscribe to tenant-scoped ticket events with durable consumer
+	// Pattern: tenant.*.ticket.> matches all ticket events for all tenants
+	sub, err := s.js.Subscribe("tenant.*.ticket.>", s.handleTicketEvent,
+		nats.Durable("comment-activity-tenant-ticket-events"))
 	if err != nil {
 		log.Printf("Failed to subscribe to ticket events: %v", err)
 		return
 	}
 	defer sub.Unsubscribe()
 
-	log.Printf("Subscribed to ticket events")
+	log.Printf("Subscribed to tenant-scoped ticket events: tenant.*.ticket.>")
 	<-s.shutdownCh
 }
 
+// extractTenantFromSubject extracts tenant ID from NATS subject
+// Subject format: tenant.{id}.comment-activity.service
+func extractTenantFromSubject(subject string) string {
+	parts := strings.Split(subject, ".")
+	if len(parts) >= 2 && parts[0] == "tenant" {
+		return parts[1]
+	}
+	return "default" // Fallback for non-tenant subjects
+}
+
 func (s *CommentActivityService) handleServiceRequest(msg *nats.Msg) {
+	// Extract tenant ID from subject (tenant.{id}.comment-activity.service)
+	tenantID := extractTenantFromSubject(msg.Subject)
+
 	var req ServiceRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		log.Printf("Failed to unmarshal service request: %v", err)
+		log.Printf("[Tenant: %s] Failed to unmarshal service request: %v", tenantID, err)
 		s.respondWithError(msg, "invalid_request", err.Error())
 		return
 	}
 
-	log.Printf("Processing request: action=%s, tenant=%s", req.Action, req.TenantID)
+	// Set tenant ID from subject (authoritative source)
+	req.TenantID = tenantID
+	log.Printf("[Tenant: %s] Processing request: action=%s", tenantID, req.Action)
 
 	switch req.Action {
 	case "add_comment":
@@ -286,13 +361,20 @@ func (s *CommentActivityService) handleAddComment(msg *nats.Msg, req ServiceRequ
 		UpdatedAt: time.Now().UTC(),
 	}
 
-	// Store comment
+	// Store comment in-memory
 	s.mu.Lock()
 	if s.comments[req.TenantID] == nil {
 		s.comments[req.TenantID] = make(map[string]*Comment)
 	}
 	s.comments[req.TenantID][comment.ID] = comment
 	s.mu.Unlock()
+
+	// Store comment in Object Store (async, don't block on errors)
+	go func() {
+		if err := s.storeCommentInObjectStore(comment); err != nil {
+			log.Printf("[Tenant: %s] WARNING: Failed to store comment in Object Store: %v", req.TenantID, err)
+		}
+	}()
 
 	// Create activity entry
 	activity := &Activity{
@@ -636,6 +718,75 @@ func (s *CommentActivityService) addActivity(activity *Activity) {
 	}
 	s.activities[activity.TenantID] = append(s.activities[activity.TenantID], activity)
 	s.mu.Unlock()
+
+	// Store activity log in Object Store (async, don't block on errors)
+	go func() {
+		if err := s.storeActivityLogInObjectStore(activity.TenantID, activity.TicketID); err != nil {
+			log.Printf("[Tenant: %s] WARNING: Failed to store activity log in Object Store: %v", activity.TenantID, err)
+		}
+	}()
+}
+
+// storeCommentInObjectStore stores a comment in tenant-scoped Object Store
+// Object naming: tenant.{tenant_id}.comments.{ticket_id}.{comment_id}
+func (s *CommentActivityService) storeCommentInObjectStore(comment *Comment) error {
+	if s.objStore == nil {
+		return nil // Object Store not available, skip storage
+	}
+
+	objectKey := fmt.Sprintf("tenant.%s.comments.%s.%s", comment.TenantID, comment.TicketID, comment.ID)
+	jsonData, err := json.Marshal(comment)
+	if err != nil {
+		return fmt.Errorf("failed to marshal comment: %w", err)
+	}
+
+	_, err = s.objStore.PutBytes(objectKey, jsonData)
+	if err != nil {
+		return fmt.Errorf("failed to store comment in Object Store: %w", err)
+	}
+
+	log.Printf("[Tenant: %s] Stored comment in Object Store: %s (size: %d bytes)",
+		comment.TenantID, objectKey, len(jsonData))
+	return nil
+}
+
+// storeActivityLogInObjectStore stores activity log in tenant-scoped Object Store
+// Object naming: tenant.{tenant_id}.activities.{ticket_id}
+func (s *CommentActivityService) storeActivityLogInObjectStore(tenantID string, ticketID string) error {
+	if s.objStore == nil {
+		return nil // Object Store not available, skip storage
+	}
+
+	// Gather all activities for this ticket
+	s.mu.RLock()
+	var activities []*Activity
+	if tenantActivities, exists := s.activities[tenantID]; exists {
+		for _, activity := range tenantActivities {
+			if activity.TicketID == ticketID {
+				activities = append(activities, activity)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(activities) == 0 {
+		return nil // No activities to store
+	}
+
+	objectKey := fmt.Sprintf("tenant.%s.activities.%s", tenantID, ticketID)
+	jsonData, err := json.Marshal(activities)
+	if err != nil {
+		return fmt.Errorf("failed to marshal activities: %w", err)
+	}
+
+	_, err = s.objStore.PutBytes(objectKey, jsonData)
+	if err != nil {
+		return fmt.Errorf("failed to store activities in Object Store: %w", err)
+	}
+
+	log.Printf("[Tenant: %s] Stored activity log in Object Store: %s (count: %d, size: %d bytes)",
+		tenantID, objectKey, len(activities), len(jsonData))
+	return nil
 }
 
 func (s *CommentActivityService) publishCommentEvent(comment *Comment) {
@@ -647,12 +798,16 @@ func (s *CommentActivityService) publishCommentEvent(comment *Comment) {
 
 	data, err := json.Marshal(eventData)
 	if err != nil {
-		log.Printf("Failed to marshal comment event: %v", err)
+		log.Printf("[Tenant: %s] Failed to marshal comment event: %v", comment.TenantID, err)
 		return
 	}
 
-	if _, err := s.js.Publish("comment.created", data); err != nil {
-		log.Printf("Failed to publish comment event: %v", err)
+	// Publish to tenant-scoped subject: tenant.{id}.comment.added
+	subject := fmt.Sprintf("tenant.%s.comment.added", comment.TenantID)
+	if _, err := s.js.Publish(subject, data); err != nil {
+		log.Printf("[Tenant: %s] Failed to publish comment event: %v", comment.TenantID, err)
+	} else {
+		log.Printf("[Tenant: %s] Published comment event to subject: %s", comment.TenantID, subject)
 	}
 }
 
@@ -665,12 +820,16 @@ func (s *CommentActivityService) publishActivityEvent(activity *Activity) {
 
 	data, err := json.Marshal(eventData)
 	if err != nil {
-		log.Printf("Failed to marshal activity event: %v", err)
+		log.Printf("[Tenant: %s] Failed to marshal activity event: %v", activity.TenantID, err)
 		return
 	}
 
-	if _, err := s.js.Publish("activity.created", data); err != nil {
-		log.Printf("Failed to publish activity event: %v", err)
+	// Publish to tenant-scoped subject: tenant.{id}.activity.created
+	subject := fmt.Sprintf("tenant.%s.activity.created", activity.TenantID)
+	if _, err := s.js.Publish(subject, data); err != nil {
+		log.Printf("[Tenant: %s] Failed to publish activity event: %v", activity.TenantID, err)
+	} else {
+		log.Printf("[Tenant: %s] Published activity event to subject: %s", activity.TenantID, subject)
 	}
 }
 

@@ -80,8 +80,15 @@ type APIHandler struct {
 
 func tenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// No tenant validation needed anymore - just pass through
-		next.ServeHTTP(w, r)
+		// Extract tenant ID from X-Tenant-ID header, default to "default"
+		tenantID := r.Header.Get("X-Tenant-ID")
+		if tenantID == "" {
+			tenantID = "default"
+		}
+
+		// Store tenant ID in request context
+		ctx := context.WithValue(r.Context(), TenantContextKey, tenantID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -114,6 +121,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
+	// Extract tenant ID from context
+	tenantID := r.Context().Value(TenantContextKey).(string)
+
 	// Accept any JSON data for dynamic field handling
 	var ticketData map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&ticketData); err != nil {
@@ -124,13 +134,16 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestData := map[string]interface{}{
-		"action": "create",
-		"data":   ticketData,
+		"action":    "create",
+		"tenant_id": tenantID,
+		"data":      ticketData,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	// Send request to tenant-specific subject: tenant.{id}.ticket.service
+	subject := fmt.Sprintf("tenant.%s.ticket.service", tenantID)
+	response, err := h.sendNATSRequest(subject, requestData, 60*time.Second)
 	if err != nil {
-		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to communicate with ticket service: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
@@ -143,15 +156,21 @@ func (h *APIHandler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
+	// Extract tenant ID from context
+	tenantID := r.Context().Value(TenantContextKey).(string)
+
 	requestData := map[string]interface{}{
-		"action": "list",
+		"action":    "list",
+		"tenant_id": tenantID,
 	}
 
 	start := time.Now()
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	// Send request to tenant-specific subject: tenant.{id}.ticket.service
+	subject := fmt.Sprintf("tenant.%s.ticket.service", tenantID)
+	response, err := h.sendNATSRequest(subject, requestData, 60*time.Second)
 	if err != nil {
-		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to communicate with ticket service: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
@@ -161,7 +180,7 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 	// Process object store response if applicable
 	finalResponse, err := h.processObjectStoreResponse(response, start)
 	if err != nil {
-		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to retrieve data from object store: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "object_store_error", Message: "Failed to retrieve data"})
@@ -173,19 +192,25 @@ func (h *APIHandler) ListTickets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
+	// Extract tenant ID from context
+	tenantID := r.Context().Value(TenantContextKey).(string)
+
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
 	requestData := map[string]interface{}{
 		"action":    "get",
+		"tenant_id": tenantID,
 		"ticket_id": ticketID,
 	}
 
 	start := time.Now()
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	// Send request to tenant-specific subject: tenant.{id}.ticket.service
+	subject := fmt.Sprintf("tenant.%s.ticket.service", tenantID)
+	response, err := h.sendNATSRequest(subject, requestData, 60*time.Second)
 	if err != nil {
-		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to communicate with ticket service: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
@@ -205,7 +230,7 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 	// Process object store response if applicable
 	finalResponse, err := h.processObjectStoreResponse(response, start)
 	if err != nil {
-		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to retrieve data from object store: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "object_store_error", Message: "Failed to retrieve data"})
@@ -217,6 +242,9 @@ func (h *APIHandler) GetTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
+	// Extract tenant ID from context
+	tenantID := r.Context().Value(TenantContextKey).(string)
+
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
@@ -231,13 +259,16 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 
 	requestData := map[string]interface{}{
 		"action":    "update",
+		"tenant_id": tenantID,
 		"ticket_id": ticketID,
 		"data":      updateData,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	// Send request to tenant-specific subject: tenant.{id}.ticket.service
+	subject := fmt.Sprintf("tenant.%s.ticket.service", tenantID)
+	response, err := h.sendNATSRequest(subject, requestData, 60*time.Second)
 	if err != nil {
-		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to communicate with ticket service: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
@@ -259,17 +290,23 @@ func (h *APIHandler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
+	// Extract tenant ID from context
+	tenantID := r.Context().Value(TenantContextKey).(string)
+
 	vars := mux.Vars(r)
 	ticketID := vars["id"]
 
 	requestData := map[string]interface{}{
 		"action":    "delete",
+		"tenant_id": tenantID,
 		"ticket_id": ticketID,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	// Send request to tenant-specific subject: tenant.{id}.ticket.service
+	subject := fmt.Sprintf("tenant.%s.ticket.service", tenantID)
+	response, err := h.sendNATSRequest(subject, requestData, 60*time.Second)
 	if err != nil {
-		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to communicate with ticket service: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
@@ -290,6 +327,8 @@ func (h *APIHandler) DeleteTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
+	// Extract tenant ID from context
+	tenantID := r.Context().Value(TenantContextKey).(string)
 
 	start := time.Now()
 
@@ -321,7 +360,7 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 
 	// Log field projection for debugging
 	if len(searchRequest.ProjectedFields) > 0 {
-		log.Printf("Search request with %d projected fields: %v (core fields id, created_at, updated_at will be included automatically)", len(searchRequest.ProjectedFields), searchRequest.ProjectedFields)
+		log.Printf("[Tenant: %s] Search request with %d projected fields: %v (core fields id, created_at, updated_at will be included automatically)", tenantID, len(searchRequest.ProjectedFields), searchRequest.ProjectedFields)
 	}
 
 	// Build request data with CategoryFilter support
@@ -337,13 +376,16 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestData := map[string]interface{}{
-		"action": "search",
-		"data":   data,
+		"action":    "search",
+		"tenant_id": tenantID,
+		"data":      data,
 	}
 
-	response, err := h.sendNATSRequest("ticket.service", requestData, 60*time.Second)
+	// Send request to tenant-specific subject: tenant.{id}.ticket.service
+	subject := fmt.Sprintf("tenant.%s.ticket.service", tenantID)
+	response, err := h.sendNATSRequest(subject, requestData, 60*time.Second)
 	if err != nil {
-		log.Printf("ERROR: Failed to communicate with ticket service: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to communicate with ticket service: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "service_unavailable", Message: "Ticket service unavailable"})
@@ -353,7 +395,7 @@ func (h *APIHandler) SearchTickets(w http.ResponseWriter, r *http.Request) {
 	// Process object store response if applicable
 	finalResponse, err := h.processObjectStoreResponse(response, start)
 	if err != nil {
-		log.Printf("ERROR: Failed to retrieve data from object store: %v", err)
+		log.Printf("[Tenant: %s] ERROR: Failed to retrieve data from object store: %v", tenantID, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "object_store_error", Message: "Failed to retrieve data"})

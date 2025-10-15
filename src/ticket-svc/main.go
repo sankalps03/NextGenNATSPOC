@@ -82,6 +82,7 @@ type TicketService struct {
 
 type ServiceRequest struct {
 	Action   string      `json:"action"`
+	TenantID string      `json:"tenant_id,omitempty"`
 	TicketID string      `json:"ticket_id,omitempty"`
 	Data     interface{} `json:"data,omitempty"`
 }
@@ -206,28 +207,35 @@ func ticketToJSON(ticket *ticketpb.TicketData) map[string]interface{} {
 	return result
 }
 
-// storeInObjectStore stores data in NATS object store and returns object ID
-func (ts *TicketService) storeInObjectStore(data interface{}, prefix string) (string, int64, error) {
+// extractTenantFromSubject extracts tenant ID from NATS subject
+// Subject format: tenant.{id}.ticket.service
+func extractTenantFromSubject(subject string) string {
+	parts := strings.Split(subject, ".")
+	if len(parts) >= 2 && parts[0] == "tenant" {
+		return parts[1]
+	}
+	return "default" // Fallback for non-tenant subjects
+}
+
+// storeInObjectStore stores data in tenant-scoped NATS object store and returns object ID
+// Object naming: tenant.{tenantID}.{prefix}-{timestamp}-{uuid}
+func (ts *TicketService) storeInObjectStore(tenantID string, data interface{}, prefix string) (string, int64, error) {
 	// Serialize data to JSON
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to marshal data: %w", err)
 	}
 
-	// Generate unique object ID
-	objectID := fmt.Sprintf("%s-%s-%s", prefix, time.Now().Format("20060102-150405"), uuid.New().String()[:8])
+	// Generate tenant-scoped unique object ID
+	objectID := fmt.Sprintf("tenant.%s.%s-%s-%s", tenantID, prefix, time.Now().Format("20060102-150405"), uuid.New().String()[:8])
 
-	// Store in object store
-	/*objectMeta := jetstream.ObjectMeta{
-		Name:        objectID,
-		Description: fmt.Sprintf("Response for %s at %s", prefix, time.Now().Format(time.RFC3339)),
-	}
-	*/
+	// Store in object store with tenant metadata
 	objInfo, err := ts.objStore.PutBytes(context.Background(), objectID, jsonData)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to store in object store: %w", err)
 	}
 
+	log.Printf("Stored object in tenant-scoped Object Store: %s (size: %d bytes)", objectID, objInfo.Size)
 	return objectID, int64(objInfo.Size), nil
 }
 
@@ -278,15 +286,22 @@ func fieldsEqual(a, b *ticketpb.FieldValue) bool {
 }
 
 func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
+	// Extract tenant ID from subject (tenant.{id}.ticket.service)
+	tenantID := extractTenantFromSubject(msg.Subject)
+
 	var req ServiceRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		log.Printf("Failed to unmarshal service request: %v", err)
+		log.Printf("[Tenant: %s] Failed to unmarshal service request: %v", tenantID, err)
 		errorResp := ErrorResponse{Error: "invalid_request", Message: err.Error()}
 		if respData, err := json.Marshal(errorResp); err == nil {
 			msg.Respond(respData)
 		}
 		return
 	}
+
+	// Set tenant ID from subject (authoritative source)
+	req.TenantID = tenantID
+	log.Printf("[Tenant: %s] Processing request: action=%s", tenantID, req.Action)
 
 	var response interface{}
 	var err error
@@ -309,13 +324,14 @@ func (ts *TicketService) handleServiceRequest(msg *nats.Msg) {
 	}
 
 	if err != nil {
+		log.Printf("[Tenant: %s] Request error: %v", tenantID, err)
 		response = ErrorResponse{Error: "internal_error", Message: err.Error()}
 	}
 
 	if respData, err := json.Marshal(response); err == nil {
 		msg.Respond(respData)
 	} else {
-		log.Printf("Failed to marshal response: %v", err)
+		log.Printf("[Tenant: %s] Failed to marshal response: %v", tenantID, err)
 		errorResp := ErrorResponse{Error: "response_error"}
 		if respData, err := json.Marshal(errorResp); err == nil {
 			msg.Respond(respData)
@@ -452,7 +468,7 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 
 	// Store in object store if available
 	if ts.objStore != nil {
-		objectID, size, err := ts.storeInObjectStore(responseData, "list-tickets")
+		objectID, size, err := ts.storeInObjectStore(req.TenantID, responseData, "list-tickets")
 		if err != nil {
 			log.Printf("Failed to store in object store: %v", err)
 			// Fallback to direct response if object store fails
@@ -468,7 +484,7 @@ func (ts *TicketService) handleListTickets(req ServiceRequest) (interface{}, err
 				"object_id":   objectID,
 				"object_size": size,
 				"total_count": len(tickets),
-				"expires_at":  time.Now().Add(30 * time.Minute).Format(time.RFC3339),
+				"expires_at":  time.Now().Add(30 * time.Second).Format(time.RFC3339),
 				"type":        "ticket_list",
 			},
 			DatabaseLatency: fmt.Sprintf("%.2f", float64(dbLatency.Nanoseconds())/1000000),
@@ -531,7 +547,7 @@ func (ts *TicketService) handleGetTicket(req ServiceRequest) (interface{}, error
 
 	// Store in object store if available
 	if ts.objStore != nil {
-		objectID, size, err := ts.storeInObjectStore(responseData, fmt.Sprintf("ticket-%s", req.TicketID))
+		objectID, size, err := ts.storeInObjectStore(req.TenantID, responseData, fmt.Sprintf("ticket-%s", req.TicketID))
 		if err != nil {
 			log.Printf("Failed to store in object store: %v", err)
 			// Fallback to direct response if object store fails
@@ -800,7 +816,7 @@ func (ts *TicketService) handleSearchTickets(req ServiceRequest) (interface{}, e
 
 	// Store in object store if available
 	if ts.objStore != nil {
-		objectID, size, err := ts.storeInObjectStore(responseData, "search-tickets")
+		objectID, size, err := ts.storeInObjectStore(req.TenantID, responseData, "search-tickets")
 		if err != nil {
 			log.Printf("Failed to store in object store: %v", err)
 			// Fallback to direct response if object store fails
@@ -880,7 +896,7 @@ func (nm *NATSManager) PublishEvent(ctx context.Context, subject string, payload
 	return err
 }
 
-func (ts *TicketService) publishTicketCreated(ctx context.Context, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketCreated(ctx context.Context, tenantID string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -895,17 +911,20 @@ func (ts *TicketService) publishTicketCreated(ctx context.Context, ticketData *t
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	subject := "ticket.create"
+	// Tenant-scoped subject: tenant.{id}.ticket.created
+	subject := fmt.Sprintf("tenant.%s.ticket.created", tenantID)
 	headers := map[string]string{
 		"schema":       "ticket.create@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
+		"Tenant-ID":    tenantID,
 	}
 
+	log.Printf("Publishing ticket.created event to subject: %s", subject)
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketUpdated(ctx context.Context, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketUpdated(ctx context.Context, tenantID string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -920,17 +939,20 @@ func (ts *TicketService) publishTicketUpdated(ctx context.Context, ticketData *t
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	subject := "ticket.update"
+	// Tenant-scoped subject: tenant.{id}.ticket.updated
+	subject := fmt.Sprintf("tenant.%s.ticket.updated", tenantID)
 	headers := map[string]string{
 		"schema":       "ticket.update@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
+		"Tenant-ID":    tenantID,
 	}
 
+	log.Printf("Publishing ticket.updated event to subject: %s", subject)
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
-func (ts *TicketService) publishTicketDeleted(ctx context.Context, ticketData *ticketpb.TicketData) error {
+func (ts *TicketService) publishTicketDeleted(ctx context.Context, tenantID string, ticketData *ticketpb.TicketData) error {
 	event := &TicketEvent{
 		Meta: &Meta{
 			EventId:    uuid.New().String(),
@@ -945,13 +967,16 @@ func (ts *TicketService) publishTicketDeleted(ctx context.Context, ticketData *t
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	subject := "ticket.delete"
+	// Tenant-scoped subject: tenant.{id}.ticket.deleted
+	subject := fmt.Sprintf("tenant.%s.ticket.deleted", tenantID)
 	headers := map[string]string{
 		"schema":       "ticket.delete@v1",
 		"Nats-Msg-Id":  uuid.New().String(),
 		"Content-Type": "application/json",
+		"Tenant-ID":    tenantID,
 	}
 
+	log.Printf("Publishing ticket.deleted event to subject: %s", subject)
 	return ts.natsManager.PublishEvent(ctx, subject, payload, headers)
 }
 
@@ -1275,7 +1300,7 @@ func main() {
 		storageType = config.StorageType
 	} else {
 		// Default to PostgreSQL if no selection
-		storageType = "mongodb"
+		storageType = "postgresql-dynamic"
 	}
 
 	// Initialize selected storage
@@ -1404,13 +1429,19 @@ func main() {
 		config:      config,
 	}
 
-	sub, err := natsManager.conn.Subscribe("ticket.service", service.handleServiceRequest)
+	// Subscribe to tenant-wildcard subject with queue group for load balancing
+	// Subject pattern: tenant.*.ticket.service
+	// Queue group: ticket-service (for horizontal scaling)
+	queueGroup := "ticket-service"
+	subject := "tenant.*.ticket.service"
+
+	sub, err := natsManager.conn.QueueSubscribe(subject, queueGroup, service.handleServiceRequest)
 	if err != nil {
-		log.Fatalf("Failed to subscribe to ticket.service: %v", err)
+		log.Fatalf("Failed to subscribe to %s with queue group %s: %v", subject, queueGroup, err)
 	}
 	defer sub.Unsubscribe()
 
-	log.Printf("Ticket Service listening on subject: ticket.service")
+	log.Printf("Ticket Service listening on subject: %s (queue group: %s)", subject, queueGroup)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
